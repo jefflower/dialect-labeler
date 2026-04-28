@@ -1,12 +1,12 @@
 use regex::Regex;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{mpsc, Mutex};
@@ -14,6 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROJECT_FOLDER: &str = "_dialect_labeler";
+const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
+const DEFAULT_LLM_PROMPT: &str = include_str!("default_llm_prompt.txt");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,11 +100,76 @@ struct PlaybackState {
     is_playing: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RecognitionOptions {
+    #[serde(default)]
+    whisper_model: Option<String>,
+    #[serde(default)]
+    use_llm: Option<bool>,
+    #[serde(default)]
+    ollama_url: Option<String>,
+    #[serde(default)]
+    ollama_model: Option<String>,
+    #[serde(default)]
+    llm_prompt: Option<String>,
+    #[serde(default)]
+    initial_prompt: Option<String>,
+    #[serde(default)]
+    use_cache: Option<bool>,
+    #[serde(default)]
+    overwrite_cache: Option<bool>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RecognitionResult {
     segment_id: String,
     text: String,
+    raw_text: String,
+    polished: bool,
+    cached: bool,
+    emotion: Option<String>,
+    tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PolishedOutput {
+    text: String,
+    emotion: Option<String>,
+    tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DependencyStatus {
+    whisper_ok: bool,
+    whisper_path: Option<String>,
+    whisper_error: Option<String>,
+    ffmpeg_ok: bool,
+    ffmpeg_error: Option<String>,
+    ollama_ok: bool,
+    ollama_url: String,
+    ollama_models: Vec<String>,
+    ollama_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportOptions {
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    pair_user_assistant: Option<bool>,
+    #[serde(default)]
+    use_source_audio_for_user: Option<bool>,
+    #[serde(default)]
+    audio_file_prefix: Option<String>,
+    /// Local input root used to compute the path relative to the
+    /// configured OSS prefix. Without it, only the file name is appended.
+    #[serde(default)]
+    input_root: Option<String>,
 }
 
 struct AudioPlayerState {
@@ -247,6 +314,95 @@ fn prepare_playback_audio_impl(
     } else {
         Err(String::from_utf8_lossy(&result.stderr).to_string())
     }
+}
+
+#[tauri::command]
+async fn read_waveform_peaks(
+    input_path: String,
+    bucket_count: Option<usize>,
+) -> Result<Vec<f32>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        read_waveform_peaks_impl(input_path, bucket_count.unwrap_or(640))
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+fn read_waveform_peaks_impl(input_path: String, bucket_count: usize) -> Result<Vec<f32>, String> {
+    ensure_ffmpeg()?;
+    let bucket_count = bucket_count.clamp(64, 4096);
+    let input = PathBuf::from(&input_path);
+    if !input.is_file() {
+        return Err(format!("Audio file not found: {}", input_path));
+    }
+
+    let mut child = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(&input)
+        .arg("-vn")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("8000")
+        .arg("-f")
+        .arg("s16le")
+        .arg("-acodec")
+        .arg("pcm_s16le")
+        .arg("-")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("ffmpeg spawn failed: {}", err))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "ffmpeg stdout missing".to_string())?;
+    let mut reader = BufReader::new(stdout);
+    let mut samples: Vec<i16> = Vec::with_capacity(8000 * 30);
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|err| format!("ffmpeg read failed: {}", err))?;
+        if n == 0 {
+            break;
+        }
+        let chunks = n / 2;
+        for index in 0..chunks {
+            let lo = buf[index * 2];
+            let hi = buf[index * 2 + 1];
+            samples.push(i16::from_le_bytes([lo, hi]));
+        }
+    }
+    let _ = child.wait();
+
+    if samples.is_empty() {
+        return Ok(vec![0.0; bucket_count]);
+    }
+
+    let bucket_size = (samples.len() / bucket_count).max(1);
+    let mut peaks = Vec::with_capacity(bucket_count);
+    for index in 0..bucket_count {
+        let start = index * bucket_size;
+        if start >= samples.len() {
+            peaks.push(0.0);
+            continue;
+        }
+        let end = (start + bucket_size).min(samples.len());
+        let mut peak = 0i32;
+        for sample in &samples[start..end] {
+            let v = (*sample as i32).abs();
+            if v > peak {
+                peak = v;
+            }
+        }
+        peaks.push((peak as f32) / (i16::MAX as f32));
+    }
+    Ok(peaks)
 }
 
 #[tauri::command]
@@ -454,9 +610,24 @@ fn scan_project_folder_impl(
     collect_files(&root, &mut files, &[project_dir.clone()]).map_err(|err| err.to_string())?;
 
     let mut manifest_records = Vec::new();
+    let mut manifest_paths: Vec<PathBuf> = Vec::new();
     if let Some(path) = manifest_path.filter(|value| !value.trim().is_empty()) {
-        let manifest = parse_manifest_file(Path::new(&path))?;
-        manifest_records.extend(manifest);
+        manifest_paths.push(PathBuf::from(path));
+    }
+    for file in &files {
+        let lname = path_file_name(file).to_ascii_lowercase();
+        if lname == "manifest.json"
+            || lname == "manifest.jsonl"
+            || lname.ends_with(".manifest.json")
+            || lname.ends_with(".manifest.jsonl")
+        {
+            manifest_paths.push(file.clone());
+        }
+    }
+    for path in &manifest_paths {
+        if let Ok(records) = parse_manifest_file(path) {
+            manifest_records.extend(records);
+        }
     }
 
     let mut audio_files = Vec::new();
@@ -582,6 +753,8 @@ fn cut_audio_file_impl(
     let ranges = build_segment_ranges(duration_sec, &events, &config);
     let source_stem = path_file_stem(&input);
     let safe_source = safe_name(&source_stem);
+    let (base_stem, role_suffix) = split_role_suffix(&source_stem);
+    let safe_base = safe_name(&base_stem);
     let source_dir = segments_root.join(&safe_source);
     fs::create_dir_all(&source_dir).map_err(|err| err.to_string())?;
 
@@ -593,13 +766,13 @@ fn cut_audio_file_impl(
     for (index, (start_sec, end_sec)) in ranges.iter().enumerate() {
         let start_ms = seconds_to_ms(*start_sec);
         let end_ms = seconds_to_ms(*end_sec);
-        let segment_file_name = format!(
-            "{}_{:04}_{}-{}.wav",
-            safe_source,
-            index + 1,
-            start_ms,
-            end_ms
-        );
+        // Demo convention: insert 2-digit segment number BEFORE role suffix.
+        // E.g. `自由演绎_0001_02_发音人.wav` → `自由演绎_0001_02_01_发音人.wav`.
+        // For files without a role suffix, append a 4-digit sequence number.
+        let segment_file_name = match &role_suffix {
+            Some(suffix) => format!("{}_{:02}_{}.wav", safe_base, index + 1, suffix),
+            None => format!("{}_{:04}.wav", safe_source, index + 1),
+        };
         let output = source_dir.join(&segment_file_name);
         write_pcm_wav_segment(
             &input,
@@ -654,6 +827,7 @@ fn export_segments_jsonl(
     project_dir: String,
     output_path: Option<String>,
     segments: Vec<SegmentRecord>,
+    options: Option<ExportOptions>,
 ) -> Result<String, String> {
     let dir = PathBuf::from(project_dir);
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
@@ -664,36 +838,318 @@ fn export_segments_jsonl(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
-    let mut lines = Vec::with_capacity(segments.len());
 
-    for segment in segments {
-        let item = serde_json::json!({
-            "role": segment.role.unwrap_or_else(|| "unknown".to_string()),
-            "content": [segment.phonetic_text],
-            "audio_file": segment.segment_path,
-            "emotion": segment.emotion,
-            "tags": segment.tags,
-            "notes": segment.notes,
-            "source_audio_file": segment.source_path,
-            "start_ms": segment.start_ms,
-            "end_ms": segment.end_ms,
-            "duration_ms": segment.duration_ms
-        });
-        lines.push(serde_json::to_string(&item).map_err(|err| err.to_string())?);
-    }
+    let opts = options.unwrap_or_default();
+    let system_prompt = opts.system_prompt.unwrap_or_default();
+    let pair = opts.pair_user_assistant.unwrap_or(true);
+    let user_use_source = opts.use_source_audio_for_user.unwrap_or(true);
+    let prefix = opts.audio_file_prefix.unwrap_or_default();
+    let input_root = opts.input_root.unwrap_or_default();
+
+    let lines = if pair {
+        build_paired_jsonl(
+            &segments,
+            &system_prompt,
+            user_use_source,
+            &prefix,
+            &input_root,
+        )
+    } else {
+        build_flat_jsonl(&segments, &system_prompt, &prefix, &input_root)
+    }?;
 
     fs::write(&path, format!("{}\n", lines.join("\n"))).map_err(|err| err.to_string())?;
     Ok(path_to_string(&path))
+}
+
+fn build_flat_jsonl(
+    segments: &[SegmentRecord],
+    system_prompt: &str,
+    prefix: &str,
+    input_root: &str,
+) -> Result<Vec<String>, String> {
+    let mut lines = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let role = segment.role.clone().unwrap_or_else(|| "assistant".into());
+        let mut messages = Vec::new();
+        if !system_prompt.trim().is_empty() {
+            messages.push(json!({"role": "system", "content": system_prompt}));
+        }
+        let audio_path = with_prefix(prefix, &segment.segment_path, input_root);
+        let content_value: Value = if role == "assistant" {
+            json!([segment.phonetic_text.clone()])
+        } else {
+            json!(segment.phonetic_text.clone())
+        };
+        let mut message = json!({
+            "role": role,
+            "content": content_value,
+            "audio_file": audio_path,
+        });
+        if !segment.emotion.is_empty() {
+            message["emotion"] = json!(segment.emotion);
+        }
+        if !segment.tags.is_empty() {
+            message["tags"] = json!(segment.tags);
+        }
+        if !segment.notes.trim().is_empty() {
+            message["notes"] = json!(segment.notes);
+        }
+        messages.push(message);
+        let line =
+            serde_json::to_string(&json!({"messages": messages})).map_err(|err| err.to_string())?;
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
+fn build_paired_jsonl(
+    segments: &[SegmentRecord],
+    system_prompt: &str,
+    user_use_source: bool,
+    prefix: &str,
+    input_root: &str,
+) -> Result<Vec<String>, String> {
+    let mut by_pair: BTreeMap<String, Vec<&SegmentRecord>> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for segment in segments {
+        let key = pair_key(segment);
+        if !by_pair.contains_key(&key) {
+            order.push(key.clone());
+        }
+        by_pair.entry(key).or_default().push(segment);
+    }
+
+    let mut lines = Vec::new();
+    for key in order {
+        let group = by_pair.get(&key).cloned().unwrap_or_default();
+        let user_segs: Vec<&SegmentRecord> = group
+            .iter()
+            .copied()
+            .filter(|segment| segment.role.as_deref() == Some("user"))
+            .collect();
+        let assistant_segs: Vec<&SegmentRecord> = group
+            .iter()
+            .copied()
+            .filter(|segment| segment.role.as_deref() == Some("assistant"))
+            .collect();
+        let other_segs: Vec<&SegmentRecord> = group
+            .iter()
+            .copied()
+            .filter(|segment| {
+                segment.role.as_deref() != Some("user")
+                    && segment.role.as_deref() != Some("assistant")
+            })
+            .collect();
+
+        if assistant_segs.is_empty() && user_segs.is_empty() && !other_segs.is_empty() {
+            for seg in &other_segs {
+                lines.push(build_single_message_line(
+                    seg,
+                    system_prompt,
+                    prefix,
+                    input_root,
+                )?);
+            }
+            continue;
+        }
+
+        if assistant_segs.is_empty() {
+            for user in &user_segs {
+                lines.push(build_single_message_line(
+                    user,
+                    system_prompt,
+                    prefix,
+                    input_root,
+                )?);
+            }
+            continue;
+        }
+
+        let user_text = user_segs
+            .iter()
+            .map(|seg| {
+                if seg.phonetic_text.trim().is_empty() {
+                    seg.original_text.clone()
+                } else {
+                    seg.phonetic_text.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let user_audio = user_segs.first().map(|seg| {
+            if user_use_source {
+                with_prefix(prefix, &seg.source_path, input_root)
+            } else {
+                with_prefix(prefix, &seg.segment_path, input_root)
+            }
+        });
+
+        for assistant in &assistant_segs {
+            let mut messages = Vec::new();
+            if !system_prompt.trim().is_empty() {
+                messages.push(json!({"role": "system", "content": system_prompt}));
+            }
+            if let Some(audio) = &user_audio {
+                messages.push(json!({
+                    "role": "user",
+                    "content": user_text.clone(),
+                    "audio_file": audio,
+                }));
+            }
+            let assistant_text = if assistant.phonetic_text.trim().is_empty() {
+                assistant.original_text.clone()
+            } else {
+                assistant.phonetic_text.clone()
+            };
+            let mut a_msg = json!({
+                "role": "assistant",
+                "content": [assistant_text],
+                "audio_file": with_prefix(prefix, &assistant.segment_path, input_root),
+            });
+            if !assistant.emotion.is_empty() {
+                a_msg["emotion"] = json!(assistant.emotion);
+            }
+            if !assistant.tags.is_empty() {
+                a_msg["tags"] = json!(assistant.tags);
+            }
+            if !assistant.notes.trim().is_empty() {
+                a_msg["notes"] = json!(assistant.notes);
+            }
+            messages.push(a_msg);
+            lines.push(
+                serde_json::to_string(&json!({"messages": messages}))
+                    .map_err(|err| err.to_string())?,
+            );
+        }
+        for extra in &other_segs {
+            lines.push(build_single_message_line(
+                extra,
+                system_prompt,
+                prefix,
+                input_root,
+            )?);
+        }
+    }
+    Ok(lines)
+}
+
+fn build_single_message_line(
+    segment: &SegmentRecord,
+    system_prompt: &str,
+    prefix: &str,
+    input_root: &str,
+) -> Result<String, String> {
+    let role = segment.role.clone().unwrap_or_else(|| "assistant".into());
+    let mut messages = Vec::new();
+    if !system_prompt.trim().is_empty() {
+        messages.push(json!({"role": "system", "content": system_prompt}));
+    }
+    let text = if segment.phonetic_text.trim().is_empty() {
+        segment.original_text.clone()
+    } else {
+        segment.phonetic_text.clone()
+    };
+    let content = if role == "assistant" {
+        json!([text])
+    } else {
+        json!(text)
+    };
+    let mut msg = json!({
+        "role": role,
+        "content": content,
+        "audio_file": with_prefix(prefix, &segment.segment_path, input_root),
+    });
+    if !segment.emotion.is_empty() {
+        msg["emotion"] = json!(segment.emotion);
+    }
+    if !segment.tags.is_empty() {
+        msg["tags"] = json!(segment.tags);
+    }
+    if !segment.notes.trim().is_empty() {
+        msg["notes"] = json!(segment.notes);
+    }
+    messages.push(msg);
+    serde_json::to_string(&json!({"messages": messages})).map_err(|err| err.to_string())
+}
+
+/// Compute the audio_file value for export.
+/// Behavior:
+/// - If `prefix` is empty: return the local path unchanged.
+/// - If `input_root` is set and `path` is inside it: prepend prefix to the
+///   path relative to `input_root` (with `_dialect_labeler/` stripped if
+///   present, so segments appear as `segments/...` not
+///   `_dialect_labeler/segments/...`).
+/// - Otherwise: prepend prefix to just the file name.
+fn with_prefix(prefix: &str, path: &str, input_root: &str) -> String {
+    if prefix.trim().is_empty() {
+        return path.to_string();
+    }
+    let trimmed_prefix = prefix.trim_end_matches('/').to_string();
+    let normalized_path = path.replace('\\', "/");
+    let rel = compute_relative_for_oss(&normalized_path, input_root);
+    format!("{}/{}", trimmed_prefix, rel)
+}
+
+fn compute_relative_for_oss(path: &str, input_root: &str) -> String {
+    let root_clean = input_root.trim().trim_end_matches('/');
+    if !root_clean.is_empty() {
+        if let Some(stripped) = path.strip_prefix(root_clean) {
+            let mut rel = stripped.trim_start_matches('/').to_string();
+            if let Some(stripped_internal) = rel.strip_prefix(&format!("{}/", PROJECT_FOLDER)) {
+                rel = stripped_internal.to_string();
+            }
+            if !rel.is_empty() {
+                return rel;
+            }
+        }
+    }
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn pair_key(segment: &SegmentRecord) -> String {
+    let stem = path_file_stem(Path::new(&segment.source_path));
+    let role = segment.role.as_deref().unwrap_or("");
+    let pattern = match role {
+        "user" => r"_(?:陪聊|user)$",
+        "assistant" => r"_(?:\d+_)?(?:发音人|assistant)$",
+        _ => r"_(?:\d+_)?(?:发音人|陪聊|user|assistant)$",
+    };
+    let key_re = Regex::new(pattern).expect("valid regex");
+    let trimmed = key_re.replace(&stem, "").to_string();
+    if trimmed.is_empty() {
+        stem
+    } else {
+        trimmed
+    }
+}
+
+/// Split a file stem into (base, optional role suffix). When the stem ends
+/// with a known role marker (`_发音人`, `_陪聊`, `_assistant`, `_user`),
+/// returns the base without that marker plus the marker as a string.
+/// Otherwise returns (stem, None).
+fn split_role_suffix(stem: &str) -> (String, Option<String>) {
+    for suffix in ["发音人", "陪聊", "assistant", "user"] {
+        let marker = format!("_{}", suffix);
+        if let Some(base) = stem.strip_suffix(&marker) {
+            return (base.to_string(), Some(suffix.to_string()));
+        }
+    }
+    (stem.to_string(), None)
 }
 
 #[tauri::command]
 async fn recognize_segments(
     project_dir: String,
     segments: Vec<SegmentRecord>,
-    model: Option<String>,
+    options: Option<RecognitionOptions>,
 ) -> Result<Vec<RecognitionResult>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        recognize_segments_impl(project_dir, segments, model)
+        recognize_segments_impl(project_dir, segments, options.unwrap_or_default())
     })
     .await
     .map_err(|err| err.to_string())?
@@ -702,7 +1158,7 @@ async fn recognize_segments(
 fn recognize_segments_impl(
     project_dir: String,
     segments: Vec<SegmentRecord>,
-    model: Option<String>,
+    options: RecognitionOptions,
 ) -> Result<Vec<RecognitionResult>, String> {
     if segments.is_empty() {
         return Ok(Vec::new());
@@ -711,70 +1167,475 @@ fn recognize_segments_impl(
     ensure_ffmpeg()?;
     let whisper = find_whisper_command()?;
     let project_dir = PathBuf::from(project_dir);
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or_default();
-    let output_dir = project_dir.join(".asr").join(format!("run_{}", stamp));
-    fs::create_dir_all(&output_dir).map_err(|err| err.to_string())?;
+    let cache_dir = project_dir.join(".asr").join("cache");
+    fs::create_dir_all(&cache_dir).map_err(|err| err.to_string())?;
 
-    let model = model
+    let model = options
+        .whisper_model
+        .clone()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "base".to_string());
+        .unwrap_or_else(|| "large-v3".to_string());
+    let initial_prompt = options
+        .initial_prompt
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            "以下是中文方言（长沙话）口语转写，请用汉字记录听到的字音，不要翻译。".to_string()
+        });
+    let use_cache = options.use_cache.unwrap_or(true);
+    let overwrite_cache = options.overwrite_cache.unwrap_or(false);
+    let use_llm = options.use_llm.unwrap_or(false);
+    let ollama_url = options
+        .ollama_url
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+    let ollama_model = options.ollama_model.clone();
+    let llm_prompt = options
+        .llm_prompt
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_LLM_PROMPT.to_string());
 
-    let mut command = Command::new(whisper);
-    command
-        .arg("--model")
-        .arg(model)
-        .arg("--language")
-        .arg("Chinese")
-        .arg("--task")
-        .arg("transcribe")
-        .arg("--output_format")
-        .arg("json")
-        .arg("--output_dir")
-        .arg(&output_dir)
-        .arg("--fp16")
-        .arg("False")
-        .arg("--verbose")
-        .arg("False")
-        .arg("--condition_on_previous_text")
-        .arg("False")
-        .arg("--initial_prompt")
-        .arg("以下是中文方言口语转写，请用中文汉字记录听到的字音，不要翻译。");
+    let mut results: Vec<RecognitionResult> = Vec::with_capacity(segments.len());
+    let mut to_run: Vec<SegmentRecord> = Vec::new();
+    let mut cache_keys: HashMap<String, String> = HashMap::new();
 
     for segment in &segments {
-        let path = PathBuf::from(&segment.segment_path);
-        if !path.is_file() {
+        let segment_path = PathBuf::from(&segment.segment_path);
+        if !segment_path.is_file() {
             return Err(format!("切割片段不存在：{}", segment.segment_path));
         }
-        command.arg(path);
+        let key = asr_cache_key(&segment_path, &model)?;
+        cache_keys.insert(segment.id.clone(), key.clone());
+        let cache_file = cache_dir.join(format!("{}.json", key));
+        if use_cache && !overwrite_cache && cache_file.is_file() {
+            if let Ok(text) = fs::read_to_string(&cache_file) {
+                let value: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+                let raw = value
+                    .get("text")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                results.push(RecognitionResult {
+                    segment_id: segment.id.clone(),
+                    text: raw.clone(),
+                    raw_text: raw,
+                    polished: false,
+                    cached: true,
+                    emotion: None,
+                    tags: Vec::new(),
+                });
+                continue;
+            }
+        }
+        to_run.push(segment.clone());
     }
 
-    let output = command
-        .output()
-        .map_err(|err| format!("无法运行本地 whisper：{}", err))?;
+    if !to_run.is_empty() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_millis())
+            .unwrap_or_default();
+        let output_dir = project_dir.join(".asr").join(format!("run_{}", stamp));
+        fs::create_dir_all(&output_dir).map_err(|err| err.to_string())?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
-            "whisper 识别失败：{}{}",
-            stderr.trim(),
-            stdout.trim()
-        ));
+        let mut command = Command::new(whisper);
+        command
+            .arg("--model")
+            .arg(&model)
+            .arg("--language")
+            .arg("Chinese")
+            .arg("--task")
+            .arg("transcribe")
+            .arg("--output_format")
+            .arg("json")
+            .arg("--output_dir")
+            .arg(&output_dir)
+            .arg("--fp16")
+            .arg("False")
+            .arg("--verbose")
+            .arg("False")
+            .arg("--condition_on_previous_text")
+            .arg("False")
+            .arg("--initial_prompt")
+            .arg(&initial_prompt);
+
+        for segment in &to_run {
+            command.arg(&segment.segment_path);
+        }
+
+        let output = command
+            .output()
+            .map_err(|err| format!("无法运行本地 whisper：{}", err))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(format!(
+                "whisper 识别失败：{}{}",
+                stderr.trim(),
+                stdout.trim()
+            ));
+        }
+
+        for segment in to_run {
+            let segment_path = PathBuf::from(&segment.segment_path);
+            let raw = read_whisper_json_text(&output_dir, &segment_path)?;
+            if let Some(key) = cache_keys.get(&segment.id) {
+                let cache_file = cache_dir.join(format!("{}.json", key));
+                let _ = fs::write(&cache_file, json!({"text": raw}).to_string());
+            }
+            results.push(RecognitionResult {
+                segment_id: segment.id.clone(),
+                text: raw.clone(),
+                raw_text: raw,
+                polished: false,
+                cached: false,
+                emotion: None,
+                tags: Vec::new(),
+            });
+        }
     }
 
-    let mut results = Vec::with_capacity(segments.len());
-    for segment in segments {
-        let path = PathBuf::from(&segment.segment_path);
-        let text = read_whisper_json_text(&output_dir, &path)?;
-        results.push(RecognitionResult {
-            segment_id: segment.id,
-            text,
-        });
+    let id_to_segment: HashMap<String, &SegmentRecord> =
+        segments.iter().map(|s| (s.id.clone(), s)).collect();
+    let id_to_index: HashMap<String, usize> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.clone(), i))
+        .collect();
+    results.sort_by_key(|r| {
+        id_to_index
+            .get(&r.segment_id)
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+
+    if use_llm {
+        let model_name = ollama_model
+            .clone()
+            .ok_or_else(|| "未指定 Ollama 模型".to_string())?;
+        for result in results.iter_mut() {
+            if result.text.trim().is_empty() {
+                continue;
+            }
+            let segment = match id_to_segment.get(&result.segment_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let role = segment.role.clone().unwrap_or_else(|| "assistant".into());
+            match polish_text(
+                &ollama_url,
+                &model_name,
+                &llm_prompt,
+                &result.text,
+                &role,
+                segment.original_text.as_str(),
+            ) {
+                Ok(polished) => {
+                    if !polished.text.trim().is_empty() {
+                        result.text = polished.text;
+                        result.polished = true;
+                        result.emotion = polished.emotion;
+                        result.tags = polished.tags;
+                    }
+                }
+                Err(err) => {
+                    return Err(format!("Ollama 后处理失败：{}", err));
+                }
+            }
+        }
     }
+
     Ok(results)
+}
+
+fn polish_text(
+    ollama_url: &str,
+    model: &str,
+    prompt_template: &str,
+    raw_text: &str,
+    role: &str,
+    hint: &str,
+) -> Result<PolishedOutput, String> {
+    let role_label = match role {
+        "user" => "陪聊（普通话提问者）",
+        "assistant" => "发音人（说长沙方言）",
+        _ => "未知角色",
+    };
+    let hint_block = if hint.trim().is_empty() {
+        String::new()
+    } else {
+        format!("【参考文本（仅供对照，可能为空或不准确）】\n{}\n", hint)
+    };
+    let user_msg = format!(
+        "【角色】{}\n{}【Whisper 识别初稿】\n{}\n\n严格按照系统提示词的 JSON 格式输出。",
+        role_label, hint_block, raw_text
+    );
+
+    let body = json!({
+        "model": model,
+        "stream": false,
+        "format": "json",
+        "options": {
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "num_ctx": 8192
+        },
+        "messages": [
+            {"role": "system", "content": prompt_template},
+            {"role": "user", "content": user_msg}
+        ]
+    });
+
+    let url = format!("{}/api/chat", ollama_url.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(180))
+        .build();
+    let response = agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(body)
+        .map_err(|err| err.to_string())?;
+    let value: Value = response.into_json().map_err(|err| err.to_string())?;
+    let content = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or_default();
+    Ok(parse_polished_output(content, raw_text))
+}
+
+fn strip_thinking(text: &str) -> String {
+    let cleaned = Regex::new(r"(?s)<think>.*?</think>")
+        .map(|re| re.replace_all(text, "").to_string())
+        .unwrap_or_else(|_| text.to_string());
+    cleaned.trim().to_string()
+}
+
+fn parse_polished_output(content: &str, fallback: &str) -> PolishedOutput {
+    let cleaned = strip_thinking(content);
+    let trimmed = cleaned
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        let text = value
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| cleaned.clone());
+        let emotion = value
+            .get("emotion")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let tags = value
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return PolishedOutput {
+            text,
+            emotion,
+            tags,
+        };
+    }
+
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            if end > start {
+                let candidate = &trimmed[start..=end];
+                if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+                    let text = value
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_else(|| cleaned.clone());
+                    let emotion = value
+                        .get("emotion")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let tags = value
+                        .get("tags")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|item| item.as_str().map(|s| s.trim().to_string()))
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    return PolishedOutput {
+                        text,
+                        emotion,
+                        tags,
+                    };
+                }
+            }
+        }
+    }
+
+    let text_only = if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    };
+    PolishedOutput {
+        text: text_only,
+        emotion: None,
+        tags: Vec::new(),
+    }
+}
+
+#[tauri::command]
+async fn polish_text_with_llm(
+    text: String,
+    role: Option<String>,
+    hint: Option<String>,
+    ollama_url: Option<String>,
+    ollama_model: Option<String>,
+    llm_prompt: Option<String>,
+) -> Result<PolishedOutput, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let url = ollama_url.unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+        let model = ollama_model.ok_or_else(|| "未指定 Ollama 模型".to_string())?;
+        let prompt = llm_prompt.unwrap_or_else(|| DEFAULT_LLM_PROMPT.to_string());
+        polish_text(
+            &url,
+            &model,
+            &prompt,
+            text.trim(),
+            role.as_deref().unwrap_or("assistant"),
+            hint.as_deref().unwrap_or(""),
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+fn get_default_llm_prompt() -> String {
+    DEFAULT_LLM_PROMPT.to_string()
+}
+
+#[tauri::command]
+async fn list_ollama_models(url: Option<String>) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = url.unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+        let url = format!("{}/api/tags", base.trim_end_matches('/'));
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(8))
+            .build();
+        let response = agent.get(&url).call().map_err(|err| err.to_string())?;
+        let value: Value = response.into_json().map_err(|err| err.to_string())?;
+        let mut models = Vec::new();
+        if let Some(arr) = value.get("models").and_then(|m| m.as_array()) {
+            for item in arr {
+                if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                    models.push(name.to_string());
+                }
+            }
+        }
+        Ok(models)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+async fn check_dependencies(ollama_url: Option<String>) -> Result<DependencyStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let url = ollama_url.unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+
+        let (whisper_path, whisper_error) = match find_whisper_command() {
+            Ok(name) => {
+                let resolved = Command::new("which")
+                    .arg(name)
+                    .output()
+                    .ok()
+                    .and_then(|out| String::from_utf8(out.stdout).ok())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| name.to_string());
+                (Some(resolved), None)
+            }
+            Err(err) => (None, Some(err)),
+        };
+
+        let ffmpeg_status = ensure_ffmpeg();
+        let (ffmpeg_ok, ffmpeg_error) = match ffmpeg_status {
+            Ok(()) => (true, None),
+            Err(err) => (false, Some(err)),
+        };
+
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(4))
+            .build();
+        let tags_url = format!("{}/api/tags", url.trim_end_matches('/'));
+        let mut models: Vec<String> = Vec::new();
+        let mut ollama_ok = false;
+        let mut ollama_error: Option<String> = None;
+        match agent.get(&tags_url).call() {
+            Ok(resp) => {
+                ollama_ok = true;
+                if let Ok(value) = resp.into_json::<Value>() {
+                    if let Some(arr) = value.get("models").and_then(|m| m.as_array()) {
+                        for item in arr {
+                            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                                models.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                ollama_error = Some(err.to_string());
+            }
+        }
+
+        Ok(DependencyStatus {
+            whisper_ok: whisper_path.is_some(),
+            whisper_path,
+            whisper_error,
+            ffmpeg_ok,
+            ffmpeg_error,
+            ollama_ok,
+            ollama_url: url,
+            ollama_models: models,
+            ollama_error,
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+fn asr_cache_key(path: &Path, model: &str) -> Result<String, String> {
+    let metadata = fs::metadata(path).map_err(|err| err.to_string())?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    path_to_string(path).hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified.hash(&mut hasher);
+    model.hash(&mut hasher);
+    Ok(format!(
+        "{}_{:x}",
+        safe_name(&path_file_stem(path)),
+        hasher.finish()
+    ))
 }
 
 fn find_whisper_command() -> Result<&'static str, String> {
@@ -783,7 +1644,10 @@ fn find_whisper_command() -> Result<&'static str, String> {
             return Ok(command);
         }
     }
-    Err("未找到本地 whisper 命令；请先安装 openai-whisper 或配置本地识别工具".to_string())
+    Err(
+        "未找到本地 whisper 命令；请先 pip install openai-whisper 或在设置中调整识别工具"
+            .to_string(),
+    )
 }
 
 fn read_whisper_json_text(output_dir: &Path, input_path: &Path) -> Result<String, String> {
@@ -1452,6 +2316,131 @@ mod tests {
     }
 
     #[test]
+    fn split_role_suffix_recognizes_known_markers() {
+        assert_eq!(
+            split_role_suffix("自由演绎_0001_02_发音人"),
+            ("自由演绎_0001_02".to_string(), Some("发音人".to_string())),
+        );
+        assert_eq!(
+            split_role_suffix("自由演绎_0001_02_陪聊"),
+            ("自由演绎_0001_02".to_string(), Some("陪聊".to_string())),
+        );
+        assert_eq!(
+            split_role_suffix("random_audio"),
+            ("random_audio".to_string(), None),
+        );
+    }
+
+    #[test]
+    fn with_prefix_uses_input_root_relative_path() {
+        let oss = "oss://bucket/dialect";
+        // Path inside the input root, but inside _dialect_labeler internal dir.
+        let result = with_prefix(
+            oss,
+            "/Users/me/audio/dataset/_dialect_labeler/segments/x/y.wav",
+            "/Users/me/audio/dataset",
+        );
+        assert_eq!(result, "oss://bucket/dialect/segments/x/y.wav");
+
+        // Source audio file relative to root.
+        let src = with_prefix(
+            oss,
+            "/Users/me/audio/dataset/sub/file_陪聊.wav",
+            "/Users/me/audio/dataset",
+        );
+        assert_eq!(src, "oss://bucket/dialect/sub/file_陪聊.wav");
+
+        // Path outside the input root falls back to file name only.
+        let out = with_prefix(oss, "/elsewhere/file.wav", "/Users/me/audio/dataset");
+        assert_eq!(out, "oss://bucket/dialect/file.wav");
+
+        // Empty prefix returns path unchanged.
+        let raw = with_prefix("", "/foo/bar.wav", "/foo");
+        assert_eq!(raw, "/foo/bar.wav");
+    }
+
+    #[test]
+    fn pair_key_strips_role_suffix() {
+        let assistant = SegmentRecord {
+            id: "x".into(),
+            source_path: "/audio/自由演绎_0001_01_01_发音人.wav".into(),
+            source_file_name: "自由演绎_0001_01_01_发音人.wav".into(),
+            segment_path: "/segments/x.wav".into(),
+            segment_file_name: "x.wav".into(),
+            role: Some("assistant".into()),
+            start_ms: 0,
+            end_ms: 1000,
+            duration_ms: 1000,
+            original_text: String::new(),
+            phonetic_text: String::new(),
+            emotion: Vec::new(),
+            tags: Vec::new(),
+            notes: String::new(),
+        };
+        assert_eq!(pair_key(&assistant), "自由演绎_0001_01");
+
+        let user_seg = SegmentRecord {
+            source_path: "/audio/自由演绎_0001_01_陪聊.wav".into(),
+            source_file_name: "自由演绎_0001_01_陪聊.wav".into(),
+            role: Some("user".into()),
+            ..assistant.clone()
+        };
+        assert_eq!(pair_key(&user_seg), "自由演绎_0001_01");
+    }
+
+    #[test]
+    fn export_paired_uses_messages_format() {
+        let user = SegmentRecord {
+            id: "u".into(),
+            source_path: "/audio/free_001_01_陪聊.wav".into(),
+            source_file_name: "free_001_01_陪聊.wav".into(),
+            segment_path: "/segments/u_01.wav".into(),
+            segment_file_name: "u_01.wav".into(),
+            role: Some("user".into()),
+            start_ms: 0,
+            end_ms: 1000,
+            duration_ms: 1000,
+            original_text: "你吃过冬瓜山的烤肠吗".into(),
+            phonetic_text: "你吃过冬瓜山的烤肠吗".into(),
+            emotion: vec![],
+            tags: vec![],
+            notes: String::new(),
+        };
+        let assistant = SegmentRecord {
+            id: "a".into(),
+            source_path: "/audio/free_001_01_01_发音人.wav".into(),
+            source_file_name: "free_001_01_01_发音人.wav".into(),
+            segment_path: "/segments/a_01.wav".into(),
+            segment_file_name: "a_01.wav".into(),
+            role: Some("assistant".into()),
+            start_ms: 0,
+            end_ms: 1500,
+            duration_ms: 1500,
+            original_text: String::new(),
+            phonetic_text: "冬瓜山的烤肠啊我挨的吃过啊".into(),
+            emotion: vec!["中立".into()],
+            tags: vec![],
+            notes: String::new(),
+        };
+        let lines = build_paired_jsonl(
+            &[user, assistant],
+            "长沙本地人，女性，25岁左右",
+            true,
+            "",
+            "",
+        )
+        .expect("paired");
+        assert_eq!(lines.len(), 1);
+        let value: Value = serde_json::from_str(&lines[0]).expect("valid json");
+        let messages = value.get("messages").and_then(|m| m.as_array()).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert!(messages[2]["content"].is_array());
+    }
+
+    #[test]
     fn cuts_to_uncompressed_pcm_wav() {
         if ensure_ffmpeg().is_err() {
             return;
@@ -1522,47 +2511,6 @@ mod tests {
     }
 
     #[test]
-    fn prepares_playback_data_url_for_24_bit_wav() {
-        if ensure_ffmpeg().is_err() {
-            return;
-        }
-
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_millis();
-        let root = std::env::temp_dir().join(format!("dialect_labeler_playback_{}", stamp));
-        fs::create_dir_all(&root).expect("test temp dir should be created");
-        let input = root.join("sample24.wav");
-
-        let status = Command::new("ffmpeg")
-            .arg("-y")
-            .arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-f")
-            .arg("lavfi")
-            .arg("-i")
-            .arg("sine=frequency=440:duration=0.2:sample_rate=48000")
-            .arg("-c:a")
-            .arg("pcm_s24le")
-            .arg(&input)
-            .status()
-            .expect("ffmpeg should run");
-        assert!(status.success());
-
-        let playback = prepare_playback_audio_impl(path_to_string(&input), path_to_string(&root))
-            .expect("playback preview should be generated");
-        assert!(playback.is_preview);
-        assert!(Path::new(&playback.path).is_file());
-
-        let probe = probe_audio(Path::new(&playback.path)).expect("preview probes");
-        assert_eq!(probe.codec_name.as_deref(), Some("pcm_s16le"));
-
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
     fn splits_text_across_segments_by_duration() {
         let chunks = split_text_by_ranges("冬瓜山的烤肠啊", &[(0.0, 1.0), (1.0, 3.0), (3.0, 4.0)]);
         assert_eq!(chunks.len(), 3);
@@ -1611,6 +2559,7 @@ pub fn run() {
         .manage(AudioPlayerState::new())
         .invoke_handler(tauri::generate_handler![
             prepare_playback_audio,
+            read_waveform_peaks,
             play_audio,
             pause_audio,
             stop_audio,
@@ -1618,6 +2567,10 @@ pub fn run() {
             scan_project_folder,
             cut_audio_file,
             recognize_segments,
+            polish_text_with_llm,
+            list_ollama_models,
+            check_dependencies,
+            get_default_llm_prompt,
             save_project_file,
             load_project_file,
             export_segments_jsonl

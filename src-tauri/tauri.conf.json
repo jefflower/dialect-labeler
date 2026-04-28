@@ -12,11 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "Dialect Labeler",
-        "width": 1320,
-        "height": 860,
+        "title": "长沙方言标注工作台",
+        "width": 1440,
+        "height": 920,
         "minWidth": 1100,
-        "minHeight": 720
+        "minHeight": 720,
+        "dragDropEnabled": true
       }
     ],
     "security": {
