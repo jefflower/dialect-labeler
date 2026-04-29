@@ -1160,6 +1160,67 @@ function App() {
     });
   }
 
+  /**
+   * Sweep every segment's phoneticText and strip any inline tag whose name
+   * is NOT in the current `settings.inlineTags` dictionary. Useful after the
+   * spec changes (e.g. when `<pause/>` was retired from the legal set but
+   * already-recognised segments still carry it). Preserves the wrapped
+   * content; only the tag tokens themselves are removed.
+   */
+  function purgeOrphanInlineTags() {
+    if (!scan || segments.length === 0) {
+      pushToast({ variant: "warning", title: "没有可扫描的片段" });
+      return;
+    }
+    const legal = new Set(
+      inlineTags.map((item) => item.tag.toLowerCase()),
+    );
+    const tagRe =
+      /<\/?([a-zA-Z][a-zA-Z0-9-]*)\s*\/?>|\[([a-zA-Z][a-zA-Z0-9-]*)\]/g;
+
+    let totalRemoved = 0;
+    const seenOrphans = new Map<string, number>();
+    const cleaned = segments.map((segment) => {
+      const text = segment.phoneticText;
+      if (!text) return segment;
+      let perSegRemoved = 0;
+      const next = text.replace(tagRe, (match, openClose, bracket) => {
+        const name = (openClose ?? bracket ?? "").toLowerCase();
+        if (legal.has(name)) return match;
+        perSegRemoved += 1;
+        seenOrphans.set(name, (seenOrphans.get(name) ?? 0) + 1);
+        return "";
+      });
+      if (perSegRemoved === 0) return segment;
+      totalRemoved += perSegRemoved;
+      return { ...segment, phoneticText: next };
+    });
+
+    if (totalRemoved === 0) {
+      pushToast({
+        variant: "info",
+        title: "没有发现废弃标签",
+        detail: `所有 inline 标签都在当前字典里（共 ${legal.size} 个合法标签）`,
+      });
+      return;
+    }
+
+    const orphanList = [...seenOrphans.entries()]
+      .map(([name, n]) => `${name}×${n}`)
+      .join("、");
+    if (
+      !window.confirm(
+        `将从 ${segments.length} 段中清除 ${totalRemoved} 处废弃 inline 标签：\n\n${orphanList}\n\n继续？（操作可撤销 ⌘Z）`,
+      )
+    ) {
+      return;
+    }
+
+    setSegments(cleaned);
+    void saveProjectSnapshot(cleaned);
+    showSuccess("已清理废弃标签", `去除 ${totalRemoved} 处 · ${orphanList}`);
+  }
+
   /** Push a snapshot of `prev` to the per-segment undo stack. */
   function pushHistory(prev: SegmentRecord, instant = false) {
     const now = Date.now();
@@ -1402,6 +1463,7 @@ function App() {
           settings={settings}
           onChange={updateSettings}
           onResetPrompt={resetLlmPrompt}
+          onPurgeOrphanTags={purgeOrphanInlineTags}
           onClose={() => setSettingsOpen(false)}
         />
         <ShortcutOverlay
@@ -1504,6 +1566,7 @@ function App() {
         settings={settings}
         onChange={updateSettings}
         onResetPrompt={resetLlmPrompt}
+          onPurgeOrphanTags={purgeOrphanInlineTags}
         onClose={() => setSettingsOpen(false)}
       />
       <ShortcutOverlay

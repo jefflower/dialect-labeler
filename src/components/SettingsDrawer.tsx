@@ -32,6 +32,7 @@ type SettingsDrawerProps = {
   settings: AppSettings;
   onChange: (patch: Partial<AppSettings>) => void;
   onResetPrompt: () => void;
+  onPurgeOrphanTags?: () => void;
   onClose: () => void;
 };
 
@@ -157,6 +158,7 @@ export function SettingsDrawer({
   settings,
   onChange,
   onResetPrompt,
+  onPurgeOrphanTags,
   onClose,
 }: SettingsDrawerProps) {
   const [models, setModels] = useState<string[]>([]);
@@ -616,6 +618,26 @@ export function SettingsDrawer({
                 标注页 1-{settings.emotions.length} 数字键依次对应这些情感（最多 9 个）。
               </p>
             </div>
+
+            {onPurgeOrphanTags && (
+              <div className="tag-editor">
+                <div className="tag-editor-head">
+                  <strong>数据清理</strong>
+                </div>
+                <p className="section-hint" style={{ marginTop: 0 }}>
+                  扫所有片段的 phoneticText，删除不在以上字典里的 inline 标签
+                  （如旧版残留的 <code>&lt;pause/&gt;</code>），保留被包裹的字。
+                </p>
+                <button
+                  className="btn-ghost"
+                  onClick={onPurgeOrphanTags}
+                  style={{ alignSelf: "flex-start" }}
+                >
+                  <Trash2 size={14} />
+                  清理废弃 inline 标签
+                </button>
+              </div>
+            )}
           </section>
 
           {!REVIEW_ONLY && <section className="drawer-section">
