@@ -133,6 +133,8 @@ export const defaultAppSettings: AppSettings = {
   segmentTags: defaultSegmentTags,
   emotions: defaultEmotions,
   cutPresets: defaultCutPresets,
+  llmConcurrency: 2,
+  ollamaExtraUrls: [],
 };
 
 export const roleLabels: Record<string, string> = {

@@ -80,6 +80,9 @@ export const ipc = {
   saveProjectFile(args: { projectDir: string; payload: ProjectFile }) {
     return invoke<string>("save_project_file", args);
   },
+  backupProjectFile(args: { projectDir: string }) {
+    return invoke<string | null>("backup_project_file", args);
+  },
   loadProjectFile(args: { projectDir: string }) {
     return invoke<ProjectFile>("load_project_file", args);
   },

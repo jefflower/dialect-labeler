@@ -353,6 +353,68 @@ export function SettingsDrawer({
               <code>ollama pull qwen2.5:32b</code>
             </p>
             <div className="drawer-row stack">
+              <label>
+                额外 Ollama 端点（可选，多机并发）
+              </label>
+              {(settings.ollamaExtraUrls ?? []).map((url, idx) => (
+                <div key={idx} style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                  <input
+                    value={url}
+                    placeholder="http://192.168.x.x:11434"
+                    onChange={(event) =>
+                      onChange({
+                        ollamaExtraUrls: (settings.ollamaExtraUrls ?? []).map(
+                          (u, i) => (i === idx ? event.target.value : u),
+                        ),
+                      })
+                    }
+                  />
+                  <button
+                    className="btn-ghost btn-icon"
+                    onClick={() =>
+                      onChange({
+                        ollamaExtraUrls: (settings.ollamaExtraUrls ?? []).filter(
+                          (_, i) => i !== idx,
+                        ),
+                      })
+                    }
+                    title="删除此端点"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
+              <button
+                className="btn-ghost"
+                onClick={() =>
+                  onChange({
+                    ollamaExtraUrls: [...(settings.ollamaExtraUrls ?? []), ""],
+                  })
+                }
+                style={{ alignSelf: "flex-start", marginTop: 6 }}
+              >
+                <Plus size={12} /> 添加端点
+              </button>
+              <p className="help-tip" style={{ marginTop: 6 }}>
+                工作会自动在「主端点 + 额外端点」之间轮转分发。例如填一台 LAN 内的另一台 Ollama 机器，识别速度可翻倍。
+              </p>
+            </div>
+            <div className="drawer-row">
+              <label>并发请求数</label>
+              <input
+                type="number"
+                min={1}
+                max={16}
+                value={settings.llmConcurrency ?? 2}
+                onChange={(event) =>
+                  onChange({
+                    llmConcurrency: Math.max(1, Number(event.target.value)),
+                  })
+                }
+                title="一批内最多同时发出的 Ollama 请求数。建议 = 端点数 × 2"
+              />
+            </div>
+            <div className="drawer-row stack">
               <label>方言改写 Prompt</label>
               <textarea
                 value={settings.llmPrompt}

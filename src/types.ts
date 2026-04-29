@@ -86,12 +86,17 @@ export type PolishedOutput = {
 export type RecognitionOptions = {
   whisperModel?: string;
   useLlm?: boolean;
+  /** Primary Ollama endpoint. */
   ollamaUrl?: string;
+  /** Optional extra endpoints — work is round-robined across the pool. */
+  ollamaExtraUrls?: string[];
   ollamaModel?: string;
   llmPrompt?: string;
   initialPrompt?: string;
   useCache?: boolean;
   overwriteCache?: boolean;
+  /** How many Ollama HTTP calls to fire in parallel across the pool. */
+  llmConcurrency?: number;
 };
 
 export type ExportOptions = {
@@ -211,4 +216,10 @@ export type AppSettings = {
   emotions: string[];
   /** Cut strategy presets (built-in + user-saved). */
   cutPresets: CutPresetDef[];
+  /** Parallel Ollama calls per batch (default 2). Set higher with more
+   *  endpoints or with `OLLAMA_NUM_PARALLEL` configured on the server. */
+  llmConcurrency: number;
+  /** Additional Ollama endpoints — primary `ollamaUrl` plus these are
+   *  round-robined for the LLM polish step. Empty list = single endpoint. */
+  ollamaExtraUrls: string[];
 };

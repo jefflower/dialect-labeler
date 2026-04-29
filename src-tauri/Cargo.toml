@@ -27,3 +27,4 @@ regex = "1"
 base64 = "0.22"
 rodio = "0.20"
 ureq = { version = "2", features = ["json"] }
+rayon = "1"

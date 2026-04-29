@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use regex::Regex;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::{Deserialize, Serialize};
@@ -117,8 +118,14 @@ struct RecognitionOptions {
     whisper_model: Option<String>,
     #[serde(default)]
     use_llm: Option<bool>,
+    /// Primary Ollama endpoint (backwards-compat).
     #[serde(default)]
     ollama_url: Option<String>,
+    /// Optional pool of *additional* Ollama endpoints. Tasks are dealt out
+    /// round-robin across `[ollama_url, ...ollama_extra_urls]` so an extra
+    /// machine on the LAN can absorb half (or 1/N) of the LLM polish work.
+    #[serde(default)]
+    ollama_extra_urls: Option<Vec<String>>,
     #[serde(default)]
     ollama_model: Option<String>,
     #[serde(default)]
@@ -129,6 +136,11 @@ struct RecognitionOptions {
     use_cache: Option<bool>,
     #[serde(default)]
     overwrite_cache: Option<bool>,
+    /// Maximum number of Ollama HTTP requests fired in parallel within a
+    /// batch. Default 2. With multiple endpoints set this to N × endpoints
+    /// to fully saturate the pool.
+    #[serde(default)]
+    llm_concurrency: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -832,6 +844,47 @@ fn save_project_file(project_dir: String, payload: Value) -> Result<String, Stri
     Ok(path_to_string(&path))
 }
 
+/// Make a timestamped copy of the project.json so a destructive operation
+/// (e.g. re-cutting an audio whose segments were already annotated) can be
+/// rolled back manually. Returns the backup path. Silently no-ops if
+/// project.json doesn't exist yet.
+#[tauri::command]
+fn backup_project_file(project_dir: String) -> Result<Option<String>, String> {
+    let dir = PathBuf::from(project_dir);
+    let src = dir.join("project.json");
+    if !src.is_file() {
+        return Ok(None);
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    let backup_dir = dir.join(".backups");
+    fs::create_dir_all(&backup_dir).map_err(|err| err.to_string())?;
+    let dst = backup_dir.join(format!("project.{}.json.bak", stamp));
+    fs::copy(&src, &dst).map_err(|err| err.to_string())?;
+
+    // Trim old backups: keep at most 20 most recent. Sorted by name (which is
+    // timestamp-prefixed) gives chronological order.
+    if let Ok(entries) = fs::read_dir(&backup_dir) {
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("project.") && n.ends_with(".json.bak"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+        let excess = paths.len().saturating_sub(20);
+        for p in paths.into_iter().take(excess) {
+            let _ = fs::remove_file(p);
+        }
+    }
+    Ok(Some(path_to_string(&dst)))
+}
+
 #[tauri::command]
 fn load_project_file(project_dir: String) -> Result<Value, String> {
     let path = PathBuf::from(project_dir).join("project.json");
@@ -977,6 +1030,41 @@ fn export_dataset_bundle_impl(
     let jsonl_path = bundle_canonical.join("export.jsonl");
     fs::write(&jsonl_path, format!("{}\n", lines.join("\n")))
         .map_err(|err| err.to_string())?;
+
+    // Also write project.json into the bundle so a downstream reviewer
+    // (e.g. the Windows audit build) can resume editing with all
+    // annotations intact. Paths are already pointed at the bundle's own
+    // segments/ + source/ subdirectories from the copy step above, so the
+    // file is portable to any machine that opens the same directory.
+    let saved_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let project_payload = serde_json::json!({
+        "version": 2,
+        "savedAt": format!("epoch_ms_{}", saved_at_ms),
+        "rootPath": bundle_root_str.clone(),
+        "projectDir": bundle_root_str.clone(),
+        "segmentsDir": path_to_string(&segments_out),
+        "config": {
+            "silenceDb": -35.0,
+            "minSilenceMs": 450,
+            "minSegmentMs": 300,
+            "preRollMs": 100,
+            "postRollMs": 200,
+            "maxSegmentMs": 30000
+        },
+        "audioFiles": Vec::<Value>::new(),
+        "manifestRecords": Vec::<Value>::new(),
+        "segments": new_segments,
+        "systemPrompt": system_prompt
+    });
+    let project_path = bundle_canonical.join("project.json");
+    fs::write(
+        &project_path,
+        serde_json::to_string_pretty(&project_payload).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
 
     let readme_path = bundle_canonical.join("README.md");
     let readme = format!(
@@ -1513,48 +1601,120 @@ fn recognize_segments_impl(
         let model_name = ollama_model
             .clone()
             .ok_or_else(|| "未指定 Ollama 模型".to_string())?;
-        let mut llm_failures: Vec<String> = Vec::new();
-        for result in results.iter_mut() {
-            if result.text.trim().is_empty() {
-                continue;
-            }
-            let segment = match id_to_segment.get(&result.segment_id) {
-                Some(s) => s,
-                None => continue,
-            };
-            let role = segment.role.clone().unwrap_or_else(|| "assistant".into());
-            match polish_text(
-                &ollama_url,
-                &model_name,
-                &llm_prompt,
-                &result.text,
-                &role,
-                segment.original_text.as_str(),
-            ) {
-                Ok(polished) => {
-                    if !polished.text.trim().is_empty() {
-                        result.text = polished.text;
-                        result.polished = true;
-                        result.emotion = polished.emotion;
-                        result.tags = polished.tags;
-                    }
-                }
-                Err(err) => {
-                    // Per-segment graceful fallback: keep the Whisper text and
-                    // record the failure. The frontend surfaces this as a toast
-                    // so users know LLM polish didn't run, but the recognition
-                    // step still landed.
-                    eprintln!(
-                        "[recognize] Ollama polish failed for segment {}: {}",
-                        result.segment_id, err
-                    );
-                    llm_failures.push(format!("{}: {}", result.segment_id, err));
+
+        // Build the endpoint pool: primary URL + any extras. Round-robin
+        // across these inside the parallel iterator below so a second LAN
+        // machine can absorb half the load.
+        let mut endpoints: Vec<String> =
+            vec![ollama_url.clone()];
+        if let Some(extras) = options.ollama_extra_urls.as_ref() {
+            for url in extras {
+                let trimmed = url.trim();
+                if !trimmed.is_empty() && trimmed != ollama_url {
+                    endpoints.push(trimmed.to_string());
                 }
             }
         }
-        if !llm_failures.is_empty() && llm_failures.len() == results.len() {
-            // Every single LLM call failed — that's a config error worth
-            // surfacing as a hard error so the user fixes it.
+        let endpoint_count = endpoints.len();
+
+        // Default concurrency = 2 per endpoint, capped at 8 total. Users can
+        // override via the settings drawer if their Ollama server's
+        // OLLAMA_NUM_PARALLEL allows more.
+        let concurrency = options
+            .llm_concurrency
+            .unwrap_or((endpoint_count as u32 * 2).min(8))
+            .max(1) as usize;
+
+        // Build a fixed-size rayon thread pool so we don't blow up parallelism
+        // beyond what the Ollama server (or the local machine's RAM) can
+        // handle. Each thread owns its own ureq Agent — http connections do
+        // not need to be shared.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(concurrency)
+            .build()
+            .map_err(|err| format!("线程池创建失败：{}", err))?;
+
+        // Snapshot the work first so we can do `.into_par_iter()` ergonomically.
+        // Each task is fully self-contained (clones the strings it needs).
+        // The endpoint is pre-assigned round-robin across the pool so each
+        // server gets ~equal load; failures on one endpoint don't poison
+        // the others (per-segment graceful fallback below).
+        struct Task {
+            idx: usize,
+            endpoint: String,
+            segment_id: String,
+            raw_text: String,
+            role: String,
+            hint: String,
+        }
+        let tasks: Vec<Task> = results
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, r)| {
+                if r.text.trim().is_empty() {
+                    return None;
+                }
+                let segment = id_to_segment.get(&r.segment_id)?;
+                Some(Task {
+                    idx,
+                    endpoint: endpoints[idx % endpoint_count].clone(),
+                    segment_id: r.segment_id.clone(),
+                    raw_text: r.text.clone(),
+                    role: segment.role.clone().unwrap_or_else(|| "assistant".into()),
+                    hint: segment.original_text.clone(),
+                })
+            })
+            .collect();
+
+        let total_to_polish = tasks.len();
+        let model_arc = model_name.clone();
+        let prompt_arc = llm_prompt.clone();
+
+        eprintln!(
+            "[recognize] polish {} segs · {} endpoint(s) · concurrency={}",
+            total_to_polish, endpoint_count, concurrency
+        );
+
+        let polished_results: Vec<(usize, String, Result<PolishedOutput, String>)> = pool
+            .install(|| {
+                tasks
+                    .into_par_iter()
+                    .map(|task| {
+                        let res = polish_text(
+                            &task.endpoint,
+                            &model_arc,
+                            &prompt_arc,
+                            &task.raw_text,
+                            &task.role,
+                            &task.hint,
+                        );
+                        (task.idx, task.segment_id, res)
+                    })
+                    .collect()
+            });
+
+        let mut llm_failures: Vec<String> = Vec::new();
+        for (idx, segment_id, res) in polished_results {
+            match res {
+                Ok(polished) => {
+                    if !polished.text.trim().is_empty() {
+                        results[idx].text = polished.text;
+                        results[idx].polished = true;
+                        results[idx].emotion = polished.emotion;
+                        results[idx].tags = polished.tags;
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[recognize] Ollama polish failed for segment {}: {}",
+                        segment_id, err
+                    );
+                    llm_failures.push(format!("{}: {}", segment_id, err));
+                }
+            }
+        }
+
+        if !llm_failures.is_empty() && llm_failures.len() == total_to_polish {
             return Err(format!(
                 "Ollama 全部失败（{} 段）。最后一段错误：{}",
                 llm_failures.len(),
@@ -2867,6 +3027,7 @@ pub fn run() {
             check_dependencies,
             get_default_llm_prompt,
             save_project_file,
+            backup_project_file,
             load_project_file,
             export_segments_jsonl,
             export_dataset_bundle

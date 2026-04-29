@@ -562,7 +562,6 @@ function App() {
 
   async function cutAll() {
     if (!scan || scan.audioFiles.length === 0) return;
-    setBusy(true);
     setAnnotationSegmentId("");
     setSelectedSegmentId("");
     try {
@@ -578,6 +577,7 @@ function App() {
         });
         return;
       }
+      setBusy(true);
       const newSegments = await cutAudioBatch(scan, audioToCut);
       const recognizedCount = autoRecognizeAfterCut
         ? await recognizeDraft(
@@ -605,6 +605,25 @@ function App() {
 
   async function cutOne(audio: AudioFileInfo) {
     if (!scan) return;
+    // Guard: refuse to silently overwrite recognised segments. The user MUST
+    // see a warning showing how much annotation work is about to be lost.
+    const existing = segments.filter(
+      (segment) => segment.sourcePath === audio.path,
+    );
+    const recognised = existing.filter((segment) =>
+      segment.phoneticText.trim(),
+    );
+    if (recognised.length > 0) {
+      const ok = window.confirm(
+        `⚠️ 重切将丢失 ${recognised.length}/${existing.length} 段已识别/已标注内容（${audio.fileName}）。\n\n建议先「保存」做备份。\n\n继续重切吗？`,
+      );
+      if (!ok) return;
+    }
+    // Best-effort backup of the current project.json before the destructive
+    // cut, so the user can hand-recover at worst by restoring the .bak file.
+    if (existing.length > 0) {
+      void backupProjectJson().catch(() => undefined);
+    }
     setBusy(true);
     selectAudio(audio);
     setStatusMsg(`正在切割：${audio.fileName}`);
@@ -666,7 +685,14 @@ function App() {
     }
     const { manageBusy, overwrite, label, overwriteCache } = options;
     if (manageBusy) setBusy(true);
-    const batchSize = Math.max(1, settings.batchSize);
+    // When LLM polish runs across multiple endpoints we want a Whisper
+    // batch large enough to keep every endpoint busy. Otherwise a tiny
+    // batch leaves most polish workers idle waiting for the next batch.
+    const endpointCount = 1 + (settings.ollamaExtraUrls?.filter((u) => u.trim()).length ?? 0);
+    const desiredBatch = settings.useLlm
+      ? Math.max(settings.batchSize, settings.llmConcurrency, endpointCount * 2)
+      : settings.batchSize;
+    const batchSize = Math.max(1, desiredBatch);
     let completed = 0;
     let recognizedCount = 0;
     setProgress({
@@ -702,8 +728,10 @@ function App() {
             overwriteCache: overwriteCache ?? false,
             useLlm: settings.useLlm,
             ollamaUrl: settings.ollamaUrl,
+            ollamaExtraUrls: settings.ollamaExtraUrls,
             ollamaModel: settings.ollamaModel,
             llmPrompt: settings.llmPrompt,
+            llmConcurrency: settings.llmConcurrency,
           },
         });
         const resultMap = new Map(
@@ -970,6 +998,26 @@ function App() {
     } finally {
       setProgress((current) => ({ ...current, visible: false }));
       setBusy(false);
+    }
+  }
+
+  /**
+   * Snapshot the current project.json to `<projectDir>/.backups/project.<ts>.json.bak`
+   * before a destructive op (re-cut, force-recognize). Best-effort only.
+   */
+  async function backupProjectJson() {
+    if (!scan) return;
+    try {
+      const dst = await ipc.backupProjectFile({ projectDir: scan.projectDir });
+      if (dst) {
+        pushToast({
+          variant: "info",
+          title: "已备份 project.json",
+          detail: dst,
+        });
+      }
+    } catch {
+      // not fatal; user already saw the destructive-op confirm dialog
     }
   }
 
