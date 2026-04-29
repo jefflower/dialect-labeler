@@ -1620,8 +1620,17 @@ function App() {
         .then(applyPlaybackState)
         .catch((error) => setPlaybackStatus(`暂停失败：${String(error)}`));
     } else {
+      // After a clip plays through, currentMs sits at duration. Tapping
+      // play again should restart from 0, not "play" 0 ms of audio.
+      const atEnd =
+        activeDurationMs > 0 && playbackCurrentMs >= activeDurationMs - 5;
+      // Floor + Math.round here is defensive: seekToRatio stores a float
+      // into playbackCurrentMs, and the Tauri command expects u64. Sending
+      // a float triggers `invalid type: floating point ... expected u64`.
+      const positionMs = atEnd ? 0 : Math.round(playbackCurrentMs);
+      if (atEnd) setPlaybackCurrentMs(0);
       void ipc
-        .playAudio({ path: playbackPath, positionMs: playbackCurrentMs })
+        .playAudio({ path: playbackPath, positionMs })
         .then(applyPlaybackState)
         .catch((error) => setPlaybackStatus(`播放失败：${String(error)}`));
     }
@@ -1629,11 +1638,16 @@ function App() {
 
   function seekToRatio(ratio: number) {
     if (!activeDurationMs) return;
-    const positionMs = clamp(ratio * activeDurationMs, 0, activeDurationMs);
+    // Round at the source so playbackCurrentMs is always an integer —
+    // anything that reads it later (togglePlayback, the IPC layer) can
+    // pass it straight through without re-rounding.
+    const positionMs = Math.round(
+      clamp(ratio * activeDurationMs, 0, activeDurationMs),
+    );
     setPlaybackCurrentMs(positionMs);
     if (playbackPath && isPlaying) {
       void ipc
-        .playAudio({ path: playbackPath, positionMs: Math.round(positionMs) })
+        .playAudio({ path: playbackPath, positionMs })
         .then(applyPlaybackState)
         .catch((error) => setPlaybackStatus(`跳转失败：${String(error)}`));
     }

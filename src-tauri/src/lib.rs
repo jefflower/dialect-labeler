@@ -1298,7 +1298,10 @@ fn export_dataset_bundle_impl(
     }?;
 
     let jsonl_path = bundle_canonical.join("export.jsonl");
-    fs::write(&jsonl_path, format!("{}\n", lines.join("\n")))
+    // Pretty records separated by a blank line — matches the demo
+    // `自由演绎.jsonl` layout. Each record is still a self-contained JSON
+    // object, so loaders that split by blank line work out of the box.
+    fs::write(&jsonl_path, format!("{}\n", lines.join("\n\n")))
         .map_err(|err| err.to_string())?;
 
     // Also write project.json into the bundle so a downstream reviewer
@@ -1417,7 +1420,7 @@ fn export_segments_jsonl(
         build_flat_jsonl(&segments, &system_prompt, &prefix, &input_root)
     }?;
 
-    fs::write(&path, format!("{}\n", lines.join("\n"))).map_err(|err| err.to_string())?;
+    fs::write(&path, format!("{}\n", lines.join("\n\n"))).map_err(|err| err.to_string())?;
     Ok(path_to_string(&path))
 }
 
@@ -1484,8 +1487,12 @@ fn build_flat_jsonl(
             message["notes"] = json!(segment.notes);
         }
         messages.push(message);
-        let line =
-            serde_json::to_string(&json!({"messages": messages})).map_err(|err| err.to_string())?;
+        // Pretty-print to match the demo `自由演绎.jsonl` layout —
+        // technically not strict JSONL anymore, but readable by `jq -s`
+        // and friends because every record is still a self-contained
+        // JSON object separated by a blank line.
+        let line = serde_json::to_string_pretty(&json!({"messages": messages}))
+            .map_err(|err| err.to_string())?;
         lines.push(line);
     }
     Ok(lines)
@@ -1701,7 +1708,7 @@ fn build_paired_jsonl(
         messages.push(a_msg);
 
         lines.push(
-            serde_json::to_string(&json!({"messages": messages}))
+            serde_json::to_string_pretty(&json!({"messages": messages}))
                 .map_err(|err| err.to_string())?,
         );
 
@@ -1755,7 +1762,7 @@ fn build_single_message_line(
         msg["notes"] = json!(segment.notes);
     }
     messages.push(msg);
-    serde_json::to_string(&json!({"messages": messages})).map_err(|err| err.to_string())
+    serde_json::to_string_pretty(&json!({"messages": messages})).map_err(|err| err.to_string())
 }
 
 /// Compute the audio_file value for export.
