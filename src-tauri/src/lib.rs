@@ -3,7 +3,7 @@ use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Read};
@@ -52,6 +52,10 @@ struct ProjectScan {
     segments_dir: String,
     audio_files: Vec<AudioFileInfo>,
     manifest_records: Vec<ManifestRecord>,
+    /// If `<project_dir>/project.json` exists, surface its contents so the
+    /// frontend can resume where it left off without re-cutting or re-running
+    /// recognition.
+    existing_project: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,6 +66,12 @@ struct CutConfig {
     min_segment_ms: u64,
     pre_roll_ms: u64,
     post_roll_ms: u64,
+    /// Hard upper bound on segment duration. Any silence-bounded range that
+    /// exceeds this is force-split into ⌈len / max⌉ equal-ish chunks. Set to
+    /// 0 (or omit) to disable. Default 30000 ms aligns with the labeling
+    /// spec's "最长不超过 30s".
+    #[serde(default)]
+    max_segment_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -661,12 +671,19 @@ fn scan_project_folder_impl(
     audio_files.sort_by(|left, right| left.path.cmp(&right.path));
     fill_manifest_fallback_by_role(&mut audio_files, &manifest_records);
 
+    // Auto-load project.json if it already exists so the user resumes where
+    // they left off after re-scanning the same folder.
+    let existing_project = fs::read_to_string(project_dir.join("project.json"))
+        .ok()
+        .and_then(|data| serde_json::from_str::<Value>(&data).ok());
+
     Ok(ProjectScan {
         root_path: path_to_string(&root),
         project_dir: path_to_string(&project_dir),
         segments_dir: path_to_string(&segments_dir),
         audio_files,
         manifest_records,
+        existing_project,
     })
 }
 
@@ -820,6 +837,187 @@ fn load_project_file(project_dir: String) -> Result<Value, String> {
     let path = PathBuf::from(project_dir).join("project.json");
     let data = fs::read_to_string(&path).map_err(|err| err.to_string())?;
     serde_json::from_str(&data).map_err(|err| err.to_string())
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleResult {
+    bundle_dir: String,
+    jsonl_path: String,
+    segment_count: usize,
+    source_audio_count: usize,
+    total_bytes: u64,
+}
+
+/// One-click "ship-ready" export. Copies every cut segment (and optionally
+/// each unique source audio file) into a self-contained folder, then writes
+/// the JSONL with paths re-rooted at the bundle. The user can upload the
+/// whole folder to OSS preserving structure, and the JSONL paths line up.
+#[tauri::command]
+async fn export_dataset_bundle(
+    bundle_dir: String,
+    segments: Vec<SegmentRecord>,
+    options: Option<ExportOptions>,
+    include_source_audio: Option<bool>,
+) -> Result<BundleResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        export_dataset_bundle_impl(
+            bundle_dir,
+            segments,
+            options.unwrap_or_default(),
+            include_source_audio.unwrap_or(true),
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+fn export_dataset_bundle_impl(
+    bundle_dir: String,
+    segments: Vec<SegmentRecord>,
+    options: ExportOptions,
+    include_source_audio: bool,
+) -> Result<BundleResult, String> {
+    if segments.is_empty() {
+        return Err("没有可导出的切割片段".to_string());
+    }
+
+    let bundle = PathBuf::from(&bundle_dir);
+    fs::create_dir_all(&bundle).map_err(|err| err.to_string())?;
+    let bundle_canonical = bundle
+        .canonicalize()
+        .map_err(|err| err.to_string())?;
+    let bundle_root_str = path_to_string(&bundle_canonical);
+
+    let segments_out = bundle_canonical.join("segments");
+    fs::create_dir_all(&segments_out).map_err(|err| err.to_string())?;
+
+    let mut total_bytes: u64 = 0;
+    let mut source_path_map: HashMap<String, String> = HashMap::new();
+
+    if include_source_audio {
+        let source_out = bundle_canonical.join("source");
+        fs::create_dir_all(&source_out).map_err(|err| err.to_string())?;
+        let mut unique_sources: Vec<&String> = Vec::new();
+        let mut seen: HashSet<&String> = HashSet::new();
+        for seg in &segments {
+            if seen.insert(&seg.source_path) {
+                unique_sources.push(&seg.source_path);
+            }
+        }
+        for src in unique_sources {
+            let src_path = PathBuf::from(src);
+            if !src_path.is_file() {
+                continue;
+            }
+            let file_name = match src_path.file_name().and_then(|n| n.to_str()) {
+                Some(value) => value.to_string(),
+                None => continue,
+            };
+            let dst = source_out.join(&file_name);
+            fs::copy(&src_path, &dst).map_err(|err| err.to_string())?;
+            total_bytes = total_bytes.saturating_add(
+                fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+            );
+            source_path_map.insert(src.clone(), path_to_string(&dst));
+        }
+    }
+
+    let mut new_segments: Vec<SegmentRecord> = Vec::with_capacity(segments.len());
+    for segment in &segments {
+        let src = PathBuf::from(&segment.segment_path);
+        if !src.is_file() {
+            return Err(format!("切割片段文件不存在：{}", segment.segment_path));
+        }
+        let parent_name = src
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("misc")
+            .to_string();
+        let dst_dir = segments_out.join(&parent_name);
+        fs::create_dir_all(&dst_dir).map_err(|err| err.to_string())?;
+        let dst = dst_dir.join(&segment.segment_file_name);
+        fs::copy(&src, &dst).map_err(|err| err.to_string())?;
+        total_bytes = total_bytes.saturating_add(
+            fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+        );
+
+        let new_source = source_path_map
+            .get(&segment.source_path)
+            .cloned()
+            .unwrap_or_else(|| segment.source_path.clone());
+
+        let mut updated = segment.clone();
+        updated.segment_path = path_to_string(&dst);
+        updated.source_path = new_source;
+        new_segments.push(updated);
+    }
+
+    let system_prompt = options.system_prompt.clone().unwrap_or_default();
+    let pair = options.pair_user_assistant.unwrap_or(true);
+    let user_use_source = options.use_source_audio_for_user.unwrap_or(true);
+    let prefix = options.audio_file_prefix.clone().unwrap_or_default();
+    // Always rewrite paths relative to the bundle root, so when the user
+    // uploads the whole bundle to OSS the JSONL references line up.
+    let input_root = bundle_root_str.clone();
+
+    let lines = if pair {
+        build_paired_jsonl(
+            &new_segments,
+            &system_prompt,
+            user_use_source,
+            &prefix,
+            &input_root,
+        )
+    } else {
+        build_flat_jsonl(&new_segments, &system_prompt, &prefix, &input_root)
+    }?;
+
+    let jsonl_path = bundle_canonical.join("export.jsonl");
+    fs::write(&jsonl_path, format!("{}\n", lines.join("\n")))
+        .map_err(|err| err.to_string())?;
+
+    let readme_path = bundle_canonical.join("README.md");
+    let readme = format!(
+        "# 长沙方言数据集打包\n\n\
+切割片段：{} 段\n\
+源音频：{} 个\n\
+体积：{:.1} MB\n\n\
+## 目录结构\n\n\
+```\n\
+{}\n\
+├── export.jsonl     # 标注数据 (与 demo 格式一致)\n\
+├── segments/        # 切割后的 PCM WAV 片段，按源文件分子目录\n\
+{}└── README.md\n\
+```\n\n\
+## 上传 OSS\n\n\
+- 整目录上传到 OSS 桶（保留 segments/{}子目录结构）\n\
+- 将设置中的 *audio_file_prefix* 设置为对应 OSS 路径\n\
+- 重新点击「一键打包」即可生成带 OSS 路径的 JSONL\n\n\
+## 校对\n\n\
+- 在工作台「设置」抽屉里调 OSS 路径前缀\n\
+- 修改后重打包会覆盖此目录\n",
+        new_segments.len(),
+        source_path_map.len(),
+        total_bytes as f64 / 1024.0 / 1024.0,
+        path_file_name(&bundle_canonical),
+        if source_path_map.is_empty() {
+            ""
+        } else {
+            "├── source/          # 源音频原文件，供 user 角色引用\n"
+        },
+        if source_path_map.is_empty() { "" } else { "source/ " }
+    );
+    let _ = fs::write(&readme_path, readme);
+
+    Ok(BundleResult {
+        bundle_dir: bundle_root_str,
+        jsonl_path: path_to_string(&jsonl_path),
+        segment_count: new_segments.len(),
+        source_audio_count: source_path_map.len(),
+        total_bytes,
+    })
 }
 
 #[tauri::command]
@@ -1315,6 +1513,7 @@ fn recognize_segments_impl(
         let model_name = ollama_model
             .clone()
             .ok_or_else(|| "未指定 Ollama 模型".to_string())?;
+        let mut llm_failures: Vec<String> = Vec::new();
         for result in results.iter_mut() {
             if result.text.trim().is_empty() {
                 continue;
@@ -1341,9 +1540,26 @@ fn recognize_segments_impl(
                     }
                 }
                 Err(err) => {
-                    return Err(format!("Ollama 后处理失败：{}", err));
+                    // Per-segment graceful fallback: keep the Whisper text and
+                    // record the failure. The frontend surfaces this as a toast
+                    // so users know LLM polish didn't run, but the recognition
+                    // step still landed.
+                    eprintln!(
+                        "[recognize] Ollama polish failed for segment {}: {}",
+                        result.segment_id, err
+                    );
+                    llm_failures.push(format!("{}: {}", result.segment_id, err));
                 }
             }
+        }
+        if !llm_failures.is_empty() && llm_failures.len() == results.len() {
+            // Every single LLM call failed — that's a config error worth
+            // surfacing as a hard error so the user fixes it.
+            return Err(format!(
+                "Ollama 全部失败（{} 段）。最后一段错误：{}",
+                llm_failures.len(),
+                llm_failures.last().cloned().unwrap_or_default()
+            ));
         }
     }
 
@@ -1396,14 +1612,43 @@ fn polish_text(
         .post(&url)
         .set("Content-Type", "application/json")
         .send_json(body)
-        .map_err(|err| err.to_string())?;
-    let value: Value = response.into_json().map_err(|err| err.to_string())?;
+        .map_err(|err| format!("Ollama HTTP 失败：{}", err))?;
+    let raw_body = response
+        .into_string()
+        .map_err(|err| format!("Ollama 响应读取失败：{}", err))?;
+    let value: Value = serde_json::from_str(&raw_body).map_err(|err| {
+        eprintln!(
+            "[polish_text] Ollama 响应非法 JSON：{}\n--- body ---\n{}",
+            err, raw_body
+        );
+        format!("Ollama 返回非法 JSON：{}", err)
+    })?;
     let content = value
         .get("message")
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
         .unwrap_or_default();
-    Ok(parse_polished_output(content, raw_text))
+    if content.trim().is_empty() {
+        eprintln!(
+            "[polish_text] Ollama content 为空（model={}, raw_text={:?}）",
+            model, raw_text
+        );
+    }
+    let parsed = parse_polished_output(content, raw_text);
+    if parsed.text.trim().is_empty() {
+        // Always preserve the Whisper draft so the user never sees an empty
+        // segment after a successful ASR step.
+        eprintln!(
+            "[polish_text] LLM polish 输出 text 为空，回退到 Whisper 原文：{:?}",
+            raw_text
+        );
+        return Ok(PolishedOutput {
+            text: raw_text.to_string(),
+            emotion: parsed.emotion,
+            tags: parsed.tags,
+        });
+    }
+    Ok(parsed)
 }
 
 fn strip_thinking(text: &str) -> String {
@@ -2085,6 +2330,31 @@ fn build_segment_ranges(
         ranges.push((0.0, duration_sec));
     }
 
+    // Enforce maxSegmentMs as a hard upper bound — any silence-free stretch
+    // longer than this gets force-split into N equal-ish chunks. The split
+    // doesn't try to land on natural boundaries (no silence info available),
+    // it just slices time uniformly. Users can still tweak silence params
+    // first; this is a safety net for the spec's 30s limit.
+    if config.max_segment_ms > 0 {
+        let max_sec = config.max_segment_ms as f64 / 1000.0;
+        let mut adjusted = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            let len = end - start;
+            if len > max_sec {
+                let chunks = (len / max_sec).ceil() as usize;
+                let chunk_len = len / chunks as f64;
+                for i in 0..chunks {
+                    let cs = start + chunk_len * i as f64;
+                    let ce = (cs + chunk_len).min(end);
+                    adjusted.push((cs, ce));
+                }
+            } else {
+                adjusted.push((start, end));
+            }
+        }
+        return adjusted;
+    }
+
     ranges
 }
 
@@ -2489,6 +2759,7 @@ mod tests {
             min_segment_ms: 100,
             pre_roll_ms: 100,
             post_roll_ms: 200,
+            max_segment_ms: 0,
         };
 
         let segments = cut_audio_file_impl(
@@ -2508,6 +2779,30 @@ mod tests {
         assert!(segments[0].segment_file_name.ends_with(".wav"));
 
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn max_segment_force_splits_overlong_ranges() {
+        // 50s of audio, no silence detected → one big range; with max=20s
+        // we expect ⌈50/20⌉ = 3 chunks of ~16.67s each.
+        let config = CutConfig {
+            silence_db: -35.0,
+            min_silence_ms: 450,
+            min_segment_ms: 300,
+            pre_roll_ms: 100,
+            post_roll_ms: 200,
+            max_segment_ms: 20_000,
+        };
+        let ranges = build_segment_ranges(50.0, &[], &config);
+        assert_eq!(ranges.len(), 3);
+        assert!((ranges[0].1 - ranges[0].0 - 50.0 / 3.0).abs() < 0.001);
+        // No max → keeps the long single range.
+        let unbounded = CutConfig {
+            max_segment_ms: 0,
+            ..config
+        };
+        let ranges = build_segment_ranges(50.0, &[], &unbounded);
+        assert_eq!(ranges.len(), 1);
     }
 
     #[test]
@@ -2573,7 +2868,8 @@ pub fn run() {
             get_default_llm_prompt,
             save_project_file,
             load_project_file,
-            export_segments_jsonl
+            export_segments_jsonl,
+            export_dataset_bundle
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

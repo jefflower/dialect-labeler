@@ -2,12 +2,14 @@ import {
   Download,
   Keyboard,
   Moon,
+  Package,
   Save,
   Settings,
   Sun,
   Sunrise,
 } from "lucide-react";
 import type { Theme } from "../types";
+import { BUILD_CHANNEL, REVIEW_ONLY } from "../env";
 
 type TopbarProps = {
   status: string;
@@ -22,6 +24,7 @@ type TopbarProps = {
   onSave: () => void;
   onLoad: () => void;
   onExport: () => void;
+  onExportBundle: () => void;
 };
 
 const themeIcon = {
@@ -43,6 +46,7 @@ export function Topbar({
   onSave,
   onLoad,
   onExport,
+  onExportBundle,
 }: TopbarProps) {
   const ThemeIcon = themeIcon[theme] ?? Sunrise;
   const dotClass = hasError ? "error" : busy ? "busy" : hasProject ? "" : "idle";
@@ -53,7 +57,14 @@ export function Topbar({
           湘
         </div>
         <div className="brand-text">
-          <h1>长沙方言标注工作台</h1>
+          <h1>
+            长沙方言标注工作台
+            {REVIEW_ONLY && (
+              <span className="build-channel-badge" title="无 Whisper / Ollama 集成；只用于审核已处理过的标注">
+                {BUILD_CHANNEL}
+              </span>
+            )}
+          </h1>
           <p className="status-line">
             <span className={`status-dot ${dotClass}`} />
             <span>{status}</span>
@@ -94,12 +105,21 @@ export function Topbar({
           保存
         </button>
         <button
-          className="btn-primary"
           onClick={onExport}
           disabled={!hasSegments || busy}
+          title="只导出 JSONL（不复制音频文件）"
         >
           <Download size={14} />
           导出 JSONL
+        </button>
+        <button
+          className="btn-primary"
+          onClick={onExportBundle}
+          disabled={!hasSegments || busy}
+          title="复制全部切割文件 + 源音频 + JSONL 到一个目录，可直接整目录上传 OSS"
+        >
+          <Package size={14} />
+          一键打包
         </button>
       </div>
     </header>

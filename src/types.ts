@@ -27,6 +27,7 @@ export type ProjectScan = {
   segmentsDir: string;
   audioFiles: AudioFileInfo[];
   manifestRecords: ManifestRecord[];
+  existingProject?: ProjectFile | null;
 };
 
 export type CutConfig = {
@@ -35,6 +36,18 @@ export type CutConfig = {
   minSegmentMs: number;
   preRollMs: number;
   postRollMs: number;
+  /** Hard upper bound; 0 = no cap. Default 30000 ms aligns with spec. */
+  maxSegmentMs: number;
+};
+
+export type CutPresetDef = {
+  /** Display name. */
+  name: string;
+  /** True for the 3 built-in presets — UI prevents editing/deleting these. */
+  builtin?: boolean;
+  /** One-liner shown in the dropdown. */
+  hint?: string;
+  config: CutConfig;
 };
 
 export type SegmentRecord = {
@@ -87,6 +100,14 @@ export type ExportOptions = {
   useSourceAudioForUser?: boolean;
   audioFilePrefix?: string;
   inputRoot?: string;
+};
+
+export type BundleResult = {
+  bundleDir: string;
+  jsonlPath: string;
+  segmentCount: number;
+  sourceAudioCount: number;
+  totalBytes: number;
 };
 
 export type DependencyStatus = {
@@ -145,6 +166,32 @@ export type Toast = {
 
 export type Theme = "light" | "dark" | "system";
 
+/**
+ * Inline tag definition. `kind: "paired"` produces `<tag>...</tag>` wrapping
+ * a selection. `kind: "bracket"` produces `[tag]` as a discrete event marker.
+ */
+export type InlineTagDef = {
+  /** Tech name (lowercase ASCII), e.g. "laugh". */
+  tag: string;
+  /** Display label in Chinese, e.g. "笑着说". */
+  label: string;
+  /** Single-letter keyboard shortcut. Empty string = no shortcut. */
+  key: string;
+  /** Wrap behaviour. */
+  kind: "paired" | "bracket";
+  /** 1-char glyph shown in the AlignedTimeline for bracket markers. */
+  glyph?: string;
+  /** Tooltip / hint shown next to the toolbar button. */
+  hint?: string;
+};
+
+/** Segment-level tag definition (written to JSONL `tags`). */
+export type SegmentTagDef = {
+  value: string;
+  label: string;
+  key: string;
+};
+
 export type AppSettings = {
   theme: Theme;
   whisperModel: string;
@@ -158,4 +205,10 @@ export type AppSettings = {
   systemPrompt: string;
   pairUserAssistant: boolean;
   audioFilePrefix: string;
+  /** User-editable tag dictionaries — initial values come from `defaults.ts`. */
+  inlineTags: InlineTagDef[];
+  segmentTags: SegmentTagDef[];
+  emotions: string[];
+  /** Cut strategy presets (built-in + user-saved). */
+  cutPresets: CutPresetDef[];
 };

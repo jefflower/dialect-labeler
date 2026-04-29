@@ -1,5 +1,8 @@
 import { useMemo, useState } from "react";
 import {
+  AlertTriangle,
+  CheckCircle2,
+  CircleDashed,
   Folder,
   Pause,
   Scissors,
@@ -68,6 +71,17 @@ export function MainView(props: MainViewProps) {
     return { total, done, percent: total ? Math.round((done / total) * 100) : 0 };
   }, [props.visibleSegments]);
 
+  const statsByAudio = useMemo(() => {
+    const map = new Map<string, { total: number; done: number }>();
+    for (const segment of props.segments) {
+      const entry = map.get(segment.sourcePath) ?? { total: 0, done: 0 };
+      entry.total += 1;
+      if (segment.phoneticText.trim()) entry.done += 1;
+      map.set(segment.sourcePath, entry);
+    }
+    return map;
+  }, [props.segments]);
+
   if (!props.scan) {
     return (
       <section className="card" style={{ flex: 1, display: "grid" }}>
@@ -112,41 +126,70 @@ export function MainView(props: MainViewProps) {
               description="尝试更换搜索词"
             />
           )}
-          {filteredAudio.map((audio) => (
-            <button
-              key={audio.id}
-              className={`audio-row ${audio.id === props.selectedAudioId ? "active" : ""}`}
-              onClick={() => props.onSelectAudio(audio)}
-              title={audio.path}
-            >
-              <strong>{audio.fileName}</strong>
-              <div className="audio-row-meta">
-                <span className={`badge-role ${audio.role ?? "unknown"}`}>
-                  {roleLabels[audio.role ?? "unknown"]}
+          {filteredAudio.map((audio) => {
+            const stats = statsByAudio.get(audio.path);
+            const isCut = !!stats;
+            const isFullyDone = !!stats && stats.done === stats.total && stats.total > 0;
+            return (
+              <button
+                key={audio.id}
+                className={`audio-row ${audio.id === props.selectedAudioId ? "active" : ""}`}
+                onClick={() => props.onSelectAudio(audio)}
+                title={audio.path}
+              >
+                <strong>{audio.fileName}</strong>
+                <div className="audio-row-meta">
+                  <span className={`badge-role ${audio.role ?? "unknown"}`}>
+                    {roleLabels[audio.role ?? "unknown"]}
+                  </span>
+                  <span className="dot">·</span>
+                  <span>{formatDuration(audio.durationMs)}</span>
+                  <span className="dot">·</span>
+                  <span>{audio.sampleRate ? `${audio.sampleRate}Hz` : "—"}</span>
+                  <span className="dot">·</span>
+                  <span>{audio.channels ? `${audio.channels}ch` : "—"}</span>
+                  {isCut && (
+                    <>
+                      <span className="dot">·</span>
+                      <span
+                        className={`segment-tag ${isFullyDone ? "tag-done" : "tag-cut"}`}
+                        title={
+                          isFullyDone
+                            ? `${stats.done}/${stats.total} 段已识别`
+                            : `${stats.done}/${stats.total} 段已识别`
+                        }
+                      >
+                        {isFullyDone ? (
+                          <CheckCircle2 size={11} />
+                        ) : (
+                          <CircleDashed size={11} />
+                        )}
+                        {stats.done}/{stats.total}
+                      </span>
+                    </>
+                  )}
+                </div>
+                <span className="audio-row-action">
+                  <button
+                    className="btn-ghost"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      props.onCutOne(audio);
+                    }}
+                    disabled={props.busy}
+                    title={
+                      isCut
+                        ? "重新切割（覆盖现有片段）"
+                        : "按当前静音参数切割此音频"
+                    }
+                  >
+                    <Scissors size={13} />
+                    {isCut ? "重切" : "切割"}
+                  </button>
                 </span>
-                <span className="dot">·</span>
-                <span>{formatDuration(audio.durationMs)}</span>
-                <span className="dot">·</span>
-                <span>{audio.sampleRate ? `${audio.sampleRate}Hz` : "—"}</span>
-                <span className="dot">·</span>
-                <span>{audio.channels ? `${audio.channels}ch` : "—"}</span>
-              </div>
-              <span className="audio-row-action">
-                <button
-                  className="btn-ghost"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    props.onCutOne(audio);
-                  }}
-                  disabled={props.busy}
-                  title="按当前静音参数切割此音频"
-                >
-                  <Scissors size={13} />
-                  切割
-                </button>
-              </span>
-            </button>
-          ))}
+              </button>
+            );
+          })}
         </div>
       </aside>
 
@@ -231,40 +274,62 @@ export function MainView(props: MainViewProps) {
               }
             />
           )}
-          {filteredSegments.map((segment, index) => (
-            <button
-              key={segment.id}
-              className={`segment-row ${segment.id === props.selectedSegmentId ? "active" : ""}`}
-              onClick={() => props.onSelectSegment(segment)}
-              title={segment.segmentFileName}
-            >
-              <span className="segment-index">
-                {String(index + 1).padStart(2, "0")}
-              </span>
-              <span
-                className={`segment-text ${segment.phoneticText ? "" : "empty"}`}
+          {filteredSegments.map((segment, index) => {
+            const tooLong = segment.durationMs > 30_000;
+            return (
+              <button
+                key={segment.id}
+                className={`segment-row ${segment.id === props.selectedSegmentId ? "active" : ""}`}
+                onClick={() => props.onSelectSegment(segment)}
+                title={
+                  tooLong
+                    ? `${segment.segmentFileName} · 时长 ${(segment.durationMs / 1000).toFixed(1)}s 超过 30s 上限，建议手动拆分或调小切割阈值`
+                    : segment.segmentFileName
+                }
               >
-                {segment.phoneticText ||
-                  segment.originalText ||
-                  "未标注"}
-              </span>
-              <span className="segment-time">
-                {formatMsRange(segment.startMs, segment.endMs)}
-              </span>
-              <div className="segment-meta-row">
-                {segment.emotion.map((e) => (
-                  <span className="segment-tag emotion" key={e}>
-                    {e}
-                  </span>
-                ))}
-                {segment.tags.map((t) => (
-                  <span className={`segment-tag tag-${t}`} key={t}>
-                    {t}
-                  </span>
-                ))}
-              </div>
-            </button>
-          ))}
+                <span className="segment-index">
+                  {String(index + 1).padStart(2, "0")}
+                </span>
+                <span
+                  className={`segment-text ${segment.phoneticText ? "" : "empty"}`}
+                >
+                  {segment.phoneticText ||
+                    segment.originalText ||
+                    "未标注"}
+                </span>
+                <span className="segment-time">
+                  {tooLong && (
+                    <AlertTriangle
+                      size={12}
+                      style={{
+                        color: "var(--warning)",
+                        verticalAlign: "-2px",
+                        marginRight: 4,
+                      }}
+                    />
+                  )}
+                  {formatMsRange(segment.startMs, segment.endMs)}
+                </span>
+                <div className="segment-meta-row">
+                  {tooLong && (
+                    <span className="segment-tag tag-overlong">
+                      &gt;30s
+                    </span>
+                  )}
+                  {segment.emotion.map((e) => (
+                    <span className="segment-tag emotion" key={e}>
+                      {e}
+                    </span>
+                  ))}
+                  {segment.tags.map((t) => (
+                    <span className={`segment-tag tag-${t}`} key={t}>
+                      {t}
+                    </span>
+                  ))}
+                </div>
+              </button>
+            );
+          })}
         </div>
       </section>
 

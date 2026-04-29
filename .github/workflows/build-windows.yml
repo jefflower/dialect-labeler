@@ -1,0 +1,70 @@
+name: Build Windows Reviewer
+
+# Builds a slimmed-down "审核版" Windows binary every push to main + on
+# version tags. The reviewer build hides every Whisper / Ollama UI element
+# (controlled by the VITE_REVIEW_ONLY=1 env at frontend build time). It is
+# intended for QA people who only need to: pick an input/output folder + a
+# JSONL path, browse already-AI-processed segments, fine-tune annotations,
+# and one-click export.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-reviewer:
+    name: Build Windows reviewer (no models)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri reviewer bundle (Windows)
+        env:
+          VITE_REVIEW_ONLY: '1'
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dialect-labeler-reviewer-windows-${{ github.sha }}
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach to release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: '长沙方言标注审核版 ${{ github.ref_name }}'
+          draft: true
+          generate_release_notes: true
+          files: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe

@@ -1,4 +1,5 @@
 import { FileJson, FolderOpen, ScanSearch } from "lucide-react";
+import { REVIEW_ONLY } from "../env";
 
 type SetupBandProps = {
   folderPath: string;
@@ -62,14 +63,16 @@ export function SetupBand(props: SetupBandProps) {
             </button>
           </div>
         </label>
-        <label className="checkbox-field">
-          <input
-            type="checkbox"
-            checked={props.autoCutAfterScan}
-            onChange={(event) => props.onAutoCutChange(event.target.checked)}
-          />
-          <span>扫描后自动切割</span>
-        </label>
+        {!REVIEW_ONLY && (
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={props.autoCutAfterScan}
+              onChange={(event) => props.onAutoCutChange(event.target.checked)}
+            />
+            <span>扫描后自动切割</span>
+          </label>
+        )}
         <button
           className="btn-primary"
           onClick={props.onScan}

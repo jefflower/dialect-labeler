@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AudioFileInfo,
+  BundleResult,
   CutConfig,
   DependencyStatus,
   ExportOptions,
@@ -89,6 +90,14 @@ export const ipc = {
     options?: ExportOptions;
   }) {
     return invoke<string>("export_segments_jsonl", args);
+  },
+  exportDatasetBundle(args: {
+    bundleDir: string;
+    segments: SegmentRecord[];
+    options?: ExportOptions;
+    includeSourceAudio?: boolean;
+  }) {
+    return invoke<BundleResult>("export_dataset_bundle", args);
   },
 };
 

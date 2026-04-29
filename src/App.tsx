@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { Folder, Inbox } from "lucide-react";
@@ -8,16 +8,19 @@ import { SetupBand } from "./components/SetupBand";
 import { ConfigBand } from "./components/ConfigBand";
 import { MainView } from "./components/MainView";
 import { AnnotationView } from "./components/AnnotationView";
+import type { SelectionRange } from "./components/AlignedTimeline";
 import { ProgressPanel } from "./components/ProgressPanel";
 import { SettingsDrawer } from "./components/SettingsDrawer";
 import { ShortcutOverlay } from "./components/ShortcutOverlay";
 import { ToastStack } from "./components/ToastStack";
-import { defaultCutConfig, tagOptions } from "./defaults";
+import { defaultCutConfig } from "./defaults";
+import { REVIEW_ONLY } from "./env";
 import { ipc, normalizeRecognizedText, waitForPaint, clamp } from "./lib";
 import { isTyping, useSettings, useShortcutOverlay, useTheme, useToasts } from "./hooks";
 import type {
   AudioFileInfo,
   CutConfig,
+  InlineTagDef,
   PlaybackAudio,
   PlaybackState,
   ProgressState,
@@ -29,6 +32,21 @@ import type {
 function App() {
   const { settings, update: updateSettings } = useSettings();
   useTheme(settings.theme);
+
+  // Tag dictionaries are user-editable; expose them as derived state so any
+  // place that used to import the static constant now reads the live array.
+  const inlineTags = settings.inlineTags;
+  const tagOptions = settings.segmentTags;
+  const emotionOptions = settings.emotions;
+  const inlineTagByKey = useMemo(
+    () =>
+      new Map<string, InlineTagDef>(
+        inlineTags
+          .filter((item) => item.key)
+          .map((item) => [item.key.toUpperCase(), item]),
+      ),
+    [inlineTags],
+  );
 
   const { toasts, push: pushToast, dismiss: dismissToast } = useToasts();
   const { open: shortcutOpen, setOpen: setShortcutOpen } = useShortcutOverlay();
@@ -43,7 +61,7 @@ function App() {
   const [selectedAudioId, setSelectedAudioId] = useState("");
   const [selectedSegmentId, setSelectedSegmentId] = useState("");
   const [annotationSegmentId, setAnnotationSegmentId] = useState("");
-  const [autoCutAfterScan, setAutoCutAfterScan] = useState(true);
+  const [autoCutAfterScan, setAutoCutAfterScan] = useState(!REVIEW_ONLY);
   const [autoRecognizeAfterCut, setAutoRecognizeAfterCut] = useState(false);
   const [autoPlayOnReady, setAutoPlayOnReady] = useState(false);
   const [status, setStatus] = useState("请选择音频文件夹开始");
@@ -62,6 +80,17 @@ function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [busy, setBusy] = useState(false);
   const [dropping, setDropping] = useState(false);
+
+  // Aligned-timeline selection lifted from AnnotationView so keyboard shortcuts
+  // can act on it (wrap inline tags / insert breath / pause markers).
+  const [timelineSelection, setTimelineSelection] =
+    useState<SelectionRange | null>(null);
+
+  // Per-segment undo/redo history. Snapshots are taken before each mutation.
+  // Typing snapshots are debounced (~700ms) so Cmd+Z doesn't undo per-char.
+  const undoRef = useRef<Map<string, SegmentRecord[]>>(new Map());
+  const redoRef = useRef<Map<string, SegmentRecord[]>>(new Map());
+  const lastSnapshotRef = useRef<{ id: string; time: number } | null>(null);
 
   const selectedAudio = useMemo(
     () => scan?.audioFiles.find((audio) => audio.id === selectedAudioId) ?? null,
@@ -140,6 +169,30 @@ function App() {
       showError("恢复默认 Prompt 失败", error);
     }
   }, [pushToast, showError, updateSettings]);
+
+  // Debounced auto-save: persist project state ~2s after the last edit so the
+  // user never loses annotation work even on a hard quit.
+  useEffect(() => {
+    if (!scan || segments.length === 0 || busy) return;
+    const handle = window.setTimeout(() => {
+      const payload: ProjectFile = {
+        version: 2,
+        savedAt: new Date().toISOString(),
+        rootPath: scan.rootPath,
+        projectDir: scan.projectDir,
+        segmentsDir: scan.segmentsDir,
+        config,
+        audioFiles: scan.audioFiles,
+        manifestRecords: scan.manifestRecords,
+        segments,
+        systemPrompt: settings.systemPrompt,
+      };
+      void ipc
+        .saveProjectFile({ projectDir: scan.projectDir, payload })
+        .catch(() => undefined);
+    }, 2000);
+    return () => window.clearTimeout(handle);
+  }, [segments, config, settings.systemPrompt, scan, busy]);
 
   // Drag & drop folder support (Tauri v2 file drop event)
   useEffect(() => {
@@ -230,13 +283,39 @@ function App() {
     return () => window.clearInterval(timer);
   }, [isPlaying]);
 
-  // Keyboard shortcuts (J/K for nav, L/B/P/U/N for tags, Space for play/pause)
+  // Context-aware keyboard handler. Behaviour summary:
+  //   - Cmd/Ctrl + Z / Shift+Z       : undo / redo on current segment
+  //   - Space                        : play / pause
+  //   - J / K                        : next / prev segment
+  //   - Esc                          : close annotation, or clear selection
+  //   - L / S / U                    : wrap selection with paired tag (if a
+  //                                    char selection exists in annotation
+  //                                    mode); otherwise toggle segment tag
+  //   - B / P                        : insert self-closing breath/pause
+  //                                    marker at selection start
+  //   - 1..6                         : set emotion (中立/开心/惊讶/疑问/生气/难过)
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      if (isTyping(event.target)) {
-        if (event.code === "Space" && annotationSegment) {
-          // allow space in textarea — don't intercept
+      // Allow undo/redo even when typing in textarea/input — it's expected.
+      const meta = event.metaKey || event.ctrlKey;
+      if (meta && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) {
+          redoCurrent();
+        } else {
+          undoCurrent();
         }
+        return;
+      }
+      if (meta && event.key.toLowerCase() === "y") {
+        event.preventDefault();
+        redoCurrent();
+        return;
+      }
+
+      if (isTyping(event.target)) {
+        // Don't intercept regular typing — but still let Cmd+Enter pass to
+        // the surrounding handler (none yet).
         return;
       }
 
@@ -246,11 +325,53 @@ function App() {
         return;
       }
 
+      if (event.code === "Escape") {
+        if (timelineSelection) {
+          setTimelineSelection(null);
+        } else if (annotationSegment) {
+          closeAnnotation();
+        }
+        return;
+      }
+
       const key = event.key.toUpperCase();
-      const tag = tagOptions.find((item) => item.key === key);
-      if (tag) {
+
+      // Inline-tag insertion takes priority when we're in annotation mode,
+      // because the tag keys serve dual duty (segment tag vs inline tag).
+      if (annotationSegment) {
+        const inlineMeta = inlineTagByKey.get(key);
+        if (inlineMeta) {
+          if (inlineMeta.kind === "bracket" || timelineSelection) {
+            event.preventDefault();
+            applyInlineTag(inlineMeta.tag, inlineMeta.kind);
+            return;
+          }
+          // Fall through to segment tag toggle when no selection.
+        }
+
+        // 1-7: emotion shortcuts (single emotion replacement is friendlier
+        // for keyboard-only annotation than additive toggling).
+        const numKey = event.key;
+        if (/^[1-7]$/.test(numKey)) {
+          event.preventDefault();
+          const emotion = emotionOptions[Number(numKey) - 1];
+          if (annotationSegment && emotion) {
+            updateSegment(
+              annotationSegment.id,
+              { emotion: [emotion] },
+              { instant: true },
+            );
+          }
+          return;
+        }
+      }
+
+      // Segment-level tag toggle (works in both main view and annotation
+      // when no inline selection is active).
+      const segTag = tagOptions.find((item) => item.key === key);
+      if (segTag) {
         event.preventDefault();
-        toggleTagOnActive(tag.value);
+        toggleTagOnActive(segTag.value);
         return;
       }
 
@@ -272,6 +393,8 @@ function App() {
     playbackPath,
     isPlaying,
     playbackCurrentMs,
+    timelineSelection,
+    segments,
   ]);
 
   function applyPlaybackState(state: PlaybackState) {
@@ -324,28 +447,68 @@ function App() {
       });
       setScan(result);
       setSelectedAudioId(result.audioFiles[0]?.id ?? "");
-      if (autoCutAfterScan && result.audioFiles.length > 0) {
-        const allSegments = await cutAudioBatch(result);
-        setSegments(allSegments);
-        const recognizedCount = autoRecognizeAfterCut
-          ? await recognizeDraft(allSegments, {
+
+      // Hydrate from existing project.json so previous cut/recognize/annotate
+      // work isn't lost when the user re-scans the same folder.
+      const existing = result.existingProject ?? null;
+      const restoredSegments: SegmentRecord[] = (existing?.segments ?? []).filter(
+        (segment) =>
+          // Drop stale entries whose audio file no longer maps to a scanned
+          // source (manual file moves shouldn't keep showing dead segments).
+          result.audioFiles.some((audio) => audio.path === segment.sourcePath),
+      );
+      setSegments(restoredSegments);
+      if (existing?.config) setConfig(existing.config);
+      if (existing?.systemPrompt) {
+        updateSettings({ systemPrompt: existing.systemPrompt });
+      }
+
+      const cutSourcePaths = new Set(
+        restoredSegments.map((segment) => segment.sourcePath),
+      );
+      const audioToCut = result.audioFiles.filter(
+        (audio) => !cutSourcePaths.has(audio.path),
+      );
+
+      let cutCount = 0;
+      let recognizedCount = 0;
+
+      if (!REVIEW_ONLY && autoCutAfterScan && audioToCut.length > 0) {
+        const newSegments = await cutAudioBatch(result, audioToCut);
+        const merged = [...restoredSegments, ...newSegments];
+        setSegments(merged);
+        cutCount = newSegments.length;
+        if (autoRecognizeAfterCut) {
+          // Only recognize segments whose phonetic text is still empty so we
+          // don't burn cycles re-running Whisper / Ollama on done work.
+          const targets = merged.filter(
+            (segment) => !segment.phoneticText.trim(),
+          );
+          if (targets.length > 0) {
+            recognizedCount = await recognizeDraft(targets, {
               manageBusy: false,
               overwrite: false,
               label: "自动识别",
-            })
-          : 0;
-        showSuccess(
-          "扫描并自动切割完成",
-          `${result.audioFiles.length} 个音频，${allSegments.length} 段${
-            autoRecognizeAfterCut ? `，识别 ${recognizedCount} 段` : ""
-          }`,
-        );
-      } else {
-        showSuccess(
-          "扫描完成",
-          `${result.audioFiles.length} 个音频`,
-        );
+            });
+          }
+        }
       }
+
+      const restoredCount = restoredSegments.length;
+      const restoredDone = restoredSegments.filter((segment) =>
+        segment.phoneticText.trim(),
+      ).length;
+      const detail = [
+        `${result.audioFiles.length} 个音频`,
+        existing
+          ? `恢复进度：${restoredCount} 段（已标 ${restoredDone}）`
+          : null,
+        cutCount > 0 ? `新增切割 ${cutCount} 段` : null,
+        recognizedCount > 0 ? `识别 ${recognizedCount} 段` : null,
+      ]
+        .filter(Boolean)
+        .join("，");
+      showSuccess(existing ? "扫描完成 · 已恢复进度" : "扫描完成", detail);
     } catch (error) {
       showError("扫描失败", error);
     } finally {
@@ -354,26 +517,25 @@ function App() {
     }
   }
 
-  async function cutAudioBatch(targetScan: ProjectScan) {
-    const allSegments: SegmentRecord[] = [];
-    setSegments([]);
-    setSelectedSegmentId("");
-    setAnnotationSegmentId("");
-    for (const [index, audio] of targetScan.audioFiles.entries()) {
+  async function cutAudioBatch(
+    targetScan: ProjectScan,
+    audioList?: AudioFileInfo[],
+  ) {
+    const sources = audioList ?? targetScan.audioFiles;
+    const created: SegmentRecord[] = [];
+    for (const [index, audio] of sources.entries()) {
       setSelectedAudioId(audio.id);
-      setStatusMsg(
-        `自动切割 ${index + 1}/${targetScan.audioFiles.length}：${audio.fileName}`,
-      );
+      setStatusMsg(`切割 ${index + 1}/${sources.length}：${audio.fileName}`);
       setProgress({
         visible: true,
         label: "自动切割",
         detail: audio.fileName,
         current: index,
-        total: targetScan.audioFiles.length,
+        total: sources.length,
         indeterminate: true,
       });
       await waitForPaint();
-      const created = await ipc.cutAudioFile({
+      const newSegs = await ipc.cutAudioFile({
         inputPath: audio.path,
         segmentsDir: targetScan.segmentsDir,
         config,
@@ -381,18 +543,21 @@ function App() {
         originalText: audio.matchedText ?? "",
         emotion: audio.matchedEmotion ?? [],
       });
-      allSegments.push(...created);
-      setSegments([...allSegments]);
+      created.push(...newSegs);
+      setSegments((current) => [
+        ...current.filter((segment) => segment.sourcePath !== audio.path),
+        ...newSegs,
+      ]);
       setProgress({
         visible: true,
         label: "自动切割",
-        detail: `${audio.fileName} → ${created.length} 段`,
+        detail: `${audio.fileName} → ${newSegs.length} 段`,
         current: index + 1,
-        total: targetScan.audioFiles.length,
+        total: sources.length,
       });
       await waitForPaint();
     }
-    return allSegments;
+    return created;
   }
 
   async function cutAll() {
@@ -401,18 +566,32 @@ function App() {
     setAnnotationSegmentId("");
     setSelectedSegmentId("");
     try {
-      const allSegments = await cutAudioBatch(scan);
-      setSegments(allSegments);
+      const cutSourcePaths = new Set(segments.map((segment) => segment.sourcePath));
+      const audioToCut = scan.audioFiles.filter(
+        (audio) => !cutSourcePaths.has(audio.path),
+      );
+      if (audioToCut.length === 0) {
+        pushToast({
+          variant: "info",
+          title: "全部音频已切割",
+          detail: "如需重切某条，点该音频右侧的「切割」按钮覆盖",
+        });
+        return;
+      }
+      const newSegments = await cutAudioBatch(scan, audioToCut);
       const recognizedCount = autoRecognizeAfterCut
-        ? await recognizeDraft(allSegments, {
-            manageBusy: false,
-            overwrite: false,
-            label: "自动识别",
-          })
+        ? await recognizeDraft(
+            newSegments.filter((segment) => !segment.phoneticText.trim()),
+            {
+              manageBusy: false,
+              overwrite: false,
+              label: "自动识别",
+            },
+          )
         : 0;
       showSuccess(
         "切割完成",
-        `${allSegments.length} 段${
+        `新增 ${newSegments.length} 段${
           autoRecognizeAfterCut ? `，识别 ${recognizedCount} 段` : ""
         }`,
       );
@@ -474,13 +653,18 @@ function App() {
 
   async function recognizeDraft(
     targetSegments: SegmentRecord[],
-    options: { manageBusy: boolean; overwrite: boolean; label: string },
+    options: {
+      manageBusy: boolean;
+      overwrite: boolean;
+      label: string;
+      overwriteCache?: boolean;
+    },
   ) {
     if (!scan || targetSegments.length === 0) {
       pushToast({ variant: "warning", title: "没有可识别的切割片段" });
       return 0;
     }
-    const { manageBusy, overwrite, label } = options;
+    const { manageBusy, overwrite, label, overwriteCache } = options;
     if (manageBusy) setBusy(true);
     const batchSize = Math.max(1, settings.batchSize);
     let completed = 0;
@@ -488,7 +672,7 @@ function App() {
     setProgress({
       visible: true,
       label,
-      detail: `准备识别 ${targetSegments.length} 段（${settings.whisperModel}）`,
+      detail: `准备识别 ${targetSegments.length} 段（${settings.whisperModel}${overwriteCache ? " · 跳过缓存" : ""}）`,
       current: 0,
       total: targetSegments.length,
     });
@@ -515,6 +699,7 @@ function App() {
             whisperModel: settings.whisperModel,
             initialPrompt: settings.whisperInitialPrompt,
             useCache: settings.useAsrCache,
+            overwriteCache: overwriteCache ?? false,
             useLlm: settings.useLlm,
             ollamaUrl: settings.ollamaUrl,
             ollamaModel: settings.ollamaModel,
@@ -567,7 +752,16 @@ function App() {
   }
 
   async function recognizeVisibleDraft() {
-    const target = visibleSegments.length > 0 ? visibleSegments : segments;
+    const pool = visibleSegments.length > 0 ? visibleSegments : segments;
+    const target = pool.filter((segment) => !segment.phoneticText.trim());
+    if (target.length === 0) {
+      pushToast({
+        variant: "info",
+        title: "无待识别片段",
+        detail: "当前范围内的所有片段都有文本了。需要重跑请用「重新识别」",
+      });
+      return;
+    }
     const recognizedCount = await recognizeDraft(target, {
       manageBusy: true,
       overwrite: false,
@@ -578,6 +772,141 @@ function App() {
         settings.useLlm ? "识别 + 改写完成" : "Whisper 识别完成",
         `${recognizedCount} 段`,
       );
+    }
+  }
+
+  /**
+   * Project-wide one-click: find every cut segment whose phoneticText is
+   * still empty (regardless of which source audio is currently selected
+   * in the left pane) and run the full Whisper + Ollama pipeline on them.
+   */
+  async function recognizeAllPending() {
+    const target = segments.filter((segment) => !segment.phoneticText.trim());
+    if (target.length === 0) {
+      pushToast({
+        variant: "info",
+        title: "全部片段已识别",
+        detail: `共 ${segments.length} 段，无待识别的。需要重跑用「重新识别」`,
+      });
+      return;
+    }
+    const total = segments.length;
+    const done = total - target.length;
+    pushToast({
+      variant: "info",
+      title: `开始跨音频批量识别`,
+      detail: `项目共 ${total} 段，已识别 ${done} 段；本次处理剩余 ${target.length} 段`,
+    });
+    const recognizedCount = await recognizeDraft(target, {
+      manageBusy: true,
+      overwrite: false,
+      label: settings.useLlm ? "全部待识别 + 方言改写" : "全部待识别（Whisper）",
+    });
+    if (recognizedCount > 0) {
+      showSuccess(
+        "全部待识别完成",
+        `新增 ${recognizedCount} 段；项目累计 ${done + recognizedCount}/${total}`,
+      );
+    }
+  }
+
+  /**
+   * Force-re-run recognition on every visible segment, overwriting any
+   * existing text and bypassing the ASR cache so Whisper actually re-runs.
+   * Useful after switching Whisper model or LLM prompt.
+   */
+  async function reRecognizeVisible() {
+    const target = visibleSegments.length > 0 ? visibleSegments : segments;
+    if (target.length === 0) return;
+    const ok = window.confirm(
+      `将对 ${target.length} 段强制重跑 Whisper${settings.useLlm ? " + Ollama 改写" : ""}，覆盖现有文本与情绪/标签。\n\n继续？`,
+    );
+    if (!ok) return;
+    const count = await recognizeDraft(target, {
+      manageBusy: true,
+      overwrite: true,
+      overwriteCache: true,
+      label: "重新识别 + 改写",
+    });
+    if (count > 0) {
+      showSuccess("重新识别完成", `${count} 段已覆盖`);
+    }
+  }
+
+  /**
+   * Batch LLM polish: re-run only the Ollama dialect rewrite on existing
+   * phoneticText. Skips Whisper entirely. Useful after editing the LLM
+   * prompt or switching Ollama model — much faster than full re-recognize.
+   */
+  async function repolishVisibleWithLlm() {
+    if (!settings.useLlm) {
+      pushToast({
+        variant: "warning",
+        title: "请先在设置抽屉里启用 Ollama 后处理",
+      });
+      return;
+    }
+    const pool = visibleSegments.length > 0 ? visibleSegments : segments;
+    const target = pool.filter((segment) => segment.phoneticText.trim());
+    if (target.length === 0) {
+      pushToast({
+        variant: "info",
+        title: "没有可润色的片段",
+        detail: "请先识别或手动写入文本",
+      });
+      return;
+    }
+    setBusy(true);
+    setProgress({
+      visible: true,
+      label: "AI 重打标签",
+      detail: `Ollama (${settings.ollamaModel}) 重新分析 ${target.length} 段`,
+      current: 0,
+      total: target.length,
+    });
+    let completed = 0;
+    let updated = 0;
+    let failed = 0;
+    try {
+      for (const segment of target) {
+        setProgress({
+          visible: true,
+          label: "AI 重打标签",
+          detail: `${completed + 1}/${target.length} · ${segment.segmentFileName}`,
+          current: completed,
+          total: target.length,
+        });
+        await waitForPaint();
+        try {
+          const result = await ipc.polishTextWithLlm({
+            text: segment.phoneticText,
+            role: segment.role,
+            hint: segment.originalText,
+            ollamaUrl: settings.ollamaUrl,
+            ollamaModel: settings.ollamaModel,
+            llmPrompt: settings.llmPrompt,
+          });
+          const patch: Partial<SegmentRecord> = {};
+          const cleaned = normalizeRecognizedText(result.text);
+          if (cleaned) patch.phoneticText = cleaned;
+          if (result.emotion) patch.emotion = [result.emotion];
+          if (result.tags?.length) patch.tags = result.tags;
+          if (Object.keys(patch).length > 0) {
+            updateSegment(segment.id, patch, { instant: true });
+            updated += 1;
+          }
+        } catch {
+          failed += 1;
+        }
+        completed += 1;
+      }
+      showSuccess(
+        "AI 重打标签完成",
+        `${updated} 段更新${failed > 0 ? `，${failed} 段失败` : ""}`,
+      );
+    } finally {
+      setProgress((current) => ({ ...current, visible: false }));
+      setBusy(false);
     }
   }
 
@@ -705,6 +1034,59 @@ function App() {
     }
   }
 
+  async function exportBundle() {
+    if (!scan) return;
+    if (segments.length === 0) {
+      pushToast({ variant: "warning", title: "没有可打包的切割片段" });
+      return;
+    }
+    const target = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "选择打包目录（建议新建空目录或单独的输出位置）",
+    });
+    if (typeof target !== "string" || !target) return;
+
+    setBusy(true);
+    setProgress({
+      visible: true,
+      label: "一键打包",
+      detail: `复制 ${segments.length} 段 + 源音频到 ${target}`,
+      current: 0,
+      total: segments.length,
+      indeterminate: true,
+    });
+    try {
+      await waitForPaint();
+      const result = await ipc.exportDatasetBundle({
+        bundleDir: target,
+        segments,
+        includeSourceAudio: true,
+        options: {
+          systemPrompt: settings.systemPrompt,
+          pairUserAssistant: settings.pairUserAssistant,
+          useSourceAudioForUser: true,
+          audioFilePrefix: settings.audioFilePrefix,
+        },
+      });
+      const sizeMb = (result.totalBytes / 1024 / 1024).toFixed(1);
+      showSuccess(
+        "打包完成",
+        `${result.segmentCount} 段 · ${result.sourceAudioCount} 源音频 · ${sizeMb} MB`,
+      );
+      pushToast({
+        variant: "info",
+        title: "JSONL 已生成",
+        detail: result.jsonlPath,
+      });
+    } catch (error) {
+      showError("打包失败", error);
+    } finally {
+      setProgress((current) => ({ ...current, visible: false }));
+      setBusy(false);
+    }
+  }
+
   function selectAudio(audio: AudioFileInfo) {
     setSelectedAudioId(audio.id);
     setSelectedSegmentId("");
@@ -737,12 +1119,162 @@ function App() {
     });
   }
 
-  function updateSegment(id: string, patch: Partial<SegmentRecord>) {
-    setSegments((current) =>
-      current.map((segment) =>
+  /** Push a snapshot of `prev` to the per-segment undo stack. */
+  function pushHistory(prev: SegmentRecord, instant = false) {
+    const now = Date.now();
+    const last = lastSnapshotRef.current;
+    if (!instant && last && last.id === prev.id && now - last.time < 700) {
+      // Within the typing debounce window — skip pushing another snapshot.
+      return;
+    }
+    lastSnapshotRef.current = { id: prev.id, time: now };
+    const list = undoRef.current.get(prev.id) ?? [];
+    list.push(prev);
+    if (list.length > 100) list.shift();
+    undoRef.current.set(prev.id, list);
+    // Any new edit invalidates the redo stack for that segment.
+    redoRef.current.set(prev.id, []);
+  }
+
+  function updateSegment(
+    id: string,
+    patch: Partial<SegmentRecord>,
+    options?: { instant?: boolean },
+  ) {
+    setSegments((current) => {
+      const prev = current.find((s) => s.id === id);
+      if (prev) pushHistory(prev, options?.instant ?? false);
+      return current.map((segment) =>
         segment.id === id ? { ...segment, ...patch } : segment,
-      ),
-    );
+      );
+    });
+  }
+
+  function undoCurrent() {
+    const targetId = annotationSegmentId || selectedSegmentId;
+    if (!targetId) return false;
+    const list = undoRef.current.get(targetId);
+    if (!list || list.length === 0) return false;
+    const prev = list.pop()!;
+    setSegments((current) => {
+      const cur = current.find((s) => s.id === targetId);
+      if (cur) {
+        const redoList = redoRef.current.get(targetId) ?? [];
+        redoList.push(cur);
+        redoRef.current.set(targetId, redoList);
+      }
+      return current.map((s) => (s.id === targetId ? prev : s));
+    });
+    pushToast({
+      variant: "info",
+      title: "已撤销",
+      detail: targetId,
+    });
+    return true;
+  }
+
+  function redoCurrent() {
+    const targetId = annotationSegmentId || selectedSegmentId;
+    if (!targetId) return false;
+    const list = redoRef.current.get(targetId);
+    if (!list || list.length === 0) return false;
+    const next = list.pop()!;
+    setSegments((current) => {
+      const cur = current.find((s) => s.id === targetId);
+      if (cur) {
+        const undoList = undoRef.current.get(targetId) ?? [];
+        undoList.push(cur);
+        undoRef.current.set(targetId, undoList);
+      }
+      return current.map((s) => (s.id === targetId ? next : s));
+    });
+    return true;
+  }
+
+  /**
+   * Apply an inline tag to the current segment.
+   *
+   * Two forms — disambiguated by the `kind` argument or, if absent, inferred
+   * from the metadata table:
+   *
+   * `paired`  — `<tag>...</tag>` wraps the active selection. Toggling: if
+   *             the whole selection is already inside that tag, the tag is
+   *             stripped instead. Without a selection, the call is a no-op
+   *             with a toast nudge.
+   *
+   * `bracket` — `[tag]` is inserted as a discrete event marker at the
+   *             selection start (or, if no selection, at the end of the
+   *             text). Same shape as the spec's paralinguistic markers.
+   */
+  function applyInlineTag(tag: string, kind?: "paired" | "bracket") {
+    const targetId = annotationSegmentId;
+    if (!targetId) return false;
+    const segment = segments.find((s) => s.id === targetId);
+    if (!segment) return false;
+    const text = segment.phoneticText;
+
+    // Resolve effective kind: explicit > metadata lookup with selection
+    // fallback for the dual-purpose laugh keybinding.
+    let effectiveKind: "paired" | "bracket" | undefined = kind;
+    if (!effectiveKind) {
+      const matches = inlineTags.filter((item) => item.tag === tag);
+      const paired = matches.find((m) => m.kind === "paired");
+      const bracket = matches.find((m) => m.kind === "bracket");
+      if (timelineSelection && paired) effectiveKind = "paired";
+      else if (bracket) effectiveKind = "bracket";
+      else if (paired) effectiveKind = "paired";
+    }
+    if (!effectiveKind) return false;
+
+    if (effectiveKind === "bracket") {
+      const pos = timelineSelection?.startRaw ?? text.length;
+      const next = `${text.slice(0, pos)}[${tag}]${text.slice(pos)}`;
+      updateSegment(targetId, { phoneticText: next }, { instant: true });
+      return true;
+    }
+
+    // Paired path
+    if (!timelineSelection) {
+      pushToast({
+        variant: "warning",
+        title: `请先在波形下选中要标记的字`,
+        detail: "拖选一段或单击一个字均可，再点这个按钮包裹",
+      });
+      return false;
+    }
+
+    const { startRaw, endRaw, commonTags } = timelineSelection;
+
+    if (commonTags.includes(tag)) {
+      // Toggle: strip the wrapping <tag>...</tag> closest to the selection.
+      const open = `<${tag}>`;
+      const close = `</${tag}>`;
+      const before = text.slice(0, startRaw);
+      const after = text.slice(endRaw);
+      const lastOpen = before.lastIndexOf(open);
+      const firstClose = after.indexOf(close);
+      if (lastOpen === -1 || firstClose === -1) return false;
+      const newBefore =
+        before.slice(0, lastOpen) + before.slice(lastOpen + open.length);
+      const newAfter =
+        after.slice(0, firstClose) + after.slice(firstClose + close.length);
+      updateSegment(
+        targetId,
+        {
+          phoneticText: newBefore + text.slice(startRaw, endRaw) + newAfter,
+        },
+        { instant: true },
+      );
+      setTimelineSelection(null);
+      return true;
+    }
+
+    const inner = text.slice(startRaw, endRaw);
+    if (!inner) return false;
+    const next = `${text.slice(0, startRaw)}<${tag}>${inner}</${tag}>${text.slice(endRaw)}`;
+    updateSegment(targetId, { phoneticText: next }, { instant: true });
+    setTimelineSelection(null);
+    return true;
   }
 
   function toggleTagOnActive(tag: string) {
@@ -807,6 +1339,12 @@ function App() {
           busy={busy}
           llmEnabled={settings.useLlm}
           progress={progress}
+          selection={timelineSelection}
+          inlineTags={inlineTags}
+          segmentTags={tagOptions}
+          emotions={emotionOptions}
+          onSelectionChange={setTimelineSelection}
+          onApplyInlineTag={applyInlineTag}
           onClose={closeAnnotation}
           onTogglePlay={togglePlayback}
           onSeekRatio={seekToRatio}
@@ -850,6 +1388,7 @@ function App() {
           onSave={saveProject}
           onLoad={loadProject}
           onExport={exportJsonl}
+          onExportBundle={exportBundle}
         />
         <div className="app-body">
           <SetupBand
@@ -867,18 +1406,28 @@ function App() {
             onAutoCutChange={setAutoCutAfterScan}
             onScan={scanFolder}
           />
-          <ConfigBand
-            config={config}
-            onConfigChange={setConfig}
-            autoRecognizeAfterCut={autoRecognizeAfterCut}
-            onAutoRecognizeChange={setAutoRecognizeAfterCut}
-            busy={busy}
-            hasAudio={Boolean(scan && scan.audioFiles.length > 0)}
-            hasSegments={segments.length > 0}
-            llmEnabled={settings.useLlm}
-            onCutAll={cutAll}
-            onRecognizeVisible={recognizeVisibleDraft}
-          />
+          {!REVIEW_ONLY && (
+            <ConfigBand
+              config={config}
+              onConfigChange={setConfig}
+              presets={settings.cutPresets}
+              onPresetsChange={(next) => updateSettings({ cutPresets: next })}
+              autoRecognizeAfterCut={autoRecognizeAfterCut}
+              onAutoRecognizeChange={setAutoRecognizeAfterCut}
+              busy={busy}
+              hasAudio={Boolean(scan && scan.audioFiles.length > 0)}
+              hasSegments={segments.length > 0}
+              llmEnabled={settings.useLlm}
+              pendingCount={
+                segments.filter((s) => !s.phoneticText.trim()).length
+              }
+              onCutAll={cutAll}
+              onRecognizeVisible={recognizeVisibleDraft}
+              onRecognizeAllPending={recognizeAllPending}
+              onReRecognizeVisible={reRecognizeVisible}
+              onRepolishVisible={repolishVisibleWithLlm}
+            />
+          )}
           {progress.visible && <ProgressPanel progress={progress} />}
           <MainView
             scan={scan}

@@ -5,12 +5,26 @@ import {
   Cpu,
   HardDrive,
   Mic,
+  Plus,
   RefreshCcw,
   Sparkles,
+  Tags as TagsIcon,
+  Trash2,
   X,
 } from "lucide-react";
-import type { AppSettings, DependencyStatus } from "../types";
-import { whisperModels } from "../defaults";
+import type {
+  AppSettings,
+  DependencyStatus,
+  InlineTagDef,
+  SegmentTagDef,
+} from "../types";
+import {
+  defaultEmotions,
+  defaultInlineTags,
+  defaultSegmentTags,
+  whisperModels,
+} from "../defaults";
+import { REVIEW_ONLY } from "../env";
 import { ipc } from "../lib";
 
 type SettingsDrawerProps = {
@@ -25,6 +39,117 @@ function prefixPreview(prefix: string, relPath: string): string {
   const trimmed = (prefix ?? "").replace(/\/+$/, "");
   if (!trimmed) return `(留空)/${relPath}`;
   return `${trimmed}/${relPath}`;
+}
+
+function InlineTagRow({
+  tag,
+  onChange,
+  onRemove,
+}: {
+  tag: InlineTagDef;
+  onChange: (next: InlineTagDef) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <>
+      <input
+        value={tag.label}
+        onChange={(event) => onChange({ ...tag, label: event.target.value })}
+        title="中文显示名"
+      />
+      <input
+        value={tag.tag}
+        onChange={(event) =>
+          onChange({ ...tag, tag: event.target.value.toLowerCase() })
+        }
+        placeholder="laugh"
+        title="英文标签名（写入 JSONL）"
+      />
+      <select
+        value={tag.kind}
+        onChange={(event) =>
+          onChange({ ...tag, kind: event.target.value as InlineTagDef["kind"] })
+        }
+        title="paired = <tag>...</tag> 包文本；bracket = [tag] 离散事件"
+      >
+        <option value="paired">成对包裹</option>
+        <option value="bracket">离散事件</option>
+      </select>
+      <input
+        value={tag.key}
+        maxLength={1}
+        onChange={(event) =>
+          onChange({ ...tag, key: event.target.value.toUpperCase().slice(0, 1) })
+        }
+        placeholder="—"
+        title="单字母快捷键（可空）"
+        style={{ textAlign: "center" }}
+      />
+      <input
+        value={tag.glyph ?? ""}
+        maxLength={1}
+        onChange={(event) =>
+          onChange({ ...tag, glyph: event.target.value.slice(0, 1) })
+        }
+        placeholder="—"
+        title="时间轴上离散事件显示的字符（仅 bracket 用）"
+        style={{ textAlign: "center" }}
+        disabled={tag.kind !== "bracket"}
+      />
+      <button
+        className="btn-ghost btn-icon"
+        onClick={onRemove}
+        title="删除此标签"
+      >
+        <Trash2 size={12} />
+      </button>
+    </>
+  );
+}
+
+function SegmentTagRow({
+  tag,
+  onChange,
+  onRemove,
+}: {
+  tag: SegmentTagDef;
+  onChange: (next: SegmentTagDef) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <>
+      <input
+        value={tag.label}
+        onChange={(event) => onChange({ ...tag, label: event.target.value })}
+        title="中文显示名"
+      />
+      <input
+        value={tag.value}
+        onChange={(event) =>
+          onChange({ ...tag, value: event.target.value.toLowerCase() })
+        }
+        placeholder="laugh"
+        title="英文标签名（写入 JSONL）"
+      />
+      <input
+        value={tag.key}
+        maxLength={1}
+        onChange={(event) =>
+          onChange({ ...tag, key: event.target.value.toUpperCase().slice(0, 1) })
+        }
+        placeholder="—"
+        title="单字母快捷键（可空）"
+        style={{ textAlign: "center" }}
+      />
+      <button
+        className="btn-ghost btn-icon"
+        onClick={onRemove}
+        title="删除此标签"
+      >
+        <Trash2 size={12} />
+      </button>
+    </>
+  );
 }
 
 export function SettingsDrawer({
@@ -115,7 +240,7 @@ export function SettingsDrawer({
             </div>
           </section>
 
-          <section className="drawer-section">
+          {!REVIEW_ONLY && <section className="drawer-section">
             <h3>
               <Mic size={14} />
               Whisper（语音→普通话）
@@ -159,9 +284,9 @@ export function SettingsDrawer({
                 <span>命中相同音频时跳过重跑（按文件 hash 缓存）</span>
               </label>
             </div>
-          </section>
+          </section>}
 
-          <section className="drawer-section">
+          {!REVIEW_ONLY && <section className="drawer-section">
             <h3>
               <Sparkles size={14} />
               Ollama 后处理（普通话→长沙记音字）
@@ -238,7 +363,7 @@ export function SettingsDrawer({
                 恢复默认 Prompt
               </button>
             </div>
-          </section>
+          </section>}
 
           <section className="drawer-section">
             <h3>
@@ -293,21 +418,207 @@ export function SettingsDrawer({
                 建议：传到 OSS 时保留这里的相对结构（例如把整个 <code>segments/</code> 目录上传到对应 prefix 下）。
               </p>
             </div>
-            <div className="drawer-row">
-              <label>识别批大小</label>
-              <input
-                type="number"
-                min={1}
-                max={64}
-                value={settings.batchSize}
-                onChange={(event) =>
-                  onChange({ batchSize: Math.max(1, Number(event.target.value)) })
-                }
-              />
-            </div>
+            {!REVIEW_ONLY && (
+              <div className="drawer-row">
+                <label>识别批大小</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={64}
+                  value={settings.batchSize}
+                  onChange={(event) =>
+                    onChange({ batchSize: Math.max(1, Number(event.target.value)) })
+                  }
+                />
+              </div>
+            )}
           </section>
 
           <section className="drawer-section">
+            <h3>
+              <TagsIcon size={14} />
+              标签字典
+            </h3>
+            <p className="section-hint">
+              用户可动态维护。修改后立即在标注页生效；如需让 LLM 也按新标签输出，请相应更新方言改写 Prompt。
+            </p>
+
+            <div className="tag-editor">
+              <div className="tag-editor-head">
+                <strong>内联标签（10 种默认）</strong>
+                <button
+                  className="btn-ghost"
+                  onClick={() =>
+                    onChange({ inlineTags: defaultInlineTags.slice() })
+                  }
+                  title="还原为默认标签字典"
+                >
+                  <RefreshCcw size={12} /> 恢复默认
+                </button>
+              </div>
+              <div className="tag-editor-grid tag-editor-grid-inline">
+                <span>中文</span>
+                <span>英文</span>
+                <span>类型</span>
+                <span>键</span>
+                <span>字</span>
+                <span></span>
+                {settings.inlineTags.map((item, idx) => (
+                  <InlineTagRow
+                    key={idx}
+                    tag={item}
+                    onChange={(next) =>
+                      onChange({
+                        inlineTags: settings.inlineTags.map((t, i) =>
+                          i === idx ? next : t,
+                        ),
+                      })
+                    }
+                    onRemove={() =>
+                      onChange({
+                        inlineTags: settings.inlineTags.filter(
+                          (_, i) => i !== idx,
+                        ),
+                      })
+                    }
+                  />
+                ))}
+              </div>
+              <button
+                className="btn-ghost"
+                style={{ marginTop: 8, alignSelf: "flex-start" }}
+                onClick={() =>
+                  onChange({
+                    inlineTags: [
+                      ...settings.inlineTags,
+                      {
+                        tag: "newtag",
+                        label: "新标签",
+                        key: "",
+                        kind: "bracket",
+                        glyph: "新",
+                        hint: "",
+                      },
+                    ],
+                  })
+                }
+              >
+                <Plus size={12} /> 新增内联标签
+              </button>
+            </div>
+
+            <div className="tag-editor">
+              <div className="tag-editor-head">
+                <strong>段级标签（写入 JSONL `tags`）</strong>
+                <button
+                  className="btn-ghost"
+                  onClick={() =>
+                    onChange({ segmentTags: defaultSegmentTags.slice() })
+                  }
+                >
+                  <RefreshCcw size={12} /> 恢复默认
+                </button>
+              </div>
+              <div className="tag-editor-grid tag-editor-grid-segment">
+                <span>中文</span>
+                <span>英文</span>
+                <span>键</span>
+                <span></span>
+                {settings.segmentTags.map((item, idx) => (
+                  <SegmentTagRow
+                    key={idx}
+                    tag={item}
+                    onChange={(next) =>
+                      onChange({
+                        segmentTags: settings.segmentTags.map((t, i) =>
+                          i === idx ? next : t,
+                        ),
+                      })
+                    }
+                    onRemove={() =>
+                      onChange({
+                        segmentTags: settings.segmentTags.filter(
+                          (_, i) => i !== idx,
+                        ),
+                      })
+                    }
+                  />
+                ))}
+              </div>
+              <button
+                className="btn-ghost"
+                style={{ marginTop: 8, alignSelf: "flex-start" }}
+                onClick={() =>
+                  onChange({
+                    segmentTags: [
+                      ...settings.segmentTags,
+                      { value: "newtag", label: "新标签", key: "" },
+                    ],
+                  })
+                }
+              >
+                <Plus size={12} /> 新增段级标签
+              </button>
+            </div>
+
+            <div className="tag-editor">
+              <div className="tag-editor-head">
+                <strong>情感字典</strong>
+                <button
+                  className="btn-ghost"
+                  onClick={() =>
+                    onChange({ emotions: defaultEmotions.slice() })
+                  }
+                >
+                  <RefreshCcw size={12} /> 恢复默认
+                </button>
+              </div>
+              <div className="emotion-chip-editor">
+                {settings.emotions.map((emo, idx) => (
+                  <span key={idx} className="tag-chip emotion-chip-edit">
+                    <input
+                      value={emo}
+                      onChange={(event) =>
+                        onChange({
+                          emotions: settings.emotions.map((e, i) =>
+                            i === idx ? event.target.value : e,
+                          ),
+                        })
+                      }
+                    />
+                    <button
+                      className="btn-ghost btn-icon"
+                      onClick={() =>
+                        onChange({
+                          emotions: settings.emotions.filter(
+                            (_, i) => i !== idx,
+                          ),
+                        })
+                      }
+                      title="删除"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </span>
+                ))}
+                <button
+                  className="btn-ghost"
+                  onClick={() =>
+                    onChange({
+                      emotions: [...settings.emotions, "新情感"],
+                    })
+                  }
+                >
+                  <Plus size={12} /> 新增
+                </button>
+              </div>
+              <p className="help-tip">
+                标注页 1-{settings.emotions.length} 数字键依次对应这些情感（最多 9 个）。
+              </p>
+            </div>
+          </section>
+
+          {!REVIEW_ONLY && <section className="drawer-section">
             <h3>
               <Activity size={14} />
               依赖体检
@@ -368,7 +679,7 @@ export function SettingsDrawer({
               <HardDrive size={14} />
               重新检测
             </button>
-          </section>
+          </section>}
         </div>
         <footer className="drawer-foot">
           <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>

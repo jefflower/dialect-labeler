@@ -3,15 +3,20 @@ import type { ProgressState } from "../types";
 export function ProgressPanel({ progress }: { progress: ProgressState }) {
   if (!progress.visible) return null;
   const indeterminate = progress.indeterminate || progress.total <= 0;
-  const percent = progress.total > 0
-    ? Math.min(100, Math.round((progress.current / progress.total) * 100))
-    : 0;
+  const percent =
+    progress.total > 0
+      ? Math.min(100, Math.round((progress.current / progress.total) * 100))
+      : 0;
 
   return (
-    <section className="progress-panel">
+    <section className="progress-panel" aria-live="polite">
       <div className="label-block">
         <strong>{progress.label}</strong>
-        <span title={progress.detail}>{progress.detail}</span>
+        <span className="progress-numbers">
+          {progress.total > 0
+            ? `${progress.current}/${progress.total} · ${percent}%`
+            : "进行中…"}
+        </span>
       </div>
       <div
         className={`progress-track ${indeterminate ? "indeterminate" : ""}`}
@@ -22,10 +27,11 @@ export function ProgressPanel({ progress }: { progress: ProgressState }) {
       >
         <div className="progress-fill" style={{ width: `${percent}%` }} />
       </div>
-      <span className="progress-numbers">
-        {progress.total > 0
-          ? `${progress.current}/${progress.total} · ${percent}%`
-          : "进行中…"}
+      <span
+        className="progress-detail"
+        title={progress.detail}
+      >
+        {progress.detail}
       </span>
     </section>
   );
