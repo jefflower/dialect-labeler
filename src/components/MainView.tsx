@@ -71,12 +71,22 @@ export function MainView(props: MainViewProps) {
     return { total, done, percent: total ? Math.round((done / total) * 100) : 0 };
   }, [props.visibleSegments]);
 
+  // Two-stage progress per audio file:
+  //   asrDone    — segments with non-empty phoneticText (Whisper landed)
+  //   polishDone — segments with a non-empty emotion array (Ollama polished)
+  // Shown as two badges on each row so users can tell at a glance whether
+  // an audio file is half-done (Whisper yes, polish no) vs fully done.
   const statsByAudio = useMemo(() => {
-    const map = new Map<string, { total: number; done: number }>();
+    const map = new Map<
+      string,
+      { total: number; asrDone: number; polishDone: number }
+    >();
     for (const segment of props.segments) {
-      const entry = map.get(segment.sourcePath) ?? { total: 0, done: 0 };
+      const entry =
+        map.get(segment.sourcePath) ?? { total: 0, asrDone: 0, polishDone: 0 };
       entry.total += 1;
-      if (segment.phoneticText.trim()) entry.done += 1;
+      if (segment.phoneticText.trim()) entry.asrDone += 1;
+      if (segment.emotion.length > 0) entry.polishDone += 1;
       map.set(segment.sourcePath, entry);
     }
     return map;
@@ -129,7 +139,10 @@ export function MainView(props: MainViewProps) {
           {filteredAudio.map((audio) => {
             const stats = statsByAudio.get(audio.path);
             const isCut = !!stats;
-            const isFullyDone = !!stats && stats.done === stats.total && stats.total > 0;
+            const asrFullyDone =
+              !!stats && stats.asrDone === stats.total && stats.total > 0;
+            const polishFullyDone =
+              !!stats && stats.polishDone === stats.total && stats.total > 0;
             return (
               <button
                 key={audio.id}
@@ -152,19 +165,26 @@ export function MainView(props: MainViewProps) {
                     <>
                       <span className="dot">·</span>
                       <span
-                        className={`segment-tag ${isFullyDone ? "tag-done" : "tag-cut"}`}
-                        title={
-                          isFullyDone
-                            ? `${stats.done}/${stats.total} 段已识别`
-                            : `${stats.done}/${stats.total} 段已识别`
-                        }
+                        className={`segment-tag ${asrFullyDone ? "tag-done" : "tag-cut"}`}
+                        title={`Whisper 已识别 ${stats.asrDone}/${stats.total} 段`}
                       >
-                        {isFullyDone ? (
+                        {asrFullyDone ? (
                           <CheckCircle2 size={11} />
                         ) : (
                           <CircleDashed size={11} />
                         )}
-                        {stats.done}/{stats.total}
+                        ASR {stats.asrDone}/{stats.total}
+                      </span>
+                      <span
+                        className={`segment-tag ${polishFullyDone ? "tag-done" : "tag-cut"}`}
+                        title={`Ollama 已改写 ${stats.polishDone}/${stats.total} 段`}
+                      >
+                        {polishFullyDone ? (
+                          <CheckCircle2 size={11} />
+                        ) : (
+                          <CircleDashed size={11} />
+                        )}
+                        AI {stats.polishDone}/{stats.total}
                       </span>
                     </>
                   )}

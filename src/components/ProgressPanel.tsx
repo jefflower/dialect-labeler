@@ -1,6 +1,15 @@
 import type { ProgressState } from "../types";
 
-export function ProgressPanel({ progress }: { progress: ProgressState }) {
+export function ProgressPanel({
+  progress,
+  onCancel,
+}: {
+  progress: ProgressState;
+  /** Optional cancel handler — when provided, a button is rendered
+   *  next to the label. Use for long-running tasks (Whisper / Ollama
+   *  recognition) where the user might want to abort mid-run. */
+  onCancel?: () => void;
+}) {
   if (!progress.visible) return null;
   const indeterminate = progress.indeterminate || progress.total <= 0;
   const percent =
@@ -17,6 +26,16 @@ export function ProgressPanel({ progress }: { progress: ProgressState }) {
             ? `${progress.current}/${progress.total} · ${percent}%`
             : "进行中…"}
         </span>
+        {onCancel && (
+          <button
+            type="button"
+            className="btn-ghost progress-cancel"
+            onClick={onCancel}
+            title="停止当前识别（已完成的段会保留缓存，下次启动会跳过）"
+          >
+            停止
+          </button>
+        )}
       </div>
       <div
         className={`progress-track ${indeterminate ? "indeterminate" : ""}`}

@@ -19,7 +19,21 @@ export function useSettings() {
       const raw = localStorage.getItem(SETTINGS_KEY);
       if (!raw) return defaultAppSettings;
       const parsed = JSON.parse(raw);
-      return { ...defaultAppSettings, ...parsed };
+      const merged = { ...defaultAppSettings, ...parsed };
+      // Migrate legacy `ollamaExtraUrls: string[]` → new
+      // `ollamaExtraEndpoints: { url, model? }[]`. Each old URL becomes
+      // an entry with no model override (uses primary model).
+      const legacyUrls: unknown = parsed?.ollamaExtraUrls;
+      if (
+        Array.isArray(legacyUrls) &&
+        legacyUrls.length > 0 &&
+        merged.ollamaExtraEndpoints.length === 0
+      ) {
+        merged.ollamaExtraEndpoints = legacyUrls
+          .filter((u): u is string => typeof u === "string" && u.trim() !== "")
+          .map((url) => ({ url, model: undefined }));
+      }
+      return merged;
     } catch {
       return defaultAppSettings;
     }

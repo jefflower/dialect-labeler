@@ -286,6 +286,21 @@ export function SettingsDrawer({
                 <span>命中相同音频时跳过重跑（按文件 hash 缓存）</span>
               </label>
             </div>
+            <div className="drawer-row">
+              <label>并发进程数</label>
+              <input
+                type="number"
+                min={1}
+                max={4}
+                value={settings.whisperConcurrency ?? 1}
+                onChange={(event) =>
+                  onChange({
+                    whisperConcurrency: Math.max(1, Number(event.target.value)),
+                  })
+                }
+                title="同时跑多少个 Whisper 进程。每个进程独占一份模型 (≈1.5GB RAM/large-v3-turbo)。默认 1；2-3 仅在你有 GPU 显存或大内存时再开。"
+              />
+            </div>
           </section>}
 
           {!REVIEW_ONLY && <section className="drawer-section">
@@ -353,18 +368,45 @@ export function SettingsDrawer({
               <code>ollama pull qwen2.5:32b</code>
             </p>
             <div className="drawer-row stack">
-              <label>
-                额外 Ollama 端点（可选，多机并发）
-              </label>
-              {(settings.ollamaExtraUrls ?? []).map((url, idx) => (
-                <div key={idx} style={{ display: "flex", gap: 6, marginTop: 6 }}>
+              <label>额外 Ollama 端点（可选，多机并发）</label>
+              {(settings.ollamaExtraEndpoints ?? []).map((ep, idx) => (
+                <div
+                  key={idx}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "minmax(180px, 2fr) minmax(120px, 1fr) auto",
+                    gap: 6,
+                    marginTop: 6,
+                  }}
+                >
                   <input
-                    value={url}
+                    value={ep.url}
                     placeholder="http://192.168.x.x:11434"
                     onChange={(event) =>
                       onChange({
-                        ollamaExtraUrls: (settings.ollamaExtraUrls ?? []).map(
-                          (u, i) => (i === idx ? event.target.value : u),
+                        ollamaExtraEndpoints: (
+                          settings.ollamaExtraEndpoints ?? []
+                        ).map((e, i) =>
+                          i === idx ? { ...e, url: event.target.value } : e,
+                        ),
+                      })
+                    }
+                  />
+                  <input
+                    value={ep.model ?? ""}
+                    placeholder={`默认: ${settings.ollamaModel}`}
+                    title="此端点专用模型；留空则用主模型"
+                    onChange={(event) =>
+                      onChange({
+                        ollamaExtraEndpoints: (
+                          settings.ollamaExtraEndpoints ?? []
+                        ).map((e, i) =>
+                          i === idx
+                            ? {
+                                ...e,
+                                model: event.target.value.trim() || undefined,
+                              }
+                            : e,
                         ),
                       })
                     }
@@ -373,9 +415,9 @@ export function SettingsDrawer({
                     className="btn-ghost btn-icon"
                     onClick={() =>
                       onChange({
-                        ollamaExtraUrls: (settings.ollamaExtraUrls ?? []).filter(
-                          (_, i) => i !== idx,
-                        ),
+                        ollamaExtraEndpoints: (
+                          settings.ollamaExtraEndpoints ?? []
+                        ).filter((_, i) => i !== idx),
                       })
                     }
                     title="删除此端点"
@@ -388,7 +430,10 @@ export function SettingsDrawer({
                 className="btn-ghost"
                 onClick={() =>
                   onChange({
-                    ollamaExtraUrls: [...(settings.ollamaExtraUrls ?? []), ""],
+                    ollamaExtraEndpoints: [
+                      ...(settings.ollamaExtraEndpoints ?? []),
+                      { url: "", model: undefined },
+                    ],
                   })
                 }
                 style={{ alignSelf: "flex-start", marginTop: 6 }}
@@ -396,7 +441,9 @@ export function SettingsDrawer({
                 <Plus size={12} /> 添加端点
               </button>
               <p className="help-tip" style={{ marginTop: 6 }}>
-                工作会自动在「主端点 + 额外端点」之间轮转分发。例如填一台 LAN 内的另一台 Ollama 机器，识别速度可翻倍。
+                URL 必填；模型可留空（用主模型）或填该机器上独立装的模型，
+                例如本机 <code>qwen2.5:32b</code> + 远端 <code>qwen3.5:122b</code>
+                同时跑。轮转分发，每端各拿一份。
               </p>
             </div>
             <div className="drawer-row">
@@ -482,20 +529,6 @@ export function SettingsDrawer({
                 建议：传到 OSS 时保留这里的相对结构（例如把整个 <code>segments/</code> 目录上传到对应 prefix 下）。
               </p>
             </div>
-            {!REVIEW_ONLY && (
-              <div className="drawer-row">
-                <label>识别批大小</label>
-                <input
-                  type="number"
-                  min={1}
-                  max={64}
-                  value={settings.batchSize}
-                  onChange={(event) =>
-                    onChange({ batchSize: Math.max(1, Number(event.target.value)) })
-                  }
-                />
-              </div>
-            )}
           </section>
 
           <section className="drawer-section">

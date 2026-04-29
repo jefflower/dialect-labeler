@@ -65,6 +65,9 @@ export type SegmentRecord = {
   emotion: string[];
   tags: string[];
   notes: string;
+  /** Last LLM endpoint that polished this segment — for visibility only. */
+  lastPolishEndpoint?: string | null;
+  lastPolishModel?: string | null;
 };
 
 export type RecognitionResult = {
@@ -75,6 +78,8 @@ export type RecognitionResult = {
   cached: boolean;
   emotion: string | null;
   tags: string[];
+  polishEndpoint?: string | null;
+  polishModel?: string | null;
 };
 
 export type PolishedOutput = {
@@ -83,13 +88,22 @@ export type PolishedOutput = {
   tags: string[];
 };
 
+export type OllamaEndpointDef = {
+  url: string;
+  /** Model name to use on this endpoint. Empty / undefined → fallback to
+   *  the primary `ollamaModel`. */
+  model?: string;
+};
+
 export type RecognitionOptions = {
   whisperModel?: string;
   useLlm?: boolean;
   /** Primary Ollama endpoint. */
   ollamaUrl?: string;
-  /** Optional extra endpoints — work is round-robined across the pool. */
+  /** Legacy URL-only extra endpoints — kept for backwards-compat. Prefer
+   *  `ollamaExtraEndpoints` so each endpoint can declare its own model. */
   ollamaExtraUrls?: string[];
+  ollamaExtraEndpoints?: OllamaEndpointDef[];
   ollamaModel?: string;
   llmPrompt?: string;
   initialPrompt?: string;
@@ -97,6 +111,10 @@ export type RecognitionOptions = {
   overwriteCache?: boolean;
   /** How many Ollama HTTP calls to fire in parallel across the pool. */
   llmConcurrency?: number;
+  /** Number of concurrent Whisper processes. Default 1; raise to 2-3
+   *  if you have GPU/RAM headroom and the LLM pool is starving for
+   *  input. Each process loads its own model. */
+  whisperConcurrency?: number;
 };
 
 export type ExportOptions = {
@@ -206,7 +224,6 @@ export type AppSettings = {
   ollamaUrl: string;
   ollamaModel: string;
   llmPrompt: string;
-  batchSize: number;
   systemPrompt: string;
   pairUserAssistant: boolean;
   audioFilePrefix: string;
@@ -219,7 +236,11 @@ export type AppSettings = {
   /** Parallel Ollama calls per batch (default 2). Set higher with more
    *  endpoints or with `OLLAMA_NUM_PARALLEL` configured on the server. */
   llmConcurrency: number;
+  /** Concurrent Whisper processes (default 1). Each loads its own
+   *  model — only raise if you have GPU/RAM headroom. */
+  whisperConcurrency: number;
   /** Additional Ollama endpoints — primary `ollamaUrl` plus these are
-   *  round-robined for the LLM polish step. Empty list = single endpoint. */
-  ollamaExtraUrls: string[];
+   *  round-robined for the LLM polish step. Each entry may pin its own
+   *  model (e.g. local 32b paired with a remote 122b). */
+  ollamaExtraEndpoints: OllamaEndpointDef[];
 };

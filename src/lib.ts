@@ -40,6 +40,13 @@ export const ipc = {
   }) {
     return invoke<RecognitionResult[]>("recognize_segments", args);
   },
+  /** Request the in-flight `recognize_segments` run to stop. Whisper /
+   *  LLM workers exit at their next loop iteration; the in-flight task
+   *  finishes naturally (5–10s) before exit. Already-completed segments
+   *  remain cached/persisted, so you can re-launch later and resume. */
+  cancelRecognize() {
+    return invoke<void>("cancel_recognize");
+  },
   polishTextWithLlm(args: {
     text: string;
     role?: string | null;

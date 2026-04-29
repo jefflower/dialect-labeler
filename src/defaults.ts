@@ -125,7 +125,6 @@ export const defaultAppSettings: AppSettings = {
   ollamaUrl: "http://localhost:11434",
   ollamaModel: "qwen2.5:32b",
   llmPrompt: "",
-  batchSize: 4,
   systemPrompt: "长沙本地人，女性，25岁左右，声音娇柔，声音清亮",
   pairUserAssistant: true,
   audioFilePrefix: "",
@@ -134,7 +133,8 @@ export const defaultAppSettings: AppSettings = {
   emotions: defaultEmotions,
   cutPresets: defaultCutPresets,
   llmConcurrency: 2,
-  ollamaExtraUrls: [],
+  whisperConcurrency: 1,
+  ollamaExtraEndpoints: [],
 };
 
 export const roleLabels: Record<string, string> = {

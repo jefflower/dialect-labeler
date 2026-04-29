@@ -1,4 +1,3 @@
-use rayon::prelude::*;
 use regex::Regex;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::{Deserialize, Serialize};
@@ -111,6 +110,14 @@ struct PlaybackState {
     is_playing: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OllamaEndpointDef {
+    url: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct RecognitionOptions {
@@ -121,11 +128,16 @@ struct RecognitionOptions {
     /// Primary Ollama endpoint (backwards-compat).
     #[serde(default)]
     ollama_url: Option<String>,
-    /// Optional pool of *additional* Ollama endpoints. Tasks are dealt out
-    /// round-robin across `[ollama_url, ...ollama_extra_urls]` so an extra
-    /// machine on the LAN can absorb half (or 1/N) of the LLM polish work.
+    /// Optional pool of *additional* Ollama endpoints (URL only — uses the
+    /// primary `ollama_model`). Kept for backwards-compat; prefer
+    /// `ollama_extra_endpoints` when each endpoint needs its own model.
     #[serde(default)]
     ollama_extra_urls: Option<Vec<String>>,
+    /// Per-endpoint URL + model. If `model` is None for an entry, the
+    /// primary `ollama_model` is used. Lets you mix e.g. local qwen2.5:32b
+    /// with a remote qwen3.5:122b in the same pool.
+    #[serde(default)]
+    ollama_extra_endpoints: Option<Vec<OllamaEndpointDef>>,
     #[serde(default)]
     ollama_model: Option<String>,
     #[serde(default)]
@@ -141,6 +153,12 @@ struct RecognitionOptions {
     /// to fully saturate the pool.
     #[serde(default)]
     llm_concurrency: Option<u32>,
+    /// Number of concurrent Whisper processes. Default 1 — most setups
+    /// can only afford one model copy in GPU/RAM. With a beefy box, 2-3
+    /// can keep the LLM pool fed faster. Each process loads its own
+    /// model (so RAM cost scales linearly).
+    #[serde(default)]
+    whisper_concurrency: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -153,6 +171,10 @@ struct RecognitionResult {
     cached: bool,
     emotion: Option<String>,
     tags: Vec<String>,
+    /// Which Ollama endpoint actually polished this segment, for UI badges.
+    /// `None` for cached results or when LLM polish was skipped/failed.
+    polish_endpoint: Option<String>,
+    polish_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -684,10 +706,19 @@ fn scan_project_folder_impl(
     fill_manifest_fallback_by_role(&mut audio_files, &manifest_records);
 
     // Auto-load project.json if it already exists so the user resumes where
-    // they left off after re-scanning the same folder.
+    // they left off after re-scanning the same folder. Apply the same
+    // path-resolution as load_project_file so a project.json copied in
+    // from another machine (Windows reviewer handoff) still maps to local
+    // file system paths.
     let existing_project = fs::read_to_string(project_dir.join("project.json"))
         .ok()
-        .and_then(|data| serde_json::from_str::<Value>(&data).ok());
+        .and_then(|data| serde_json::from_str::<Value>(&data).ok())
+        .map(|value| {
+            let canonical = project_dir
+                .canonicalize()
+                .unwrap_or_else(|_| project_dir.clone());
+            absolutize_payload(value, &canonical)
+        });
 
     Ok(ProjectScan {
         root_path: path_to_string(&root),
@@ -836,12 +867,159 @@ fn cut_audio_file_impl(
 
 #[tauri::command]
 fn save_project_file(project_dir: String, payload: Value) -> Result<String, String> {
-    let dir = PathBuf::from(project_dir);
+    let dir = PathBuf::from(&project_dir);
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let canonical_dir = dir.canonicalize().unwrap_or(dir.clone());
     let path = dir.join("project.json");
-    let data = serde_json::to_string_pretty(&payload).map_err(|err| err.to_string())?;
+
+    // Backend safety guard: refuse to overwrite an on-disk project.json
+    // that has non-empty segments[] with a payload whose segments[] is
+    // empty. This stops a buggy scan / state reset from silently wiping
+    // hours of annotation work — we already lost 1212 segments to this
+    // bug class once. Frontend should explicitly handle the recovery
+    // path (e.g. write to a backup file, prompt user, etc.) instead of
+    // sneaking an empty save through.
+    let new_segs_empty = payload
+        .get("segments")
+        .and_then(|v| v.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(true);
+    if new_segs_empty {
+        if let Ok(existing_data) = fs::read_to_string(&path) {
+            if let Ok(existing) = serde_json::from_str::<Value>(&existing_data) {
+                let on_disk_count = existing
+                    .get("segments")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if on_disk_count > 0 {
+                    eprintln!(
+                        "[save_project_file] REFUSED: incoming segments=[] but on-disk has {} segments. Backing up and skipping write.",
+                        on_disk_count
+                    );
+                    let _ = backup_project_file(project_dir.clone());
+                    return Err(format!(
+                        "拒绝写入空 segments[]：磁盘上有 {} 段。已备份到 .backups/，请检查恢复",
+                        on_disk_count
+                    ));
+                }
+            }
+        }
+    }
+
+    // Rewrite well-known path fields to be relative to projectDir whenever
+    // possible. The output folder becomes self-contained and portable —
+    // a Windows reviewer can open the same dir and resolve segments
+    // against their own absolute path.
+    let portable = portablize_payload(payload, &canonical_dir);
+    let data = serde_json::to_string_pretty(&portable).map_err(|err| err.to_string())?;
     fs::write(&path, data).map_err(|err| err.to_string())?;
     Ok(path_to_string(&path))
+}
+
+/// Walk a project.json `Value` and convert every known absolute path field
+/// (`segmentsDir`, `segments[].sourcePath`, `segments[].segmentPath`,
+/// `audioFiles[].path`) into one relative to `project_dir` if it lives
+/// inside that tree. Paths outside the tree (e.g. source audio in a
+/// sibling input folder) are left absolute.
+fn portablize_payload(mut value: Value, project_dir: &Path) -> Value {
+    fn rel(p: &str, base: &Path) -> String {
+        let path = PathBuf::from(p);
+        if let Ok(canon) = path.canonicalize() {
+            if let Ok(rel) = canon.strip_prefix(base) {
+                let s = rel.to_string_lossy().replace('\\', "/");
+                if !s.is_empty() {
+                    return format!("./{}", s);
+                }
+            }
+        }
+        // Already relative or outside the project tree — keep as-is so the
+        // path semantics on this machine are unchanged.
+        p.to_string()
+    }
+    fn fix_str(node: &mut Value, base: &Path) {
+        if let Some(s) = node.as_str() {
+            *node = json!(rel(s, base));
+        }
+    }
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(s) = obj.get_mut("segmentsDir") {
+            fix_str(s, project_dir);
+        }
+        if let Some(arr) = obj.get_mut("segments").and_then(|v| v.as_array_mut()) {
+            for seg in arr.iter_mut() {
+                if let Some(seg_obj) = seg.as_object_mut() {
+                    if let Some(p) = seg_obj.get_mut("sourcePath") {
+                        fix_str(p, project_dir);
+                    }
+                    if let Some(p) = seg_obj.get_mut("segmentPath") {
+                        fix_str(p, project_dir);
+                    }
+                }
+            }
+        }
+        if let Some(arr) = obj.get_mut("audioFiles").and_then(|v| v.as_array_mut()) {
+            for af in arr.iter_mut() {
+                if let Some(af_obj) = af.as_object_mut() {
+                    if let Some(p) = af_obj.get_mut("path") {
+                        fix_str(p, project_dir);
+                    }
+                }
+            }
+        }
+    }
+    value
+}
+
+/// Inverse of `portablize_payload`. Resolves any relative path under the
+/// known fields back to an absolute path rooted at `project_dir`. Absolute
+/// paths in the JSON are passed through unchanged so files saved on
+/// another platform still work as long as they live inside the dir we
+/// just opened.
+fn absolutize_payload(mut value: Value, project_dir: &Path) -> Value {
+    fn abs(p: &str, base: &Path) -> String {
+        let path = PathBuf::from(p);
+        if path.is_absolute() {
+            return p.to_string();
+        }
+        // Treat "./foo" or "foo/bar" as relative to project_dir. Strip any
+        // leading "./" so PathBuf::join doesn't get confused on Windows.
+        let stripped = p.strip_prefix("./").unwrap_or(p);
+        let joined = base.join(stripped);
+        path_to_string(&joined)
+    }
+    fn fix_str(node: &mut Value, base: &Path) {
+        if let Some(s) = node.as_str() {
+            *node = json!(abs(s, base));
+        }
+    }
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(s) = obj.get_mut("segmentsDir") {
+            fix_str(s, project_dir);
+        }
+        if let Some(arr) = obj.get_mut("segments").and_then(|v| v.as_array_mut()) {
+            for seg in arr.iter_mut() {
+                if let Some(seg_obj) = seg.as_object_mut() {
+                    if let Some(p) = seg_obj.get_mut("sourcePath") {
+                        fix_str(p, project_dir);
+                    }
+                    if let Some(p) = seg_obj.get_mut("segmentPath") {
+                        fix_str(p, project_dir);
+                    }
+                }
+            }
+        }
+        if let Some(arr) = obj.get_mut("audioFiles").and_then(|v| v.as_array_mut()) {
+            for af in arr.iter_mut() {
+                if let Some(af_obj) = af.as_object_mut() {
+                    if let Some(p) = af_obj.get_mut("path") {
+                        fix_str(p, project_dir);
+                    }
+                }
+            }
+        }
+    }
+    value
 }
 
 /// Make a timestamped copy of the project.json so a destructive operation
@@ -887,9 +1065,12 @@ fn backup_project_file(project_dir: String) -> Result<Option<String>, String> {
 
 #[tauri::command]
 fn load_project_file(project_dir: String) -> Result<Value, String> {
-    let path = PathBuf::from(project_dir).join("project.json");
+    let dir = PathBuf::from(&project_dir);
+    let path = dir.join("project.json");
     let data = fs::read_to_string(&path).map_err(|err| err.to_string())?;
-    serde_json::from_str(&data).map_err(|err| err.to_string())
+    let value: Value = serde_json::from_str(&data).map_err(|err| err.to_string())?;
+    let canonical_dir = dir.canonicalize().unwrap_or(dir);
+    Ok(absolutize_payload(value, &canonical_dir))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1428,24 +1609,88 @@ fn split_role_suffix(stem: &str) -> (String, Option<String>) {
     (stem.to_string(), None)
 }
 
+/// Per-segment progress event payload. Frontend listens to
+/// `recognize:segment_done` and updates the segment immediately,
+/// without waiting for the whole batch to finish.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SegmentProgressEvent {
+    segment_id: String,
+    /// "asr" — Whisper text just landed (no LLM polish yet).
+    /// "polish_ok" — LLM polish succeeded (text + emotion + tags ready).
+    /// "polish_fail" — LLM polish failed (Whisper text preserved).
+    phase: String,
+    text: String,
+    emotion: Option<String>,
+    tags: Vec<String>,
+    polish_endpoint: Option<String>,
+    polish_model: Option<String>,
+    cached: bool,
+    completed: usize,
+    total: usize,
+}
+
+/// Global cancel flag for the in-flight recognize run. Workers poll it
+/// at safe checkpoints (between Whisper chunks / between polish tasks).
+/// In-flight Whisper subprocesses or LLM HTTP calls are NOT killed —
+/// they finish naturally (~5–10s typical), then the worker loop exits.
+static RECOGNIZE_CANCEL: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+fn recognize_cancel_flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    RECOGNIZE_CANCEL
+        .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .clone()
+}
+
+#[tauri::command]
+fn cancel_recognize() -> Result<(), String> {
+    recognize_cancel_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("[recognize] cancel requested");
+    Ok(())
+}
+
 #[tauri::command]
 async fn recognize_segments(
+    app: tauri::AppHandle,
     project_dir: String,
     segments: Vec<SegmentRecord>,
     options: Option<RecognitionOptions>,
 ) -> Result<Vec<RecognitionResult>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        recognize_segments_impl(project_dir, segments, options.unwrap_or_default())
+        recognize_segments_impl(app, project_dir, segments, options.unwrap_or_default())
     })
     .await
     .map_err(|err| err.to_string())?
 }
 
+/// Two-phase recognize: Whisper → Ollama polish.
+///
+/// **Why two-phase and not streaming?** On Apple Silicon (and any single-GPU
+/// box) the streaming pipeline ran into resource contention — Ollama's 32b
+/// model holds ~22GB of VRAM/unified-memory while it's loaded, and a
+/// concurrent Whisper-on-Metal process gets timeshared with it, slowing
+/// both sides 5–10× and occasionally inducing multi-minute swap stalls.
+/// Two-phase lets each tool own the GPU/CPU in turn:
+///   Phase 1 — Whisper drains all segments (each Whisper subprocess uses
+///             CPU here so it never collides with a hot Ollama runner).
+///   Phase 2 — LLM polish workers drain the polished text queue.
+///
+/// Each phase emits per-segment progress events. The frontend resets the
+/// progress bar between phases so users see Whisper-progress and
+/// polish-progress separately.
+///
+/// Cancellation: `cancel_recognize` flips a global flag. Workers check it
+/// at the top of each loop iteration. In-flight Whisper subprocesses /
+/// LLM HTTP calls finish naturally (5–10s typical) before the worker exits.
 fn recognize_segments_impl(
+    app: tauri::AppHandle,
     project_dir: String,
     segments: Vec<SegmentRecord>,
     options: RecognitionOptions,
 ) -> Result<Vec<RecognitionResult>, String> {
+    use std::sync::atomic::Ordering;
+    use tauri::Emitter as _;
     if segments.is_empty() {
         return Ok(Vec::new());
     }
@@ -1455,6 +1700,10 @@ fn recognize_segments_impl(
     let project_dir = PathBuf::from(project_dir);
     let cache_dir = project_dir.join(".asr").join("cache");
     fs::create_dir_all(&cache_dir).map_err(|err| err.to_string())?;
+
+    // Reset cancel flag at the start of each run.
+    let cancel = recognize_cancel_flag();
+    cancel.store(false, Ordering::Relaxed);
 
     let model = options
         .whisper_model
@@ -1483,11 +1732,22 @@ fn recognize_segments_impl(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_LLM_PROMPT.to_string());
 
-    let mut results: Vec<RecognitionResult> = Vec::with_capacity(segments.len());
+    let id_to_idx: HashMap<String, usize> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.clone(), i))
+        .collect();
+    let results: std::sync::Arc<Mutex<Vec<Option<RecognitionResult>>>> =
+        std::sync::Arc::new(Mutex::new(vec![None; segments.len()]));
+
+    // ============================================================
+    // PHASE 1 — ASR (cache pre-pass + Whisper worker pool)
+    // ============================================================
+
     let mut to_run: Vec<SegmentRecord> = Vec::new();
     let mut cache_keys: HashMap<String, String> = HashMap::new();
-
     for segment in &segments {
+        let idx = id_to_idx[&segment.id];
         let segment_path = PathBuf::from(&segment.segment_path);
         if !segment_path.is_file() {
             return Err(format!("切割片段不存在：{}", segment.segment_path));
@@ -1503,20 +1763,27 @@ fn recognize_segments_impl(
                     .and_then(|item| item.as_str())
                     .unwrap_or_default()
                     .to_string();
-                results.push(RecognitionResult {
-                    segment_id: segment.id.clone(),
-                    text: raw.clone(),
-                    raw_text: raw,
-                    polished: false,
-                    cached: true,
-                    emotion: None,
-                    tags: Vec::new(),
-                });
+                if let Ok(mut g) = results.lock() {
+                    g[idx] = Some(RecognitionResult {
+                        segment_id: segment.id.clone(),
+                        text: raw.clone(),
+                        raw_text: raw,
+                        polished: false,
+                        cached: true,
+                        polish_endpoint: None,
+                        polish_model: None,
+                        emotion: None,
+                        tags: Vec::new(),
+                    });
+                }
                 continue;
             }
         }
         to_run.push(segment.clone());
     }
+
+    let asr_total = to_run.len();
+    let asr_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     if !to_run.is_empty() {
         let stamp = SystemTime::now()
@@ -1526,204 +1793,451 @@ fn recognize_segments_impl(
         let output_dir = project_dir.join(".asr").join(format!("run_{}", stamp));
         fs::create_dir_all(&output_dir).map_err(|err| err.to_string())?;
 
-        let mut command = Command::new(whisper);
-        command
-            .arg("--model")
-            .arg(&model)
-            .arg("--language")
-            .arg("Chinese")
-            .arg("--task")
-            .arg("transcribe")
-            .arg("--output_format")
-            .arg("json")
-            .arg("--output_dir")
-            .arg(&output_dir)
-            .arg("--fp16")
-            .arg("False")
-            .arg("--verbose")
-            .arg("False")
-            .arg("--condition_on_previous_text")
-            .arg("False")
-            .arg("--initial_prompt")
-            .arg(&initial_prompt);
+        const WHISPER_CHUNK_SIZE: usize = 8;
+        let total_chunks = to_run.len().div_ceil(WHISPER_CHUNK_SIZE);
+        let whisper_concurrency = options.whisper_concurrency.unwrap_or(1).max(1) as usize;
 
-        for segment in &to_run {
-            command.arg(&segment.segment_path);
+        let (chunks_tx, chunks_rx) = mpsc::channel::<Vec<SegmentRecord>>();
+        for chunk in to_run.chunks(WHISPER_CHUNK_SIZE) {
+            let _ = chunks_tx.send(chunk.to_vec());
         }
+        drop(chunks_tx);
+        let chunks_rx = std::sync::Arc::new(Mutex::new(chunks_rx));
+        let chunks_done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let output = command
-            .output()
-            .map_err(|err| format!("无法运行本地 whisper：{}", err))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(format!(
-                "whisper 识别失败：{}{}",
-                stderr.trim(),
-                stdout.trim()
-            ));
-        }
+        eprintln!(
+            "[recognize] phase=whisper · {} segs to run · {} chunks · whisper_concurrency={}",
+            asr_total, total_chunks, whisper_concurrency
+        );
 
-        for segment in to_run {
-            let segment_path = PathBuf::from(&segment.segment_path);
-            let raw = read_whisper_json_text(&output_dir, &segment_path)?;
-            if let Some(key) = cache_keys.get(&segment.id) {
-                let cache_file = cache_dir.join(format!("{}.json", key));
-                let _ = fs::write(&cache_file, json!({"text": raw}).to_string());
-            }
-            results.push(RecognitionResult {
-                segment_id: segment.id.clone(),
-                text: raw.clone(),
-                raw_text: raw,
-                polished: false,
-                cached: false,
-                emotion: None,
-                tags: Vec::new(),
+        let mut whisper_handles: Vec<std::thread::JoinHandle<()>> =
+            Vec::with_capacity(whisper_concurrency);
+        for w in 0..whisper_concurrency {
+            let rx = std::sync::Arc::clone(&chunks_rx);
+            let app_clone = app.clone();
+            let counter = std::sync::Arc::clone(&asr_counter);
+            let results_arc = std::sync::Arc::clone(&results);
+            let cancel_clone = std::sync::Arc::clone(&cancel);
+            let id_to_idx_clone = id_to_idx.clone();
+            let cache_keys_clone = cache_keys.clone();
+            let cache_dir_clone = cache_dir.clone();
+            let output_dir_clone = output_dir.clone();
+            let initial_prompt_clone = initial_prompt.clone();
+            let model_clone = model.clone();
+            let whisper_path = whisper.to_string();
+            let chunks_done_clone = std::sync::Arc::clone(&chunks_done);
+            let h = std::thread::spawn(move || loop {
+                if cancel_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+                let chunk = {
+                    let guard = match rx.lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    match guard.recv() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    }
+                };
+                let chunk_idx = chunks_done_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[whisper-{}] chunk {}/{} · {} segs",
+                    w,
+                    chunk_idx,
+                    total_chunks,
+                    chunk.len()
+                );
+
+                let mut command = Command::new(&whisper_path);
+                command
+                    .arg("--model")
+                    .arg(&model_clone)
+                    .arg("--language")
+                    .arg("Chinese")
+                    .arg("--task")
+                    .arg("transcribe")
+                    .arg("--output_format")
+                    .arg("json")
+                    .arg("--output_dir")
+                    .arg(&output_dir_clone)
+                    .arg("--fp16")
+                    .arg("False")
+                    .arg("--verbose")
+                    .arg("False")
+                    .arg("--condition_on_previous_text")
+                    .arg("False")
+                    // Force CPU. On Apple Silicon, Ollama 32b holds ~22GB
+                    // VRAM whenever it's hot — Whisper-on-Metal would get
+                    // timeshared and stall. CPU inference for turbo is
+                    // ~1–1.5s/seg and steady. Phase 1 runs only Whisper,
+                    // but a hot Ollama from a prior run can still hog VRAM.
+                    .arg("--device")
+                    .arg("cpu")
+                    .arg("--initial_prompt")
+                    .arg(&initial_prompt_clone);
+                for segment in &chunk {
+                    command.arg(&segment.segment_path);
+                }
+                let output = match command.output() {
+                    Ok(o) => o,
+                    Err(err) => {
+                        eprintln!("[whisper-{}] spawn failed: {}", w, err);
+                        continue;
+                    }
+                };
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprintln!(
+                        "[whisper-{}] chunk {} failed (skipping): {}",
+                        w,
+                        chunk_idx,
+                        stderr.trim()
+                    );
+                    continue;
+                }
+
+                for segment in &chunk {
+                    let segment_path = PathBuf::from(&segment.segment_path);
+                    let raw = match read_whisper_json_text(&output_dir_clone, &segment_path) {
+                        Ok(r) => r,
+                        Err(err) => {
+                            eprintln!(
+                                "[whisper-{}] missing output for {}: {}",
+                                w, segment.id, err
+                            );
+                            continue;
+                        }
+                    };
+                    if let Some(key) = cache_keys_clone.get(&segment.id) {
+                        let cache_file = cache_dir_clone.join(format!("{}.json", key));
+                        let _ = fs::write(&cache_file, json!({"text": raw}).to_string());
+                    }
+                    let Some(&idx) = id_to_idx_clone.get(&segment.id) else {
+                        continue;
+                    };
+                    let completed = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = app_clone.emit(
+                        "recognize:segment_done",
+                        SegmentProgressEvent {
+                            segment_id: segment.id.clone(),
+                            phase: "asr".into(),
+                            text: raw.clone(),
+                            emotion: None,
+                            tags: Vec::new(),
+                            polish_endpoint: None,
+                            polish_model: None,
+                            cached: false,
+                            completed,
+                            total: asr_total,
+                        },
+                    );
+                    if let Ok(mut g) = results_arc.lock() {
+                        g[idx] = Some(RecognitionResult {
+                            segment_id: segment.id.clone(),
+                            text: raw.clone(),
+                            raw_text: raw,
+                            polished: false,
+                            cached: false,
+                            emotion: None,
+                            tags: Vec::new(),
+                            polish_endpoint: None,
+                            polish_model: None,
+                        });
+                    }
+                }
             });
+            whisper_handles.push(h);
+        }
+        for h in whisper_handles {
+            let _ = h.join();
         }
     }
 
-    let id_to_segment: HashMap<String, &SegmentRecord> =
-        segments.iter().map(|s| (s.id.clone(), s)).collect();
-    let id_to_index: HashMap<String, usize> = segments
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.id.clone(), i))
-        .collect();
-    results.sort_by_key(|r| {
-        id_to_index
-            .get(&r.segment_id)
-            .copied()
-            .unwrap_or(usize::MAX)
-    });
+    // Tell the frontend Phase 1 is done so it can flip the progress bar
+    // to the Polish label and reset the counter.
+    let _ = app.emit(
+        "recognize:segment_done",
+        SegmentProgressEvent {
+            segment_id: String::new(),
+            phase: "phase_done".into(),
+            text: "asr".into(),
+            emotion: None,
+            tags: Vec::new(),
+            polish_endpoint: None,
+            polish_model: None,
+            cached: false,
+            completed: asr_total,
+            total: asr_total,
+        },
+    );
+
+    if cancel.load(Ordering::Relaxed) {
+        eprintln!("[recognize] cancelled after Whisper phase");
+        let g = results.lock().map_err(|err| err.to_string())?;
+        return Ok(g.iter().filter_map(|s| s.clone()).collect());
+    }
+
+    // ============================================================
+    // PHASE 2 — Ollama polish
+    // ============================================================
 
     if use_llm {
-        let model_name = ollama_model
-            .clone()
-            .ok_or_else(|| "未指定 Ollama 模型".to_string())?;
-
-        // Build the endpoint pool: primary URL + any extras. Round-robin
-        // across these inside the parallel iterator below so a second LAN
-        // machine can absorb half the load.
-        let mut endpoints: Vec<String> =
-            vec![ollama_url.clone()];
-        if let Some(extras) = options.ollama_extra_urls.as_ref() {
-            for url in extras {
-                let trimmed = url.trim();
-                if !trimmed.is_empty() && trimmed != ollama_url {
-                    endpoints.push(trimmed.to_string());
-                }
-            }
-        }
-        let endpoint_count = endpoints.len();
-
-        // Default concurrency = 2 per endpoint, capped at 8 total. Users can
-        // override via the settings drawer if their Ollama server's
-        // OLLAMA_NUM_PARALLEL allows more.
-        let concurrency = options
-            .llm_concurrency
-            .unwrap_or((endpoint_count as u32 * 2).min(8))
-            .max(1) as usize;
-
-        // Build a fixed-size rayon thread pool so we don't blow up parallelism
-        // beyond what the Ollama server (or the local machine's RAM) can
-        // handle. Each thread owns its own ureq Agent — http connections do
-        // not need to be shared.
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(concurrency)
-            .build()
-            .map_err(|err| format!("线程池创建失败：{}", err))?;
-
-        // Snapshot the work first so we can do `.into_par_iter()` ergonomically.
-        // Each task is fully self-contained (clones the strings it needs).
-        // The endpoint is pre-assigned round-robin across the pool so each
-        // server gets ~equal load; failures on one endpoint don't poison
-        // the others (per-segment graceful fallback below).
-        struct Task {
+        // Build the polish task list. Skip segments that:
+        //   (a) Have empty Whisper text — nothing to polish.
+        //   (b) Already have an emotion tag from a prior polish run, unless
+        //       the caller asked for `overwriteCache` (the "重新识别" path).
+        //       This is the resume-after-cancel guarantee — interrupted runs
+        //       can be re-launched and polished work is not redone.
+        struct PolishTask {
             idx: usize,
-            endpoint: String,
             segment_id: String,
             raw_text: String,
             role: String,
             hint: String,
         }
-        let tasks: Vec<Task> = results
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, r)| {
+        let mut tasks: Vec<PolishTask> = Vec::new();
+        {
+            let g = results.lock().map_err(|err| err.to_string())?;
+            for (idx, slot) in g.iter().enumerate() {
+                let Some(r) = slot else { continue };
                 if r.text.trim().is_empty() {
-                    return None;
+                    continue;
                 }
-                let segment = id_to_segment.get(&r.segment_id)?;
-                Some(Task {
+                let segment = &segments[idx];
+                if !overwrite_cache && !segment.emotion.is_empty() {
+                    continue;
+                }
+                tasks.push(PolishTask {
                     idx,
-                    endpoint: endpoints[idx % endpoint_count].clone(),
                     segment_id: r.segment_id.clone(),
                     raw_text: r.text.clone(),
                     role: segment.role.clone().unwrap_or_else(|| "assistant".into()),
                     hint: segment.original_text.clone(),
-                })
-            })
-            .collect();
+                });
+            }
+        }
+        let polish_total = tasks.len();
 
-        let total_to_polish = tasks.len();
-        let model_arc = model_name.clone();
-        let prompt_arc = llm_prompt.clone();
+        if polish_total == 0 {
+            eprintln!(
+                "[recognize] phase=polish · nothing to do (all segments already polished or empty)"
+            );
+        } else {
+            let model_name = ollama_model
+                .clone()
+                .ok_or_else(|| "未指定 Ollama 模型".to_string())?;
 
-        eprintln!(
-            "[recognize] polish {} segs · {} endpoint(s) · concurrency={}",
-            total_to_polish, endpoint_count, concurrency
-        );
-
-        let polished_results: Vec<(usize, String, Result<PolishedOutput, String>)> = pool
-            .install(|| {
-                tasks
-                    .into_par_iter()
-                    .map(|task| {
-                        let res = polish_text(
-                            &task.endpoint,
-                            &model_arc,
-                            &prompt_arc,
-                            &task.raw_text,
-                            &task.role,
-                            &task.hint,
-                        );
-                        (task.idx, task.segment_id, res)
-                    })
-                    .collect()
-            });
-
-        let mut llm_failures: Vec<String> = Vec::new();
-        for (idx, segment_id, res) in polished_results {
-            match res {
-                Ok(polished) => {
-                    if !polished.text.trim().is_empty() {
-                        results[idx].text = polished.text;
-                        results[idx].polished = true;
-                        results[idx].emotion = polished.emotion;
-                        results[idx].tags = polished.tags;
+            // URL normaliser — tolerates user typos.
+            fn normalise_url(raw: &str) -> Option<String> {
+                let trimmed = raw.trim().trim_end_matches('/');
+                if trimmed.is_empty() {
+                    return None;
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                if let Some(rest) = lower.strip_prefix("https://") {
+                    let len = "https://".len();
+                    let rest_orig = &trimmed[len..len + rest.len()];
+                    return Some(format!("https://{}", rest_orig));
+                }
+                let candidates = [
+                    "https://", "http://", "https//", "http//", "https:", "http:",
+                ];
+                let mut tail = trimmed;
+                for prefix in candidates.iter() {
+                    let lower_tail = tail.to_ascii_lowercase();
+                    if lower_tail.starts_with(prefix) {
+                        tail = &tail[prefix.len()..];
+                        break;
                     }
                 }
-                Err(err) => {
-                    eprintln!(
-                        "[recognize] Ollama polish failed for segment {}: {}",
-                        segment_id, err
-                    );
-                    llm_failures.push(format!("{}: {}", segment_id, err));
+                let tail = tail.trim_start_matches('/');
+                if tail.is_empty() {
+                    return None;
                 }
+                Some(format!("http://{}", tail))
+            }
+
+            let mut endpoints: Vec<(String, String)> = Vec::new();
+            if let Some(url) = normalise_url(&ollama_url) {
+                endpoints.push((url, model_name.clone()));
+            }
+            if let Some(defs) = options.ollama_extra_endpoints.as_ref() {
+                for def in defs {
+                    let Some(url) = normalise_url(&def.url) else {
+                        continue;
+                    };
+                    let mdl = def
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(model_name.as_str())
+                        .to_string();
+                    if endpoints.iter().any(|(u, m)| u == &url && m == &mdl) {
+                        continue;
+                    }
+                    endpoints.push((url, mdl));
+                }
+            }
+            if let Some(extras) = options.ollama_extra_urls.as_ref() {
+                for url in extras {
+                    let Some(url) = normalise_url(url) else {
+                        continue;
+                    };
+                    if endpoints.iter().any(|(u, _)| u == &url) {
+                        continue;
+                    }
+                    endpoints.push((url, model_name.clone()));
+                }
+            }
+            if endpoints.is_empty() {
+                return Err("Ollama 端点列表为空 — 检查设置抽屉里的端点 URL".to_string());
+            }
+            let endpoint_count = endpoints.len();
+            let concurrency = options
+                .llm_concurrency
+                .unwrap_or((endpoint_count as u32 * 2).min(8))
+                .max(1) as usize;
+
+            eprintln!(
+                "[recognize] phase=polish · {} tasks · {} endpoint(s) · llm_concurrency={} · pool={:?}",
+                polish_total, endpoint_count, concurrency, endpoints,
+            );
+
+            let (task_tx, task_rx) = mpsc::channel::<PolishTask>();
+            for t in tasks {
+                let _ = task_tx.send(t);
+            }
+            drop(task_tx);
+            let task_rx = std::sync::Arc::new(Mutex::new(task_rx));
+            let polish_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let prompt_arc = std::sync::Arc::new(llm_prompt.clone());
+
+            let mut polish_handles: Vec<std::thread::JoinHandle<()>> =
+                Vec::with_capacity(concurrency);
+            for worker_idx in 0..concurrency {
+                let (url, mdl) = endpoints[worker_idx % endpoint_count].clone();
+                let prompt = std::sync::Arc::clone(&prompt_arc);
+                let rx = std::sync::Arc::clone(&task_rx);
+                let app_clone = app.clone();
+                let counter = std::sync::Arc::clone(&polish_counter);
+                let results_arc = std::sync::Arc::clone(&results);
+                let cancel_clone = std::sync::Arc::clone(&cancel);
+                let total = polish_total;
+                let h = std::thread::spawn(move || loop {
+                    if cancel_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let task = {
+                        let guard = match rx.lock() {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        };
+                        match guard.recv() {
+                            Ok(t) => t,
+                            Err(_) => return,
+                        }
+                    };
+                    let started = Instant::now();
+                    let res = polish_text(
+                        &url,
+                        &mdl,
+                        &prompt,
+                        &task.raw_text,
+                        &task.role,
+                        &task.hint,
+                    );
+                    let elapsed_ms = started.elapsed().as_millis();
+                    eprintln!(
+                        "[polish] {} · {} · {:.1}s · {}",
+                        task.segment_id,
+                        mdl,
+                        elapsed_ms as f64 / 1000.0,
+                        if res.is_ok() { "ok" } else { "fail" }
+                    );
+                    if let Ok(p) = &res {
+                        if !p.text.trim().is_empty() {
+                            if let Ok(mut g) = results_arc.lock() {
+                                if let Some(r) = g[task.idx].as_mut() {
+                                    r.text = p.text.clone();
+                                    r.polished = true;
+                                    r.emotion = p.emotion.clone();
+                                    r.tags = p.tags.clone();
+                                    r.polish_endpoint = Some(url.clone());
+                                    r.polish_model = Some(mdl.clone());
+                                }
+                            }
+                        }
+                    }
+                    let completed = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    let event = match &res {
+                        Ok(p) => SegmentProgressEvent {
+                            segment_id: task.segment_id.clone(),
+                            phase: "polish_ok".into(),
+                            text: p.text.clone(),
+                            emotion: p.emotion.clone(),
+                            tags: p.tags.clone(),
+                            polish_endpoint: Some(url.clone()),
+                            polish_model: Some(mdl.clone()),
+                            cached: false,
+                            completed,
+                            total,
+                        },
+                        Err(err) => {
+                            eprintln!(
+                                "[polish] error for {} via {}: {}",
+                                task.segment_id, url, err
+                            );
+                            SegmentProgressEvent {
+                                segment_id: task.segment_id.clone(),
+                                phase: "polish_fail".into(),
+                                text: task.raw_text.clone(),
+                                emotion: None,
+                                tags: Vec::new(),
+                                polish_endpoint: Some(url.clone()),
+                                polish_model: Some(mdl.clone()),
+                                cached: false,
+                                completed,
+                                total,
+                            }
+                        }
+                    };
+                    let _ = app_clone.emit("recognize:segment_done", event);
+                });
+                polish_handles.push(h);
+            }
+            for h in polish_handles {
+                let _ = h.join();
             }
         }
 
-        if !llm_failures.is_empty() && llm_failures.len() == total_to_polish {
-            return Err(format!(
-                "Ollama 全部失败（{} 段）。最后一段错误：{}",
-                llm_failures.len(),
-                llm_failures.last().cloned().unwrap_or_default()
-            ));
-        }
+        let _ = app.emit(
+            "recognize:segment_done",
+            SegmentProgressEvent {
+                segment_id: String::new(),
+                phase: "phase_done".into(),
+                text: "polish".into(),
+                emotion: None,
+                tags: Vec::new(),
+                polish_endpoint: None,
+                polish_model: None,
+                cached: false,
+                completed: polish_total,
+                total: polish_total,
+            },
+        );
     }
 
-    Ok(results)
+    let g = results.lock().map_err(|err| err.to_string())?;
+    let out: Vec<RecognitionResult> = g.iter().filter_map(|s| s.clone()).collect();
+    if cancel.load(Ordering::Relaxed) {
+        eprintln!(
+            "[recognize] run cancelled · returning {} partial results",
+            out.len()
+        );
+    }
+    Ok(out)
 }
 
 fn polish_text(
@@ -1765,8 +2279,13 @@ fn polish_text(
     });
 
     let url = format!("{}/api/chat", ollama_url.trim_end_matches('/'));
+    // 15-minute timeout — generous enough that a slow endpoint (e.g. 122b
+    // on memory pressure, or a model still warming up cold) gets a fair
+    // chance to finish without blowing the whole pipeline. The work-stealing
+    // pool means a slow endpoint just contributes proportionally less; we
+    // don't want to drop their work entirely.
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(900))
         .build();
     let response = agent
         .post(&url)
@@ -3022,6 +3541,7 @@ pub fn run() {
             scan_project_folder,
             cut_audio_file,
             recognize_segments,
+            cancel_recognize,
             polish_text_with_llm,
             list_ollama_models,
             check_dependencies,
