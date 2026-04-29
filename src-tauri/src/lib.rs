@@ -17,6 +17,28 @@ const PROJECT_FOLDER: &str = "_dialect_labeler";
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 const DEFAULT_LLM_PROMPT: &str = include_str!("default_llm_prompt.txt");
 
+/// Spawn a `Command` for a console binary (ffmpeg, ffprobe, whisper)
+/// without flashing a black cmd window every invocation on Windows.
+///
+/// On Windows, `Command::new("ffmpeg")` inherits the parent's console
+/// — but a windowed Tauri app doesn't have one, so the OS creates a
+/// fresh console for the child. With dozens of waveform/probe spawns
+/// per project that's a screenful of flicker. Setting `CREATE_NO_WINDOW`
+/// (0x08000000) tells CreateProcess to suppress the console.
+///
+/// On macOS / Linux this is a transparent passthrough.
+fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManifestRecord {
@@ -318,7 +340,7 @@ fn prepare_playback_audio_impl(
         });
     }
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = silent_command("ffmpeg");
     command
         .arg("-y")
         .arg("-hide_banner")
@@ -373,14 +395,25 @@ async fn read_waveform_peaks(
 }
 
 fn read_waveform_peaks_impl(input_path: String, bucket_count: usize) -> Result<Vec<f32>, String> {
-    ensure_ffmpeg()?;
     let bucket_count = bucket_count.clamp(64, 4096);
     let input = PathBuf::from(&input_path);
     if !input.is_file() {
         return Err(format!("Audio file not found: {}", input_path));
     }
 
-    let mut child = Command::new("ffmpeg")
+    // Disk cache: first computation per (file, mtime, size, buckets) is
+    // expensive — ffmpeg has to spawn (193MB exe on Windows = slow) and
+    // decode the whole file. Subsequent reads are a 4-byte-per-bucket
+    // memory map. Cache lives in the OS temp dir so it doesn't pollute
+    // the user's project folder; gets garbage-collected by the OS.
+    if let Some(cache_path) = waveform_cache_path(&input, bucket_count) {
+        if let Some(peaks) = load_cached_peaks(&cache_path, bucket_count) {
+            return Ok(peaks);
+        }
+    }
+
+    ensure_ffmpeg()?;
+    let mut child = silent_command("ffmpeg")
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
@@ -446,7 +479,60 @@ fn read_waveform_peaks_impl(input_path: String, bucket_count: usize) -> Result<V
         }
         peaks.push((peak as f32) / (i16::MAX as f32));
     }
+    // Best-effort cache write — failures are silent (e.g. temp dir not
+    // writable). Users will just pay the ffmpeg cost again next time.
+    if let Some(cache_path) = waveform_cache_path(&input, bucket_count) {
+        let _ = save_cached_peaks(&cache_path, &peaks);
+    }
     Ok(peaks)
+}
+
+/// Cache file path for a `(input, bucket_count)` tuple. Returns None if
+/// the input file's metadata can't be read. Key folds in mtime + size so
+/// the cache invalidates automatically when the audio is replaced.
+fn waveform_cache_path(input: &Path, bucket_count: usize) -> Option<PathBuf> {
+    let meta = fs::metadata(input).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let size = meta.len();
+    let mut hasher = DefaultHasher::new();
+    input.to_string_lossy().hash(&mut hasher);
+    mtime.hash(&mut hasher);
+    size.hash(&mut hasher);
+    bucket_count.hash(&mut hasher);
+    let key = format!("{:016x}", hasher.finish());
+    let dir = std::env::temp_dir().join("dialect-labeler-waveform");
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("{}.peaks", key)))
+}
+
+/// Load peaks from cache. Stored as raw little-endian f32 bytes (4 per
+/// bucket) — much smaller and faster to parse than JSON. Returns None
+/// if the cache file is missing, the wrong size for the requested bucket
+/// count, or unreadable.
+fn load_cached_peaks(cache_path: &Path, bucket_count: usize) -> Option<Vec<f32>> {
+    let bytes = fs::read(cache_path).ok()?;
+    if bytes.len() != bucket_count * 4 {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+fn save_cached_peaks(cache_path: &Path, peaks: &[f32]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(peaks.len() * 4);
+    for p in peaks {
+        buf.extend_from_slice(&p.to_le_bytes());
+    }
+    fs::write(cache_path, buf)
 }
 
 #[tauri::command]
@@ -1196,6 +1282,9 @@ fn export_dataset_bundle_impl(
     // uploads the whole bundle to OSS the JSONL references line up.
     let input_root = bundle_root_str.clone();
 
+    // Heal mislabeled roles inherited from the old infer_role bug.
+    let new_segments = normalize_segment_roles(&new_segments);
+
     let lines = if pair {
         build_paired_jsonl(
             &new_segments,
@@ -1313,6 +1402,9 @@ fn export_segments_jsonl(
     let prefix = opts.audio_file_prefix.unwrap_or_default();
     let input_root = opts.input_root.unwrap_or_default();
 
+    // Heal segments whose role got mislabeled by the old infer_role bug.
+    let segments = normalize_segment_roles(&segments);
+
     let lines = if pair {
         build_paired_jsonl(
             &segments,
@@ -1327,6 +1419,35 @@ fn export_segments_jsonl(
 
     fs::write(&path, format!("{}\n", lines.join("\n"))).map_err(|err| err.to_string())?;
     Ok(path_to_string(&path))
+}
+
+/// Normalize segment roles by re-inferring from the source file name.
+///
+/// Older builds had a bug in `infer_role` that scanned the full path,
+/// so any project under `/Users/<name>/` got every segment marked as
+/// `user`. This walks each segment, re-runs the (fixed) `infer_role`
+/// against `source_path`, and overrides `segment.role` if the file/dir
+/// name unambiguously implies a different role. Manual roles set via
+/// the UI are preserved when they don't conflict with the inferred one.
+fn normalize_segment_roles(segments: &[SegmentRecord]) -> Vec<SegmentRecord> {
+    segments
+        .iter()
+        .map(|s| {
+            let inferred = infer_role(Path::new(&s.source_path));
+            let mut copy = s.clone();
+            // Override only when file/dir name implies a definite role
+            // (i.e. infer_role returned Some) AND it differs from what's
+            // currently stored. This catches the bug-inflicted "user"
+            // labels on `..._发音人.wav` files without clobbering a
+            // user's deliberate manual override on ambiguous filenames.
+            if let Some(inferred_role) = inferred {
+                if copy.role.as_deref() != Some(inferred_role.as_str()) {
+                    copy.role = Some(inferred_role);
+                }
+            }
+            copy
+        })
+        .collect()
 }
 
 fn build_flat_jsonl(
@@ -1370,6 +1491,29 @@ fn build_flat_jsonl(
     Ok(lines)
 }
 
+/// Build paired-conversation JSONL matching the dataset spec (`自由演绎.jsonl`).
+///
+/// **One pair_key → one JSONL line.** A `pair_key` groups all segments
+/// belonging to the same dialogue turn — typically the user's question
+/// audio (`...02_陪聊.wav`) and the assistant's answer audio
+/// (`...02_发音人.wav`), each of which the cutter has further split
+/// into N silence-bounded segments (`...02_01_发音人.wav`,
+/// `...02_02_发音人.wav`, …).
+///
+/// Output shape per line:
+/// ```json
+/// {"messages": [
+///   {"role": "system",    "content": "<system_prompt>"},
+///   {"role": "user",      "content": "<合并的问题文本>",
+///                          "audio_file": "<源音频或单段>"},
+///   {"role": "assistant", "content": ["<句1>", "<句2>", …],
+///                          "audio_file": ["<wav1>", "<wav2>", …],
+///                          "emotion":    ["中立",  "开心", …]}
+/// ]}
+/// ```
+///
+/// Single-segment turns collapse `audio_file` and `emotion` from arrays
+/// to scalars to match the demo's "single string when only one" pattern.
 fn build_paired_jsonl(
     segments: &[SegmentRecord],
     system_prompt: &str,
@@ -1389,7 +1533,12 @@ fn build_paired_jsonl(
 
     let mut lines = Vec::new();
     for key in order {
-        let group = by_pair.get(&key).cloned().unwrap_or_default();
+        let mut group = by_pair.get(&key).cloned().unwrap_or_default();
+        // Stable order within each role: by start_ms so the assistant
+        // sub-sentences come out in temporal order (and so the audio_file
+        // array matches the content array index by index).
+        group.sort_by_key(|s| s.start_ms);
+
         let user_segs: Vec<&SegmentRecord> = group
             .iter()
             .copied()
@@ -1433,62 +1582,131 @@ fn build_paired_jsonl(
             continue;
         }
 
-        let user_text = user_segs
-            .iter()
-            .map(|seg| {
-                if seg.phonetic_text.trim().is_empty() {
-                    seg.original_text.clone()
-                } else {
-                    seg.phonetic_text.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("");
-        let user_audio = user_segs.first().map(|seg| {
-            if user_use_source {
-                with_prefix(prefix, &seg.source_path, input_root)
+        // Helper: pick polished text first, fall back to raw recognition.
+        let pick_text = |s: &SegmentRecord| -> String {
+            if s.phonetic_text.trim().is_empty() {
+                s.original_text.clone()
             } else {
-                with_prefix(prefix, &seg.segment_path, input_root)
+                s.phonetic_text.clone()
             }
-        });
+        };
 
-        for assistant in &assistant_segs {
-            let mut messages = Vec::new();
-            if !system_prompt.trim().is_empty() {
-                messages.push(json!({"role": "system", "content": system_prompt}));
-            }
-            if let Some(audio) = &user_audio {
-                messages.push(json!({
-                    "role": "user",
-                    "content": user_text.clone(),
-                    "audio_file": audio,
-                }));
-            }
-            let assistant_text = if assistant.phonetic_text.trim().is_empty() {
-                assistant.original_text.clone()
-            } else {
-                assistant.phonetic_text.clone()
-            };
-            let mut a_msg = json!({
-                "role": "assistant",
-                "content": [assistant_text],
-                "audio_file": with_prefix(prefix, &assistant.segment_path, input_root),
-            });
-            if !assistant.emotion.is_empty() {
-                a_msg["emotion"] = json!(assistant.emotion);
-            }
-            if !assistant.tags.is_empty() {
-                a_msg["tags"] = json!(assistant.tags);
-            }
-            if !assistant.notes.trim().is_empty() {
-                a_msg["notes"] = json!(assistant.notes);
-            }
-            messages.push(a_msg);
-            lines.push(
-                serde_json::to_string(&json!({"messages": messages}))
-                    .map_err(|err| err.to_string())?,
-            );
+        let mut messages = Vec::new();
+        if !system_prompt.trim().is_empty() {
+            messages.push(json!({"role": "system", "content": system_prompt}));
         }
+
+        // --- user message ---
+        // Text: concatenate all user sub-segments. Chinese has no word
+        // boundary so we join with the empty string — adjacent segments
+        // already include their own punctuation.
+        if !user_segs.is_empty() {
+            let user_text = user_segs.iter().map(|s| pick_text(s)).collect::<Vec<_>>().join("");
+            // Audio: when `user_use_source=true` (the demo default), point
+            // at the un-split source file once. Otherwise emit the cut
+            // pieces — single string when there's just one, array when
+            // there are several.
+            let audio_value: Value = if user_use_source {
+                Value::String(with_prefix(
+                    prefix,
+                    &user_segs[0].source_path,
+                    input_root,
+                ))
+            } else if user_segs.len() == 1 {
+                Value::String(with_prefix(
+                    prefix,
+                    &user_segs[0].segment_path,
+                    input_root,
+                ))
+            } else {
+                Value::Array(
+                    user_segs
+                        .iter()
+                        .map(|s| Value::String(with_prefix(prefix, &s.segment_path, input_root)))
+                        .collect(),
+                )
+            };
+            messages.push(json!({
+                "role": "user",
+                "content": user_text,
+                "audio_file": audio_value,
+            }));
+        }
+
+        // --- assistant message ---
+        // content is an array of strings — one per sub-segment. audio_file
+        // and emotion mirror that array: same length, same order.
+        let texts: Vec<Value> = assistant_segs
+            .iter()
+            .map(|s| Value::String(pick_text(s)))
+            .collect();
+        let audios: Vec<Value> = assistant_segs
+            .iter()
+            .map(|s| Value::String(with_prefix(prefix, &s.segment_path, input_root)))
+            .collect();
+        let emotions: Vec<Value> = assistant_segs
+            .iter()
+            .map(|s| {
+                Value::String(
+                    s.emotion
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "中立".to_string()),
+                )
+            })
+            .collect();
+
+        let single = assistant_segs.len() == 1;
+        let audio_value: Value = if single {
+            audios[0].clone()
+        } else {
+            Value::Array(audios)
+        };
+        let mut a_msg = json!({
+            "role": "assistant",
+            "content": Value::Array(texts),
+            "audio_file": audio_value,
+        });
+        // Emit `emotion` only when the labelers actually picked one — an
+        // all-empty group means the polish step never ran or was cleared.
+        if assistant_segs.iter().any(|s| !s.emotion.is_empty()) {
+            a_msg["emotion"] = if single {
+                emotions[0].clone()
+            } else {
+                Value::Array(emotions)
+            };
+        }
+        // Tag arrays mirror content too (one per sub-segment).
+        if assistant_segs.iter().any(|s| !s.tags.is_empty()) {
+            let tags_per_seg: Vec<Value> = assistant_segs
+                .iter()
+                .map(|s| Value::Array(s.tags.iter().cloned().map(Value::String).collect()))
+                .collect();
+            a_msg["tags"] = if single {
+                tags_per_seg[0].clone()
+            } else {
+                Value::Array(tags_per_seg)
+            };
+        }
+        // Annotator notes: keep only if any sub-segment carries one.
+        let notes_joined = assistant_segs
+            .iter()
+            .map(|s| s.notes.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        if !notes_joined.is_empty() {
+            a_msg["notes"] = json!(notes_joined);
+        }
+        messages.push(a_msg);
+
+        lines.push(
+            serde_json::to_string(&json!({"messages": messages}))
+                .map_err(|err| err.to_string())?,
+        );
+
+        // Stragglers with neither user nor assistant role get their own
+        // single-message line — rare, but preserves the data.
         for extra in &other_segs {
             lines.push(build_single_message_line(
                 extra,
@@ -1578,16 +1796,51 @@ fn compute_relative_for_oss(path: &str, input_root: &str) -> String {
         .to_string()
 }
 
+/// Group key for the "one dialogue turn = one JSONL line" rule.
+///
+/// Two source filenames belong to the same dialogue turn when their stems
+/// match after the role token is removed. Two real-world conventions are
+/// supported:
+///
+///   1. **Role at the END, separated by `_`** (the demo `自由演绎.jsonl`):
+///      ```text
+///      自由演绎_0001_01_陪聊.wav   user
+///      自由演绎_0001_01_发音人.wav assistant
+///      ```
+///      Stripping `_陪聊` / `_发音人` from the end yields the shared key
+///      `自由演绎_0001_01`.
+///
+///   2. **Role in the MIDDLE, separated by `-`** (the 长沙方言 dataset):
+///      ```text
+///      长沙方言-0413-文案演绎-陪聊-话题1.wav    user
+///      长沙方言-0413-文案演绎-发音人-话题1.wav  assistant
+///      ```
+///      Removing the `-陪聊-` / `-发音人-` token (collapsing the
+///      surrounding `-` into one) yields the shared key
+///      `长沙方言-0413-文案演绎-话题1`.
+///
+/// The regex looks for a role token bounded by `_` or `-` on the left,
+/// and either `_`/`-` on the right OR end-of-string. Matched at the end
+/// the whole `<sep><role>` is dropped; matched in the middle, just the
+/// role token (and one of the surrounding separators) is removed so the
+/// remaining text stays coherent.
 fn pair_key(segment: &SegmentRecord) -> String {
     let stem = path_file_stem(Path::new(&segment.source_path));
-    let role = segment.role.as_deref().unwrap_or("");
-    let pattern = match role {
-        "user" => r"_(?:陪聊|user)$",
-        "assistant" => r"_(?:\d+_)?(?:发音人|assistant)$",
-        _ => r"_(?:\d+_)?(?:发音人|陪聊|user|assistant)$",
-    };
-    let key_re = Regex::new(pattern).expect("valid regex");
-    let trimmed = key_re.replace(&stem, "").to_string();
+    // (left_sep) (role) (right_sep | end)
+    let re = Regex::new(r"([_\-])(?:发音人|assistant|陪聊|user)(?:([_\-])|$)")
+        .expect("valid regex");
+    let cleaned = re
+        .replace(&stem, |caps: &regex::Captures| {
+            // If a right separator was captured we're in the middle of
+            // the stem — keep one separator so adjacent tokens don't
+            // fuse. If not, the role was at the end — drop everything.
+            match caps.get(2) {
+                Some(right) => right.as_str().to_string(),
+                None => String::new(),
+            }
+        })
+        .to_string();
+    let trimmed = cleaned.trim_end_matches(['_', '-']).to_string();
     if trimmed.is_empty() {
         stem
     } else {
@@ -1849,7 +2102,7 @@ fn recognize_segments_impl(
                     chunk.len()
                 );
 
-                let mut command = Command::new(&whisper_path);
+                let mut command = silent_command(&whisper_path);
                 command
                     .arg("--model")
                     .arg(&model_clone)
@@ -2812,19 +3065,64 @@ fn normalize_name(value: &str) -> String {
         .collect()
 }
 
+/// Infer user/assistant role from a path.
+///
+/// **Don't scan the whole path string.** Earlier versions did
+/// `to_ascii_lowercase().contains("user")` over the full path — but on
+/// macOS every project lives under `/Users/<name>/`, which lowercases to
+/// `/users/...` and contains the substring `user`. That made every file
+/// false-positive as the user role, regardless of its actual filename.
+///
+/// We only look at:
+///   - the file name itself (e.g. `..._发音人.wav`)
+///   - its immediate parent directory (e.g. `发音人/...wav`)
+/// And ASCII keywords are matched with delimiter boundaries (`_user`,
+/// `-user`, `.user`, or whole-stem `user`) — substring `user` inside a
+/// longer ASCII token is ignored.
 fn infer_role(path: &Path) -> Option<String> {
-    let value = path_to_string(path);
-    if value.contains("陪聊") || value.to_ascii_lowercase().contains("user") {
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let parent_name = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    // Chinese tokens are unambiguous — they don't appear in any common
+    // system path. Direct substring match is fine.
+    if parent_name == "陪聊" || file_name.contains("陪聊") {
         return Some("user".to_string());
     }
-    if value.contains("发音人") || value.to_ascii_lowercase().contains("assistant") {
+    if parent_name == "发音人" || file_name.contains("发音人") {
+        return Some("assistant".to_string());
+    }
+
+    // ASCII keywords need delimiter boundaries to avoid matching e.g.
+    // "Users" or "userprofile". Only check the file stem, never parents.
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let bounded = |needle: &str| -> bool {
+        stem == needle
+            || stem.ends_with(&format!("_{}", needle))
+            || stem.ends_with(&format!("-{}", needle))
+            || stem.ends_with(&format!(".{}", needle))
+    };
+    if bounded("user") {
+        return Some("user".to_string());
+    }
+    if bounded("assistant") {
         return Some("assistant".to_string());
     }
     None
 }
 
 fn probe_audio(path: &Path) -> Result<AudioProbe, String> {
-    let output = Command::new("ffprobe")
+    let output = silent_command("ffprobe")
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
@@ -2905,7 +3203,7 @@ fn value_to_u32(value: &Value) -> Option<u32> {
 }
 
 fn ensure_ffmpeg() -> Result<(), String> {
-    let output = Command::new("ffmpeg")
+    let output = silent_command("ffmpeg")
         .arg("-version")
         .output()
         .map_err(|err| format!("Unable to run ffmpeg: {}", err))?;
@@ -2921,7 +3219,7 @@ fn detect_silence(path: &Path, config: &CutConfig) -> Result<Vec<SilenceEvent>, 
     let duration = format!("{:.3}", config.min_silence_ms as f64 / 1000.0);
     let filter = format!("silencedetect=noise={}:d={}", noise, duration);
 
-    let output = Command::new("ffmpeg")
+    let output = silent_command("ffmpeg")
         .arg("-hide_banner")
         .arg("-nostats")
         .arg("-i")
@@ -3115,7 +3413,7 @@ fn write_pcm_wav_segment(
     probe: &AudioProbe,
     codec: &str,
 ) -> Result<(), String> {
-    let mut command = Command::new("ffmpeg");
+    let mut command = silent_command("ffmpeg");
     command
         .arg("-y")
         .arg("-hide_banner")
@@ -3310,12 +3608,14 @@ mod tests {
 
     #[test]
     fn pair_key_strips_role_suffix() {
+        // Source file names are `..._<话题>_<轮>_<role>.wav` — sub-segment
+        // indices (01/02/…) only show up in segment_file_name, never here.
         let assistant = SegmentRecord {
             id: "x".into(),
-            source_path: "/audio/自由演绎_0001_01_01_发音人.wav".into(),
-            source_file_name: "自由演绎_0001_01_01_发音人.wav".into(),
-            segment_path: "/segments/x.wav".into(),
-            segment_file_name: "x.wav".into(),
+            source_path: "/audio/自由演绎_0001_01_发音人.wav".into(),
+            source_file_name: "自由演绎_0001_01_发音人.wav".into(),
+            segment_path: "/segments/自由演绎_0001_01_03_发音人.wav".into(),
+            segment_file_name: "自由演绎_0001_01_03_发音人.wav".into(),
             role: Some("assistant".into()),
             start_ms: 0,
             end_ms: 1000,
@@ -3335,6 +3635,65 @@ mod tests {
             ..assistant.clone()
         };
         assert_eq!(pair_key(&user_seg), "自由演绎_0001_01");
+
+        // Adjacent dialogue turns (01 vs 02) must NOT collapse to the same
+        // pair_key — that was a regression caused by the regex greedily
+        // eating `_01_发音人` instead of just `_发音人`.
+        let assistant_turn2 = SegmentRecord {
+            source_path: "/audio/自由演绎_0001_02_发音人.wav".into(),
+            source_file_name: "自由演绎_0001_02_发音人.wav".into(),
+            ..assistant.clone()
+        };
+        assert_eq!(pair_key(&assistant_turn2), "自由演绎_0001_02");
+        assert_ne!(pair_key(&assistant), pair_key(&assistant_turn2));
+    }
+
+    /// 长沙方言 dataset puts the role token in the MIDDLE of the filename
+    /// with `-` separators, not at the end with `_`. Both conventions
+    /// must collapse to the same pair_key for paired-conversation export
+    /// to work.
+    #[test]
+    fn pair_key_handles_middle_role_token_with_dashes() {
+        let mk = |path: &str, role: &str| SegmentRecord {
+            id: "x".into(),
+            source_path: path.into(),
+            source_file_name: path
+                .rsplit('/')
+                .next()
+                .unwrap_or(path)
+                .to_string(),
+            segment_path: "/segments/x.wav".into(),
+            segment_file_name: "x.wav".into(),
+            role: Some(role.into()),
+            start_ms: 0,
+            end_ms: 1000,
+            duration_ms: 1000,
+            original_text: String::new(),
+            phonetic_text: String::new(),
+            emotion: Vec::new(),
+            tags: Vec::new(),
+            notes: String::new(),
+        };
+
+        // Both files describe dialogue turn "话题1" of the 0413 session;
+        // they must share a pair_key so build_paired_jsonl groups them.
+        let assistant = mk(
+            "/Users/x/长沙方言/发音人/长沙方言-0413-文案演绎-发音人-话题1.wav",
+            "assistant",
+        );
+        let user = mk(
+            "/Users/x/长沙方言/陪聊/长沙方言-0413-文案演绎-陪聊-话题1.wav",
+            "user",
+        );
+        assert_eq!(pair_key(&assistant), "长沙方言-0413-文案演绎-话题1");
+        assert_eq!(pair_key(&user), pair_key(&assistant));
+
+        // Different topic still distinct.
+        let assistant_t2 = mk(
+            "/Users/x/长沙方言/发音人/长沙方言-0413-文案演绎-发音人-话题2.wav",
+            "assistant",
+        );
+        assert_ne!(pair_key(&assistant), pair_key(&assistant_t2));
     }
 
     #[test]
@@ -3357,10 +3716,12 @@ mod tests {
         };
         let assistant = SegmentRecord {
             id: "a".into(),
-            source_path: "/audio/free_001_01_01_发音人.wav".into(),
-            source_file_name: "free_001_01_01_发音人.wav".into(),
-            segment_path: "/segments/a_01.wav".into(),
-            segment_file_name: "a_01.wav".into(),
+            // Source is the un-cut `_发音人.wav` for this turn — sub-index
+            // (`_01`) lives only in segment_file_name.
+            source_path: "/audio/free_001_01_发音人.wav".into(),
+            source_file_name: "free_001_01_发音人.wav".into(),
+            segment_path: "/segments/free_001_01_01_发音人.wav".into(),
+            segment_file_name: "free_001_01_01_发音人.wav".into(),
             role: Some("assistant".into()),
             start_ms: 0,
             end_ms: 1500,
@@ -3387,6 +3748,113 @@ mod tests {
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[2]["role"], "assistant");
         assert!(messages[2]["content"].is_array());
+        // Single assistant sub-segment → audio_file collapses to a string
+        // and `emotion` is a single string (matching demo's pattern for
+        // length-1 turns).
+        assert!(messages[2]["audio_file"].is_string());
+        assert_eq!(messages[2]["emotion"], "中立");
+    }
+
+    /// Regression: paths under `/Users/<name>/` (every macOS project)
+    /// must NOT all collapse to role=`user`. The old `infer_role` did a
+    /// substring match on the lowercased full path; `users` contains
+    /// `user`, so it false-positively classified `..._发音人.wav` files
+    /// as `user`. The fix: only check the file name + parent dir name,
+    /// and use delimiter-bounded matching for ASCII keywords.
+    #[test]
+    fn infer_role_ignores_macos_users_in_path() {
+        let p = Path::new(
+            "/Users/sunpeak/Work/dialect/长沙方言/发音人/长沙方言-话题1.wav",
+        );
+        assert_eq!(infer_role(p).as_deref(), Some("assistant"));
+
+        let p = Path::new(
+            "/Users/sunpeak/Work/dialect/长沙方言/陪聊/长沙方言-话题1.wav",
+        );
+        assert_eq!(infer_role(p).as_deref(), Some("user"));
+
+        // Filename token wins when the parent dir doesn't have a role hint.
+        let p = Path::new("/Users/x/free_001_02_发音人.wav");
+        assert_eq!(infer_role(p).as_deref(), Some("assistant"));
+        let p = Path::new("/Users/x/free_001_02_陪聊.wav");
+        assert_eq!(infer_role(p).as_deref(), Some("user"));
+
+        // ASCII boundary check: `xuser.wav` is NOT `user`, but `_user.wav` is.
+        let p = Path::new("/tmp/xuser.wav");
+        assert_eq!(infer_role(p), None);
+        let p = Path::new("/tmp/recording_user.wav");
+        assert_eq!(infer_role(p).as_deref(), Some("user"));
+    }
+
+    /// Multi-segment assistant: when the cutter splits one `_发音人.wav`
+    /// source into N sub-segments, they should land in the SAME jsonl line
+    /// — not N separate lines, each duplicating the user audio. content,
+    /// audio_file, and emotion all become parallel arrays of length N.
+    #[test]
+    fn export_paired_groups_multi_assistant_into_one_line() {
+        let user = SegmentRecord {
+            id: "u".into(),
+            source_path: "/audio/free_001_02_陪聊.wav".into(),
+            source_file_name: "free_001_02_陪聊.wav".into(),
+            segment_path: "/segments/u_01.wav".into(),
+            segment_file_name: "u_01.wav".into(),
+            role: Some("user".into()),
+            start_ms: 0,
+            end_ms: 1000,
+            duration_ms: 1000,
+            original_text: "问题".into(),
+            phonetic_text: "问题".into(),
+            emotion: vec![],
+            tags: vec![],
+            notes: String::new(),
+        };
+        let make_assistant = |idx: u64, text: &str, emotion: &str| SegmentRecord {
+            id: format!("a{}", idx),
+            source_path: "/audio/free_001_02_发音人.wav".into(),
+            source_file_name: "free_001_02_发音人.wav".into(),
+            segment_path: format!("/segments/free_001_02_{:02}_发音人.wav", idx),
+            segment_file_name: format!("free_001_02_{:02}_发音人.wav", idx),
+            role: Some("assistant".into()),
+            start_ms: idx * 1000,
+            end_ms: idx * 1000 + 800,
+            duration_ms: 800,
+            original_text: String::new(),
+            phonetic_text: text.into(),
+            emotion: vec![emotion.into()],
+            tags: vec![],
+            notes: String::new(),
+        };
+        let segments = vec![
+            user,
+            make_assistant(2, "句二", "开心"),
+            make_assistant(1, "句一", "中立"),
+            make_assistant(3, "句三", "中立"),
+        ];
+
+        let lines = build_paired_jsonl(&segments, "system话", true, "", "")
+            .expect("paired");
+        assert_eq!(lines.len(), 1, "all four segments fold into one line");
+
+        let value: Value = serde_json::from_str(&lines[0]).expect("valid json");
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3); // system + user + assistant
+
+        let assistant_msg = &messages[2];
+        let content = assistant_msg["content"].as_array().unwrap();
+        // Sorted by start_ms — sub-segments emerge in temporal order.
+        assert_eq!(content[0], "句一");
+        assert_eq!(content[1], "句二");
+        assert_eq!(content[2], "句三");
+
+        let audio = assistant_msg["audio_file"].as_array().unwrap();
+        assert_eq!(audio.len(), 3, "audio_file is a parallel array of size 3");
+        assert!(audio[0]
+            .as_str()
+            .unwrap()
+            .ends_with("free_001_02_01_发音人.wav"));
+
+        let emotions = assistant_msg["emotion"].as_array().unwrap();
+        assert_eq!(emotions, &vec![json!("中立"), json!("开心"), json!("中立")]);
     }
 
     #[test]
