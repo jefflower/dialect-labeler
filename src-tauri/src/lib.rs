@@ -1480,9 +1480,9 @@ fn build_flat_jsonl(
         if !segment.emotion.is_empty() {
             message["emotion"] = json!(segment.emotion);
         }
-        if !segment.tags.is_empty() {
-            message["tags"] = json!(segment.tags);
-        }
+        // `tags` deliberately omitted — paralinguistic markers live
+        // inline in the text (e.g. `[breath]`, `<laugh>...</laugh>`),
+        // and the dataset spec doesn't carry a separate tags field.
         if !segment.notes.trim().is_empty() {
             message["notes"] = json!(segment.notes);
         }
@@ -1683,18 +1683,8 @@ fn build_paired_jsonl(
                 Value::Array(emotions)
             };
         }
-        // Tag arrays mirror content too (one per sub-segment).
-        if assistant_segs.iter().any(|s| !s.tags.is_empty()) {
-            let tags_per_seg: Vec<Value> = assistant_segs
-                .iter()
-                .map(|s| Value::Array(s.tags.iter().cloned().map(Value::String).collect()))
-                .collect();
-            a_msg["tags"] = if single {
-                tags_per_seg[0].clone()
-            } else {
-                Value::Array(tags_per_seg)
-            };
-        }
+        // No `tags` field — paralinguistic events are carried inline in
+        // the content text (e.g. `[breath]`, `<laugh>...</laugh>`).
         // Annotator notes: keep only if any sub-segment carries one.
         let notes_joined = assistant_segs
             .iter()
@@ -1755,9 +1745,7 @@ fn build_single_message_line(
     if !segment.emotion.is_empty() {
         msg["emotion"] = json!(segment.emotion);
     }
-    if !segment.tags.is_empty() {
-        msg["tags"] = json!(segment.tags);
-    }
+    // `tags` deliberately omitted — see build_paired_jsonl.
     if !segment.notes.trim().is_empty() {
         msg["notes"] = json!(segment.notes);
     }
