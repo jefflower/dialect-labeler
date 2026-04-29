@@ -712,8 +712,14 @@ function App() {
             .filter(([, r]) => normalizeRecognizedText(r.text)),
         );
         recognizedCount += resultMap.size;
-        setSegments((current) =>
-          current.map((segment) => {
+
+        // Update React state AND capture the merged snapshot so we can
+        // persist it to disk on the same tick. Without this checkpoint a
+        // crash / hot-reload mid-recognition loses every batch processed
+        // since the last manual save (auto-save is suppressed by busy).
+        let snapshot: SegmentRecord[] = [];
+        setSegments((current) => {
+          const updated = current.map((segment) => {
             const result = resultMap.get(segment.id);
             if (!result) return segment;
             const text = normalizeRecognizedText(result.text);
@@ -729,8 +735,10 @@ function App() {
               next.tags = result.tags;
             }
             return next;
-          }),
-        );
+          });
+          snapshot = updated;
+          return updated;
+        });
         completed += batch.length;
         setProgress({
           visible: true,
@@ -739,6 +747,10 @@ function App() {
           current: completed,
           total: targetSegments.length,
         });
+        // Fire-and-forget but await briefly so a fast loop doesn't pile up
+        // pending writes; with project.json typically < 500KB this is well
+        // under 50ms on local SSD.
+        await saveProjectSnapshot(snapshot);
         await waitForPaint();
       }
       return recognizedCount;
@@ -958,6 +970,35 @@ function App() {
     } finally {
       setProgress((current) => ({ ...current, visible: false }));
       setBusy(false);
+    }
+  }
+
+  /**
+   * Best-effort persistence used as a fast checkpoint between recognition
+   * batches. Does NOT toggle busy and never throws — if disk is full or the
+   * file is locked, we just swallow it and let the next checkpoint try
+   * again. Pass the snapshot explicitly so we can save state computed
+   * inside a setSegments updater.
+   */
+  async function saveProjectSnapshot(snapshotSegments: SegmentRecord[]) {
+    if (!scan) return;
+    const payload: ProjectFile = {
+      version: 2,
+      savedAt: new Date().toISOString(),
+      rootPath: scan.rootPath,
+      projectDir: scan.projectDir,
+      segmentsDir: scan.segmentsDir,
+      config,
+      audioFiles: scan.audioFiles,
+      manifestRecords: scan.manifestRecords,
+      segments: snapshotSegments,
+      systemPrompt: settings.systemPrompt,
+    };
+    try {
+      await ipc.saveProjectFile({ projectDir: scan.projectDir, payload });
+    } catch {
+      // Swallow — auto-save will retry once busy clears, and the next
+      // recognition batch will overwrite this snapshot anyway.
     }
   }
 
