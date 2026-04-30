@@ -37,11 +37,14 @@ type AnnotationViewProps = {
   inlineTags: InlineTagDef[];
   segmentTags: SegmentTagDef[];
   emotions: string[];
+  /** Current playback rate multiplier (1.0 = normal). */
+  playbackSpeed: number;
   onSelectionChange: (range: SelectionRange | null) => void;
   onApplyInlineTag: (tag: string, kind?: "paired" | "bracket") => boolean;
   onClose: () => void;
   onTogglePlay: () => void;
   onSeekRatio: (ratio: number) => void;
+  onPlaybackSpeedChange: (speed: number) => void;
   onUpdate: (patch: Partial<SegmentRecord>) => void;
   onRecognizeOne: () => void;
   onPolishOnly: () => void;
@@ -65,11 +68,13 @@ export function AnnotationView({
   inlineTags,
   segmentTags,
   emotions,
+  playbackSpeed,
   onSelectionChange,
   onApplyInlineTag,
   onClose,
   onTogglePlay,
   onSeekRatio,
+  onPlaybackSpeedChange,
   onUpdate,
   onRecognizeOne,
   onPolishOnly,
@@ -211,6 +216,21 @@ export function AnnotationView({
             <span>
               点字跳转 · 拖选后 L 笑着说 / S 重读 · 任何时候 G 笑声 / B 呼吸 / C 咳嗽 / X 叹气 · 1-7 情绪
             </span>
+          </div>
+          <div className="playback-speed-group" role="group" aria-label="播放倍速">
+            {[1, 1.25, 1.5].map((speed) => (
+              <button
+                key={speed}
+                type="button"
+                className={`speed-chip ${
+                  Math.abs(playbackSpeed - speed) < 0.01 ? "active" : ""
+                }`}
+                onClick={() => onPlaybackSpeedChange(speed)}
+                title={`播放速度 ${speed}×`}
+              >
+                {speed}×
+              </button>
+            ))}
           </div>
           <span className="player-bar-time">
             {formatClock(currentMs)} / {formatClock(durationMs)}

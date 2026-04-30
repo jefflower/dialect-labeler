@@ -252,7 +252,6 @@ impl AudioPlayerState {
     }
 }
 
-#[derive(Default)]
 struct AudioPlayerInner {
     stream: Option<OutputStream>,
     handle: Option<OutputStreamHandle>,
@@ -262,6 +261,28 @@ struct AudioPlayerInner {
     offset_ms: u64,
     started_at: Option<Instant>,
     is_playing: bool,
+    /// Playback rate multiplier — 1.0 = normal, 1.25/1.5 are common
+    /// review-fast modes, 0.75 etc. would be slow-mo. Applied to the
+    /// rodio sink and used when extrapolating wall-clock elapsed time
+    /// into audio-track elapsed ms (the source advances `speed` ms of
+    /// audio per 1 ms of wall clock).
+    playback_speed: f32,
+}
+
+impl Default for AudioPlayerInner {
+    fn default() -> Self {
+        Self {
+            stream: None,
+            handle: None,
+            sink: None,
+            path: None,
+            duration_ms: 0,
+            offset_ms: 0,
+            started_at: None,
+            is_playing: false,
+            playback_speed: 1.0,
+        }
+    }
 }
 
 enum AudioCommand {
@@ -277,6 +298,10 @@ enum AudioCommand {
         reply: mpsc::Sender<Result<PlaybackState, String>>,
     },
     State {
+        reply: mpsc::Sender<Result<PlaybackState, String>>,
+    },
+    SetSpeed {
+        speed: f32,
         reply: mpsc::Sender<Result<PlaybackState, String>>,
     },
 }
@@ -563,6 +588,21 @@ fn audio_state(state: tauri::State<'_, AudioPlayerState>) -> Result<PlaybackStat
     send_audio_command(&state, |reply| AudioCommand::State { reply })
 }
 
+#[tauri::command]
+fn set_playback_speed(
+    state: tauri::State<'_, AudioPlayerState>,
+    speed: f32,
+) -> Result<PlaybackState, String> {
+    // Sanitize on the Rust side too — frontend should already clamp,
+    // but a stray NaN would lock the audio thread.
+    let speed = if speed.is_finite() {
+        speed.clamp(0.25, 4.0)
+    } else {
+        1.0
+    };
+    send_audio_command(&state, |reply| AudioCommand::SetSpeed { speed, reply })
+}
+
 fn send_audio_command(
     state: &tauri::State<'_, AudioPlayerState>,
     build: impl FnOnce(mpsc::Sender<Result<PlaybackState, String>>) -> AudioCommand,
@@ -601,6 +641,26 @@ fn audio_worker(receiver: mpsc::Receiver<AudioCommand>) {
                 let result = Ok(snapshot_player(&mut inner));
                 let _ = reply.send(result);
             }
+            AudioCommand::SetSpeed { speed, reply } => {
+                // Apply to the live sink AND remember it so the next
+                // play() call also uses it. Re-anchor the wall-clock
+                // baseline so position math stays consistent: capture
+                // the current track position under the OLD speed,
+                // store it in `offset_ms`, then start a fresh epoch
+                // under the NEW speed.
+                let pos = current_player_position_ms(&inner);
+                inner.offset_ms = pos;
+                inner.started_at = if inner.is_playing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                inner.playback_speed = speed;
+                if let Some(sink) = inner.sink.as_ref() {
+                    sink.set_speed(speed);
+                }
+                let _ = reply.send(Ok(snapshot_player(&mut inner)));
+            }
         }
     }
 }
@@ -637,6 +697,8 @@ fn play_audio_inner(
         .ok_or_else(|| "音频输出设备未初始化".to_string())?;
     let sink = Sink::try_new(handle).map_err(|err| err.to_string())?;
     sink.append(source);
+    // Honor any previously-set playback speed (1.0 by default).
+    sink.set_speed(inner.playback_speed);
     sink.play();
 
     inner.sink = Some(sink);
@@ -703,7 +765,13 @@ fn current_player_position_ms(inner: &AudioPlayerInner) -> u64 {
     let mut position = inner.offset_ms;
     if inner.is_playing {
         if let Some(started_at) = inner.started_at {
-            position = position.saturating_add(started_at.elapsed().as_millis() as u64);
+            // Track-time elapsed = wall-time elapsed × speed.
+            // (At 1.5×, 1 second of wall clock advances 1.5 seconds of
+            // audio.) Use f64 for the multiply so we don't lose ms
+            // precision on long clips.
+            let wall_ms = started_at.elapsed().as_millis() as f64;
+            let track_ms = (wall_ms * inner.playback_speed as f64) as u64;
+            position = position.saturating_add(track_ms);
         }
     }
     if inner.duration_ms > 0 {
@@ -900,7 +968,13 @@ fn cut_audio_file_impl(
     let source_stem = path_file_stem(&input);
     let safe_source = safe_name(&source_stem);
     let (base_stem, role_suffix) = split_role_suffix(&source_stem);
-    let safe_base = safe_name(&base_stem);
+    // Three-number naming per spec: 话题号_话轮号_音频序号.
+    //   - When the source already encodes a turn (`...0001_01_发音人`),
+    //     extract_turn_from_base pulls out `01` and we use it.
+    //   - When the source has only a topic (`...-话题1`), treat the
+    //     whole file as a single turn → turn = 1.
+    let (true_base_stem, turn_number) = extract_turn_from_base(&base_stem);
+    let safe_base = safe_name(&true_base_stem);
     let source_dir = segments_root.join(&safe_source);
     fs::create_dir_all(&source_dir).map_err(|err| err.to_string())?;
 
@@ -908,15 +982,30 @@ fn cut_audio_file_impl(
     let mut segments = Vec::new();
     let text = original_text.clone().unwrap_or_default();
     let text_chunks = split_text_by_ranges(&text, &ranges);
+    // Spec quirk: a turn that splits into a single segment uses ONLY two
+    // numbers (`<base>_<turn>_<role>.wav`); a turn that splits into ≥2
+    // segments uses three (`<base>_<turn>_<sub>_<role>.wav`). The cutter
+    // knows the count up front from `ranges.len()`.
+    let total_segs = ranges.len();
 
     for (index, (start_sec, end_sec)) in ranges.iter().enumerate() {
         let start_ms = seconds_to_ms(*start_sec);
         let end_ms = seconds_to_ms(*end_sec);
-        // Demo convention: insert 2-digit segment number BEFORE role suffix.
-        // E.g. `自由演绎_0001_02_发音人.wav` → `自由演绎_0001_02_01_发音人.wav`.
-        // For files without a role suffix, append a 4-digit sequence number.
         let segment_file_name = match &role_suffix {
-            Some(suffix) => format!("{}_{:02}_{}.wav", safe_base, index + 1, suffix),
+            Some(suffix) if total_segs == 1 => {
+                // Single-segment turn → no sub-index, two numbers only.
+                format!("{}_{:02}_{}.wav", safe_base, turn_number, suffix)
+            }
+            Some(suffix) => {
+                // Multi-segment turn → three numbers per spec.
+                format!(
+                    "{}_{:02}_{:02}_{}.wav",
+                    safe_base,
+                    turn_number,
+                    index + 1,
+                    suffix
+                )
+            }
             None => format!("{}_{:04}.wav", safe_source, index + 1),
         };
         let output = source_dir.join(&segment_file_name);
@@ -1112,6 +1201,114 @@ fn absolutize_payload(mut value: Value, project_dir: &Path) -> Value {
 /// (e.g. re-cutting an audio whose segments were already annotated) can be
 /// rolled back manually. Returns the backup path. Silently no-ops if
 /// project.json doesn't exist yet.
+/// One-shot migration: rename segment WAV files on disk so they match
+/// the demo `<base>_<NN>_<role>.wav` layout, then return updated
+/// `SegmentRecord`s with new `segment_path` / `segment_file_name`. The
+/// frontend persists the result via `save_project_file`.
+///
+/// **Why a separate command?** Older builds wrote segments as
+/// `<source>_<NNNN>.wav` (no role suffix) when the source filename had
+/// the role token in the middle (`长沙方言-...-发音人-话题1`). The new
+/// `split_role_suffix` recognizes those, but already-cut projects still
+/// have the old names. Re-cutting throws away ASR + polish state, so
+/// we rename in place instead.
+///
+/// Behavior:
+///   - Groups segments by source, sorts each group by `start_ms`, and
+///     assigns 1-based sub-indices in temporal order.
+///   - For sources whose stem contains a role token (anywhere), the
+///     new name is `<base>_<NN>_<role>.wav`.
+///   - For sources without a role token, names stay as the legacy
+///     `<source>_<NNNN>.wav` format — nothing to migrate.
+///   - If the new name equals the existing one, the segment is skipped
+///     (no rename, no record change).
+///   - If a target name already exists on disk we fail with an error
+///     message containing the conflicting path — never silently
+///     overwrite a user's data.
+#[tauri::command]
+fn migrate_segment_filenames(
+    project_dir: String,
+    segments: Vec<SegmentRecord>,
+) -> Result<Vec<SegmentRecord>, String> {
+    let _ = project_dir; // not used directly — segment.segment_path is absolute
+    // Group segments by source_path; preserve original order for output.
+    let mut by_source: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, seg) in segments.iter().enumerate() {
+        by_source.entry(seg.source_path.clone()).or_default().push(idx);
+    }
+    // Within each source, sort by start_ms — the sub-index then matches
+    // temporal order, just like cut_audio_file_impl produced originally.
+    for indices in by_source.values_mut() {
+        indices.sort_by_key(|&i| segments[i].start_ms);
+    }
+
+    let mut updated = segments.clone();
+    let mut renamed = 0usize;
+    for indices in by_source.values() {
+        if let Some(&first) = indices.first() {
+            let source_stem = path_file_stem(Path::new(&segments[first].source_path));
+            let (base_stem, role_suffix) = split_role_suffix(&source_stem);
+            // No role token in the source — nothing to migrate. Legacy
+            // `<source>_<NNNN>.wav` names stay as-is.
+            let Some(role) = role_suffix else { continue };
+            let (true_base_stem, turn_number) = extract_turn_from_base(&base_stem);
+            let safe_base = safe_name(&true_base_stem);
+            let total = indices.len();
+
+            for (sub, &idx) in indices.iter().enumerate() {
+                let seg = &segments[idx];
+                // Spec rule (matches cut_audio_file_impl):
+                //   1 segment per turn  → `<base>_<turn>_<role>.wav`
+                //   N segments per turn → `<base>_<turn>_<sub>_<role>.wav`
+                let new_name = if total == 1 {
+                    format!("{}_{:02}_{}.wav", safe_base, turn_number, role)
+                } else {
+                    format!(
+                        "{}_{:02}_{:02}_{}.wav",
+                        safe_base,
+                        turn_number,
+                        sub + 1,
+                        role
+                    )
+                };
+                if seg.segment_file_name == new_name {
+                    continue;
+                }
+                let old_path = PathBuf::from(&seg.segment_path);
+                let parent = old_path.parent().ok_or_else(|| {
+                    format!("无法定位段文件父目录：{}", seg.segment_path)
+                })?;
+                let new_path = parent.join(&new_name);
+                if new_path.exists() {
+                    return Err(format!(
+                        "迁移目标已存在，拒绝覆盖：{}（来源段：{}）",
+                        path_to_string(&new_path),
+                        seg.segment_file_name
+                    ));
+                }
+                if old_path.is_file() {
+                    fs::rename(&old_path, &new_path).map_err(|err| {
+                        format!(
+                            "重命名失败 {} → {}：{}",
+                            seg.segment_file_name, new_name, err
+                        )
+                    })?;
+                    renamed += 1;
+                }
+                let entry = &mut updated[idx];
+                entry.segment_path = path_to_string(&new_path);
+                entry.segment_file_name = new_name;
+            }
+        }
+    }
+    eprintln!(
+        "[migrate] renamed {} of {} segments to demo layout",
+        renamed,
+        segments.len()
+    );
+    Ok(updated)
+}
+
 #[tauri::command]
 fn backup_project_file(project_dir: String) -> Result<Option<String>, String> {
     let dir = PathBuf::from(project_dir);
@@ -1298,10 +1495,10 @@ fn export_dataset_bundle_impl(
     }?;
 
     let jsonl_path = bundle_canonical.join("export.jsonl");
-    // Pretty records separated by a blank line — matches the demo
-    // `自由演绎.jsonl` layout. Each record is still a self-contained JSON
-    // object, so loaders that split by blank line work out of the box.
-    fs::write(&jsonl_path, format!("{}\n", lines.join("\n\n")))
+    // Pretty records separated by a single newline (no blank line
+    // between records). Each record is still a self-contained JSON
+    // object — pretty over multiple lines, then `}\n{` between them.
+    fs::write(&jsonl_path, format!("{}\n", lines.join("\n")))
         .map_err(|err| err.to_string())?;
 
     // Also write project.json into the bundle so a downstream reviewer
@@ -1420,7 +1617,7 @@ fn export_segments_jsonl(
         build_flat_jsonl(&segments, &system_prompt, &prefix, &input_root)
     }?;
 
-    fs::write(&path, format!("{}\n", lines.join("\n\n"))).map_err(|err| err.to_string())?;
+    fs::write(&path, format!("{}\n", lines.join("\n"))).map_err(|err| err.to_string())?;
     Ok(path_to_string(&path))
 }
 
@@ -1843,16 +2040,74 @@ fn pair_key(segment: &SegmentRecord) -> String {
     }
 }
 
-/// Split a file stem into (base, optional role suffix). When the stem ends
-/// with a known role marker (`_发音人`, `_陪聊`, `_assistant`, `_user`),
-/// returns the base without that marker plus the marker as a string.
-/// Otherwise returns (stem, None).
+/// Detect whether the base stem already encodes a "话轮" (dialogue
+/// turn) number as a `_<NN>` suffix, and split it out.
+///
+/// The dataset spec requires every cut filename to carry three numbers:
+/// 话题号 `_` 话轮号 `_` 音频序号. Some sources (the demo
+/// `自由演绎_0001_01_发音人.wav`) already encode the turn (`_01`) inside
+/// the stem; others (`长沙方言-...-话题1.wav`) only encode the topic
+/// and treat the whole recording as a single turn.
+///
+/// Returns `(stem_without_turn, turn_number)`. When no `_<2 digits>`
+/// suffix is present, the original stem is returned with `turn = 1`
+/// (default — every recording is one turn).
+///
+/// ```text
+/// extract_turn_from_base("自由演绎_0001_01")
+///   → ("自由演绎_0001", 1)         // wait — turn is `01` here
+/// ```
+/// Actually the example above returns `("自由演绎_0001", 1)` on the
+/// `_01` match — `01` parses as 1. The cut filename will then encode
+/// the turn back as `_01_` regardless.
+fn extract_turn_from_base(base: &str) -> (String, u32) {
+    // Trailing `_<2 digits>` — the demo's turn marker.
+    let re = Regex::new(r"_(\d{2})$").expect("valid regex");
+    if let Some(caps) = re.captures(base) {
+        let turn: u32 = caps[1].parse().unwrap_or(1);
+        let whole = caps.get(0).unwrap();
+        let stripped = base[..whole.start()].to_string();
+        return (stripped, turn);
+    }
+    (base.to_string(), 1)
+}
+
+/// Extract `(base_without_role, role_token)` from a file stem.
+///
+/// Two layouts are supported (mirroring `pair_key`):
+///
+///   1. **Role at the end, `_` separator** — the demo convention:
+///      `自由演绎_0001_01_发音人` → `("自由演绎_0001_01", Some("发音人"))`
+///
+///   2. **Role in the middle, `-` separator** — the 长沙方言 dataset:
+///      `长沙方言-0413-文案演绎-发音人-话题1`
+///      → `("长沙方言-0413-文案演绎-话题1", Some("发音人"))`
+///
+/// When a role token is detected in the middle, the surrounding
+/// separators are collapsed into one (the right-hand one) so the base
+/// stays a coherent identifier. The cutter then appends the demo-style
+/// `_<NN>_<role>.wav` suffix to that base — making cut sub-segments
+/// from `长沙方言-...-发音人-话题1.wav` come out as
+/// `长沙方言-...-话题1_01_发音人.wav`, which matches the demo layout
+/// and lets `pair_key` align user/assistant turns automatically.
 fn split_role_suffix(stem: &str) -> (String, Option<String>) {
-    for suffix in ["发音人", "陪聊", "assistant", "user"] {
-        let marker = format!("_{}", suffix);
-        if let Some(base) = stem.strip_suffix(&marker) {
-            return (base.to_string(), Some(suffix.to_string()));
-        }
+    // (left_sep) (role) (right_sep | end_of_string)
+    let re = Regex::new(r"([_\-])(发音人|assistant|陪聊|user)(?:([_\-])|$)")
+        .expect("valid regex");
+    if let Some(caps) = re.captures(stem) {
+        let role = caps.get(2).unwrap().as_str().to_string();
+        let whole = caps.get(0).unwrap();
+        let right_sep = caps.get(3).map(|s| s.as_str()).unwrap_or("");
+        // Reconstruct: <prefix><right_sep><suffix>. When the role was at
+        // the END (no right_sep), this just drops the role + left_sep.
+        // When the role was in the MIDDLE, we keep one separator so
+        // adjacent tokens don't fuse together.
+        let mut base = String::with_capacity(stem.len());
+        base.push_str(&stem[..whole.start()]);
+        base.push_str(right_sep);
+        base.push_str(&stem[whole.end()..]);
+        let trimmed = base.trim_end_matches(['_', '-']).to_string();
+        return (trimmed, Some(role));
     }
     (stem.to_string(), None)
 }
@@ -3559,6 +3814,7 @@ mod tests {
 
     #[test]
     fn split_role_suffix_recognizes_known_markers() {
+        // End position, `_` separator (demo convention).
         assert_eq!(
             split_role_suffix("自由演绎_0001_02_发音人"),
             ("自由演绎_0001_02".to_string(), Some("发音人".to_string())),
@@ -3567,9 +3823,72 @@ mod tests {
             split_role_suffix("自由演绎_0001_02_陪聊"),
             ("自由演绎_0001_02".to_string(), Some("陪聊".to_string())),
         );
+
+        // Middle position, `-` separator (长沙方言 dataset). Surrounding
+        // dashes collapse to one so the base remains a clean identifier.
+        assert_eq!(
+            split_role_suffix("长沙方言-0413-文案演绎-发音人-话题1"),
+            (
+                "长沙方言-0413-文案演绎-话题1".to_string(),
+                Some("发音人".to_string()),
+            ),
+        );
+        assert_eq!(
+            split_role_suffix("长沙方言-0413-文案演绎-陪聊-话题2"),
+            (
+                "长沙方言-0413-文案演绎-话题2".to_string(),
+                Some("陪聊".to_string()),
+            ),
+        );
+
+        // English variants in the middle work too.
+        assert_eq!(
+            split_role_suffix("session_user_part2"),
+            ("session_part2".to_string(), Some("user".to_string())),
+        );
+
+        // No role marker → unchanged.
         assert_eq!(
             split_role_suffix("random_audio"),
             ("random_audio".to_string(), None),
+        );
+    }
+
+    /// extract_turn_from_base implements the spec's "second number = 话轮"
+    /// rule. When the source filename already encodes a 2-digit turn
+    /// (demo `自由演绎_0001_01_发音人.wav`), pull it out. When it doesn't
+    /// (`长沙方言-...-话题1.wav`), default to turn = 1 — the whole
+    /// recording is one turn.
+    #[test]
+    fn extract_turn_from_base_recognizes_demo_turn_marker() {
+        // Demo: stem after split_role_suffix is `自由演绎_0001_01`.
+        // The `_01` is the turn marker — strip it.
+        assert_eq!(
+            extract_turn_from_base("自由演绎_0001_01"),
+            ("自由演绎_0001".to_string(), 1),
+        );
+        assert_eq!(
+            extract_turn_from_base("自由演绎_0001_07"),
+            ("自由演绎_0001".to_string(), 7),
+        );
+
+        // 长沙方言 dataset: no turn marker, default to 1.
+        assert_eq!(
+            extract_turn_from_base("长沙方言-0413-文案演绎-话题1"),
+            ("长沙方言-0413-文案演绎-话题1".to_string(), 1),
+        );
+
+        // Topic numbers like `话题15` should NOT be confused with a turn
+        // marker — they're not a `_<2 digits>` suffix.
+        assert_eq!(
+            extract_turn_from_base("长沙方言-话题15"),
+            ("长沙方言-话题15".to_string(), 1),
+        );
+
+        // Single-digit suffixes don't match (must be exactly 2 digits).
+        assert_eq!(
+            extract_turn_from_base("foo_5"),
+            ("foo_5".to_string(), 1),
         );
     }
 
@@ -4001,6 +4320,7 @@ pub fn run() {
             pause_audio,
             stop_audio,
             audio_state,
+            set_playback_speed,
             scan_project_folder,
             cut_audio_file,
             recognize_segments,
@@ -4011,6 +4331,7 @@ pub fn run() {
             get_default_llm_prompt,
             save_project_file,
             backup_project_file,
+            migrate_segment_filenames,
             load_project_file,
             export_segments_jsonl,
             export_dataset_bundle

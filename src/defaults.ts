@@ -8,10 +8,13 @@ import type {
 
 export const defaultCutConfig: CutConfig = {
   silenceDb: -35,
-  minSilenceMs: 450,
+  // Spec: 句间静音段最长不超过 0.4s — anything longer is a cut point.
+  minSilenceMs: 400,
   minSegmentMs: 300,
+  // Spec: 句首静音不超过 100ms（preRoll), 句尾静音不超过 200ms（postRoll).
   preRollMs: 100,
   postRollMs: 200,
+  // Spec: 单段最长不超过 30s — hard cap when no silence is detected.
   maxSegmentMs: 30_000,
 };
 
@@ -25,7 +28,7 @@ export const defaultCutPresets: CutPresetDef[] = [
   {
     name: "闲聊（标准）",
     builtin: true,
-    hint: "对话场景默认；中等静音阈值 + 0.45s 停顿",
+    hint: "对话场景默认；按规范 0.4s 停顿切分",
     config: defaultCutConfig,
   },
   {

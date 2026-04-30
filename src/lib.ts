@@ -84,11 +84,25 @@ export const ipc = {
   audioState() {
     return invoke<PlaybackState>("audio_state");
   },
+  /** Change the playback rate. 1.0 = normal; common review-fast modes
+   *  are 1.25 / 1.5. Backend clamps to [0.25, 4.0]. */
+  setPlaybackSpeed(args: { speed: number }) {
+    return invoke<PlaybackState>("set_playback_speed", args);
+  },
   saveProjectFile(args: { projectDir: string; payload: ProjectFile }) {
     return invoke<string>("save_project_file", args);
   },
   backupProjectFile(args: { projectDir: string }) {
     return invoke<string | null>("backup_project_file", args);
+  },
+  /** Migrate already-cut segment WAVs to the demo `<base>_<NN>_<role>.wav`
+   *  naming. Renames files on disk + returns updated SegmentRecords with
+   *  new segmentPath/segmentFileName. Caller persists the result. */
+  migrateSegmentFilenames(args: {
+    projectDir: string;
+    segments: SegmentRecord[];
+  }) {
+    return invoke<SegmentRecord[]>("migrate_segment_filenames", args);
   },
   loadProjectFile(args: { projectDir: string }) {
     return invoke<ProjectFile>("load_project_file", args);
@@ -122,6 +136,22 @@ export function formatClock(value?: number): string {
 export function formatDuration(value?: number): string {
   if (!value) return "—";
   return formatClock(value);
+}
+
+/** Format a millisecond duration in `HH:MM:SS` (or `MM:SS` for clips
+ *  under an hour). Used for total/aggregate timings where minutes
+ *  alone aren't enough resolution. */
+export function formatLongDuration(value?: number): string {
+  if (!value || value <= 0) return "0:00";
+  const totalSeconds = Math.floor(value / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  if (hours > 0) {
+    return `${hours}:${pad(minutes)}:${pad(seconds)}`;
+  }
+  return `${minutes}:${pad(seconds)}`;
 }
 
 export function formatMsRange(start: number, end: number): string {

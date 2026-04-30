@@ -33,6 +33,9 @@ type SettingsDrawerProps = {
   onChange: (patch: Partial<AppSettings>) => void;
   onResetPrompt: () => void;
   onPurgeOrphanTags?: () => void;
+  /** Optional: rename existing segment WAVs to the demo
+   *  `<base>_<NN>_<role>.wav` layout. */
+  onMigrateSegmentFilenames?: () => void;
   onClose: () => void;
 };
 
@@ -159,6 +162,7 @@ export function SettingsDrawer({
   onChange,
   onResetPrompt,
   onPurgeOrphanTags,
+  onMigrateSegmentFilenames,
   onClose,
 }: SettingsDrawerProps) {
   const [models, setModels] = useState<string[]>([]);
@@ -731,6 +735,27 @@ export function SettingsDrawer({
                   <Trash2 size={14} />
                   清理废弃 inline 标签
                 </button>
+                {onMigrateSegmentFilenames && (
+                  <>
+                    <p
+                      className="section-hint"
+                      style={{ marginTop: 12 }}
+                    >
+                      把已切好的片段重命名为 demo 格式{" "}
+                      <code>&lt;base&gt;_&lt;NN&gt;_&lt;role&gt;.wav</code>
+                      ，便于跟标准数据集对齐。会同时更新磁盘文件名和{" "}
+                      <code>project.json</code>，已识别 / 已改写状态保留。
+                    </p>
+                    <button
+                      className="btn-ghost"
+                      onClick={onMigrateSegmentFilenames}
+                      style={{ alignSelf: "flex-start" }}
+                    >
+                      <Trash2 size={14} />
+                      迁移到 demo 命名
+                    </button>
+                  </>
+                )}
               </div>
             )}
           </section>

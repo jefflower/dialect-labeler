@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { listen } from "@tauri-apps/api/event";
 import { Folder, Inbox } from "lucide-react";
 import "./App.css";
@@ -78,6 +79,10 @@ function App() {
   const [playbackDurationMs, setPlaybackDurationMs] = useState(0);
   const [playbackCurrentMs, setPlaybackCurrentMs] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  // Reviewer-friendly fast modes: 1x default, 1.25x for catch-the-detail
+  // listens, 1.5x for skim. Persists across the session, applies to
+  // every play() call, and propagates live to the running sink.
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [busy, setBusy] = useState(false);
   const [dropping, setDropping] = useState(false);
 
@@ -1279,6 +1284,10 @@ function App() {
       });
       if (!exportJsonlPath.trim()) setExportJsonlPath(path);
       showSuccess("已导出", path);
+      // Auto-reveal in Finder/Explorer — saves the user the dance of
+      // copy-pasting the path into a file manager. Failures are silent
+      // (the toast already shows the path).
+      void revealItemInDir(path).catch(() => {});
     } catch (error) {
       showError("导出失败", error);
     } finally {
@@ -1331,6 +1340,10 @@ function App() {
         title: "JSONL 已生成",
         detail: result.jsonlPath,
       });
+      // Same auto-reveal — the bundle directory is the more useful
+      // target here, but revealing the JSONL inside it shows both at
+      // once on most file managers.
+      void revealItemInDir(result.jsonlPath).catch(() => {});
     } catch (error) {
       showError("打包失败", error);
     } finally {
@@ -1430,6 +1443,50 @@ function App() {
     setSegments(cleaned);
     void saveProjectSnapshot(cleaned);
     showSuccess("已清理废弃标签", `去除 ${totalRemoved} 处 · ${orphanList}`);
+  }
+
+  /**
+   * Migrate already-cut segment WAVs to the demo
+   * `<base>_<NN>_<role>.wav` naming convention. Renames files on disk +
+   * updates segmentPath/segmentFileName in project.json. Existing ASR
+   * cache and emotion/tags state are preserved (only file names change).
+   */
+  async function migrateSegmentFilenames() {
+    if (!scan || segments.length === 0) {
+      pushToast({ variant: "warning", title: "没有可迁移的片段" });
+      return;
+    }
+    if (
+      !window.confirm(
+        `将按 demo 命名规则重命名 ${segments.length} 个切割文件：\n\n` +
+          `<base>_<NN>_<role>.wav\n\n` +
+          `已识别 / 已改写状态保留。继续？`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    try {
+      const updated = await ipc.migrateSegmentFilenames({
+        projectDir: scan.projectDir,
+        segments,
+      });
+      setSegments(updated);
+      await saveProjectSnapshot(updated);
+      const renamed = updated.filter(
+        (s, i) => s.segmentFileName !== segments[i].segmentFileName,
+      ).length;
+      showSuccess(
+        "命名迁移完成",
+        renamed === 0
+          ? "所有片段已经是 demo 格式，无需迁移"
+          : `${renamed}/${segments.length} 段已重命名`,
+      );
+    } catch (error) {
+      showError("命名迁移失败", error);
+    } finally {
+      setBusy(false);
+    }
   }
 
   /** Push a snapshot of `prev` to the per-segment undo stack. */
@@ -1636,6 +1693,16 @@ function App() {
     }
   }
 
+  function changePlaybackSpeed(speed: number) {
+    setPlaybackSpeed(speed);
+    // Apply to the live sink immediately. Backend will rebase its
+    // wall-clock baseline so position math stays correct mid-playback.
+    void ipc
+      .setPlaybackSpeed({ speed })
+      .then(applyPlaybackState)
+      .catch((error) => setPlaybackStatus(`变速失败：${String(error)}`));
+  }
+
   function seekToRatio(ratio: number) {
     if (!activeDurationMs) return;
     // Round at the source so playbackCurrentMs is always an integer —
@@ -1670,11 +1737,13 @@ function App() {
           inlineTags={inlineTags}
           segmentTags={tagOptions}
           emotions={emotionOptions}
+          playbackSpeed={playbackSpeed}
           onSelectionChange={setTimelineSelection}
           onApplyInlineTag={applyInlineTag}
           onClose={closeAnnotation}
           onTogglePlay={togglePlayback}
           onSeekRatio={seekToRatio}
+          onPlaybackSpeedChange={changePlaybackSpeed}
           onUpdate={(patch) => updateSegment(annotationSegment.id, patch)}
           onRecognizeOne={recognizeCurrentSegment}
           onPolishOnly={polishCurrentSegmentOnly}
@@ -1689,6 +1758,7 @@ function App() {
           onChange={updateSettings}
           onResetPrompt={resetLlmPrompt}
           onPurgeOrphanTags={purgeOrphanInlineTags}
+          onMigrateSegmentFilenames={migrateSegmentFilenames}
           onClose={() => setSettingsOpen(false)}
         />
         <ShortcutOverlay
@@ -1807,6 +1877,7 @@ function App() {
         onChange={updateSettings}
         onResetPrompt={resetLlmPrompt}
           onPurgeOrphanTags={purgeOrphanInlineTags}
+          onMigrateSegmentFilenames={migrateSegmentFilenames}
         onClose={() => setSettingsOpen(false)}
       />
       <ShortcutOverlay

@@ -15,7 +15,7 @@ import type {
   SegmentRecord,
 } from "../types";
 import { roleLabels } from "../defaults";
-import { formatClock, formatDuration, formatMsRange } from "../lib";
+import { formatClock, formatDuration, formatLongDuration, formatMsRange } from "../lib";
 import { Waveform } from "./Waveform";
 import { EmptyState } from "./EmptyState";
 
@@ -71,6 +71,24 @@ export function MainView(props: MainViewProps) {
     return { total, done, percent: total ? Math.round((done / total) * 100) : 0 };
   }, [props.visibleSegments]);
 
+  // Aggregate stats — shown in the pane header so the user knows the
+  // total recording length and how much has been segmented already.
+  // `audioTotalMs` includes every scanned audio file; `segmentTotalMs`
+  // sums the cut segments (which may differ from audioTotalMs because
+  // silence trimming drops some duration).
+  const audioTotalMs = useMemo(
+    () =>
+      props.scan?.audioFiles.reduce(
+        (acc, audio) => acc + (audio.durationMs ?? 0),
+        0,
+      ) ?? 0,
+    [props.scan?.audioFiles],
+  );
+  const segmentTotalMs = useMemo(
+    () => props.segments.reduce((acc, s) => acc + (s.durationMs ?? 0), 0),
+    [props.segments],
+  );
+
   // Two-stage progress per audio file:
   //   asrDone    — segments with non-empty phoneticText (Whisper landed)
   //   polishDone — segments with a non-empty emotion array (Ollama polished)
@@ -117,6 +135,17 @@ export function MainView(props: MainViewProps) {
             原音频
             <span className="badge-count">{props.scan.audioFiles.length}</span>
           </h2>
+          <span
+            className="pane-total"
+            title={`原始音频累计时长 ${formatLongDuration(audioTotalMs)} · 切割后累计 ${formatLongDuration(segmentTotalMs)}（${props.segments.length} 段）`}
+          >
+            ⏱ {formatLongDuration(audioTotalMs)}
+            {segmentTotalMs > 0 && (
+              <span className="pane-total-sub">
+                · 切割 {formatLongDuration(segmentTotalMs)} / {props.segments.length} 段
+              </span>
+            )}
+          </span>
         </div>
         <div className="pane-search">
           <div className="search-input">
@@ -221,6 +250,14 @@ export function MainView(props: MainViewProps) {
               {segmentStats.done}/{segmentStats.total}
             </span>
           </h2>
+          {segmentTotalMs > 0 && (
+            <span
+              className="pane-total"
+              title="当前所选音频里所有切割片段时长合计"
+            >
+              ⏱ {formatLongDuration(segmentTotalMs)}
+            </span>
+          )}
         </div>
         <div className="player-bar">
           <div className="player-bar-top">
