@@ -109,104 +109,110 @@ export function ConfigBand(props: ConfigBandProps) {
   return (
     <section className="card">
       <div className="config-row">
-        <details className="config-strategy" open>
-          <summary>
-            <span className="group-label" style={{ marginRight: 6 }}>
-              <Sliders size={12} style={{ verticalAlign: "-2px" }} /> 切割策略
+        <details className="config-strategy">
+          <summary className="config-strategy-trigger" title="展开切割策略参数">
+            <span className="config-strategy-trigger-main">
+              <Sliders size={14} />
+              <span>切割策略</span>
+              <span className="config-strategy-current">
+                {matchedPreset?.name ?? "自定义（未保存）"}
+              </span>
             </span>
-            <select
-              value={matchedPreset?.name ?? "__custom__"}
-              onChange={(event) => {
-                const name = event.target.value;
-                const found = props.presets.find((p) => p.name === name);
-                if (found) props.onConfigChange({ ...found.config });
-              }}
-              onClick={(event) => event.stopPropagation()}
-              style={{ minWidth: 180 }}
-              title="选择内置或保存的策略；改任何参数会变成 自定义"
-            >
-              {props.presets.map((p) => (
-                <option key={p.name} value={p.name}>
-                  {p.builtin ? "★ " : ""}{p.name}
-                </option>
-              ))}
-              {!matchedPreset && (
-                <option value="__custom__">⚙ 自定义（未保存）</option>
-              )}
-            </select>
-            <button
-              className="btn-ghost"
-              onClick={(event) => {
-                event.stopPropagation();
-                event.preventDefault();
-                const name = window.prompt("保存为预设，输入名字：", "我的预设");
-                if (!name) return;
-                const cleaned = name.trim();
-                if (!cleaned) return;
-                const without = props.presets.filter(
-                  (p) => p.name !== cleaned || p.builtin,
-                );
-                props.onPresetsChange([
-                  ...without,
-                  { name: cleaned, config: { ...props.config } },
-                ]);
-              }}
-              title="把当前参数另存为新预设"
-            >
-              <Save size={12} />
-              保存
-            </button>
-            {matchedPreset && !matchedPreset.builtin && (
+            <span className="config-strategy-chevron">
+              <ChevronDown size={14} className="config-strategy-icon-open" />
+              <ChevronRight size={14} className="config-strategy-icon-closed" />
+            </span>
+          </summary>
+          <div className="config-strategy-body">
+            <div className="config-strategy-toolbar">
+              <select
+                value={matchedPreset?.name ?? "__custom__"}
+                onChange={(event) => {
+                  const name = event.target.value;
+                  const found = props.presets.find((p) => p.name === name);
+                  if (found) props.onConfigChange({ ...found.config });
+                }}
+                title="选择内置或保存的策略；改任何参数会变成 自定义"
+              >
+                {props.presets.map((p) => (
+                  <option key={p.name} value={p.name}>
+                    {p.builtin ? "★ " : ""}{p.name}
+                  </option>
+                ))}
+                {!matchedPreset && (
+                  <option value="__custom__">⚙ 自定义（未保存）</option>
+                )}
+              </select>
               <button
                 className="btn-ghost"
                 onClick={(event) => {
                   event.stopPropagation();
                   event.preventDefault();
-                  if (!window.confirm(`删除预设「${matchedPreset.name}」？`)) return;
-                  props.onPresetsChange(
-                    props.presets.filter((p) => p.name !== matchedPreset.name),
+                  const name = window.prompt("保存为预设，输入名字：", "我的预设");
+                  if (!name) return;
+                  const cleaned = name.trim();
+                  if (!cleaned) return;
+                  const without = props.presets.filter(
+                    (p) => p.name !== cleaned || p.builtin,
                   );
+                  props.onPresetsChange([
+                    ...without,
+                    { name: cleaned, config: { ...props.config } },
+                  ]);
                 }}
-                title="删除当前选中的自定义预设"
+                title="把当前参数另存为新预设"
               >
-                <Trash2 size={12} />
+                <Save size={12} />
+                保存
               </button>
-            )}
-            <span style={{ marginLeft: 4 }}>
-              <ChevronDown size={12} className="config-strategy-icon-open" />
-              <ChevronRight size={12} className="config-strategy-icon-closed" />
-            </span>
-          </summary>
-          <div className="config-strategy-body">
-            {matchedPreset?.hint && (
-              <span className="help-tip" style={{ width: "100%" }}>
-                {matchedPreset.hint}
-              </span>
-            )}
-            {fields.map((field) => (
-              <label
-                key={field.key as string}
-                className="number-field"
-                title={field.hint}
-              >
-                <span>
-                  {field.label} <em style={{ opacity: 0.6 }}>{field.unit}</em>
+              {matchedPreset && !matchedPreset.builtin && (
+                <button
+                  className="btn-ghost"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    event.preventDefault();
+                    if (!window.confirm(`删除预设「${matchedPreset.name}」？`)) return;
+                    props.onPresetsChange(
+                      props.presets.filter((p) => p.name !== matchedPreset.name),
+                    );
+                  }}
+                  title="删除当前选中的自定义预设"
+                >
+                  <Trash2 size={12} />
+                </button>
+              )}
+              {matchedPreset?.hint && (
+                <span className="help-tip">
+                  {matchedPreset.hint}
                 </span>
-                <input
-                  type="number"
-                  min={field.min}
-                  max={field.max}
-                  step={field.step}
-                  value={props.config[field.key]}
-                  onChange={(event) =>
-                    props.onConfigChange({
-                      ...props.config,
-                      [field.key]: Number(event.target.value),
-                    })
-                  }
-                />
-              </label>
-            ))}
+              )}
+            </div>
+            <div className="config-fields">
+              {fields.map((field) => (
+                <label
+                  key={field.key as string}
+                  className="number-field"
+                  title={field.hint}
+                >
+                  <span>
+                    {field.label} <em style={{ opacity: 0.6 }}>{field.unit}</em>
+                  </span>
+                  <input
+                    type="number"
+                    min={field.min}
+                    max={field.max}
+                    step={field.step}
+                    value={props.config[field.key]}
+                    onChange={(event) =>
+                      props.onConfigChange({
+                        ...props.config,
+                        [field.key]: Number(event.target.value),
+                      })
+                    }
+                  />
+                </label>
+              ))}
+            </div>
           </div>
         </details>
 

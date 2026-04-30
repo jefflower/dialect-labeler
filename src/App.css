@@ -430,7 +430,12 @@ button:disabled {
 
 .setup-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  grid-template-columns:
+    minmax(260px, 1.1fr)
+    minmax(260px, 1.1fr)
+    minmax(240px, 0.9fr)
+    max-content
+    max-content;
   gap: var(--space-5);
   padding: var(--space-5);
   align-items: end;
@@ -449,39 +454,77 @@ button:disabled {
   font-weight: var(--weight-medium);
 }
 
+.setup-grid .checkbox-field {
+  flex-direction: row;
+  align-self: end;
+  min-height: 32px;
+}
+
 .config-row {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-3);
   padding: var(--space-4) var(--space-5);
-  align-items: end;
+  align-items: center;
 }
 
 .config-strategy {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  margin-right: var(--space-3);
+  flex: 0 0 auto;
+  min-width: 188px;
 }
 
 .config-strategy[open] {
   flex: 1 0 100%;
 }
 
-.config-strategy summary {
+.config-strategy-trigger {
   display: inline-flex;
   align-items: center;
+  justify-content: space-between;
   gap: var(--space-2);
   cursor: pointer;
   list-style: none;
   user-select: none;
   font-size: var(--text-sm);
-  color: var(--text-secondary);
-  padding: 4px 0;
+  color: var(--text-primary);
+  min-height: 32px;
+  padding: 6px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
 }
 
-.config-strategy summary::-webkit-details-marker {
+.config-strategy-trigger:hover {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+}
+
+.config-strategy-trigger::-webkit-details-marker {
   display: none;
+}
+
+.config-strategy-trigger-main {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.config-strategy-current {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+}
+
+.config-strategy-chevron {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-tertiary);
 }
 
 .config-strategy .config-strategy-icon-open { display: none; }
@@ -491,24 +534,38 @@ button:disabled {
 
 .config-strategy-body {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: var(--space-3);
   padding: var(--space-3);
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
+  align-items: stretch;
+}
+
+.config-strategy-toolbar,
+.config-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
   align-items: end;
 }
 
-.config-strategy-body .help-tip {
-  background: var(--surface);
-  margin: 0;
+.config-strategy-toolbar select {
+  flex: 0 1 260px;
+  min-width: 220px;
 }
 
-.config-strategy summary > select,
-.config-strategy summary > button {
-  height: 30px;
+.config-strategy-toolbar > select,
+.config-strategy-toolbar > button {
+  height: 32px;
   font-size: var(--text-sm);
+}
+
+.config-strategy-toolbar .help-tip {
+  flex: 1 1 280px;
+  background: var(--surface);
+  margin: 0;
 }
 
 .number-field em {
@@ -1977,6 +2034,11 @@ kbd {
   }
 
   .setup-grid {
-    grid-template-columns: minmax(200px, 1fr) minmax(200px, 1fr);
+    grid-template-columns:
+      minmax(180px, 1fr)
+      minmax(180px, 1fr)
+      minmax(180px, 0.8fr)
+      max-content
+      max-content;
   }
 }

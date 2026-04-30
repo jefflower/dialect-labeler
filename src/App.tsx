@@ -15,7 +15,7 @@ import { SettingsDrawer } from "./components/SettingsDrawer";
 import { ShortcutOverlay } from "./components/ShortcutOverlay";
 import { ToastStack } from "./components/ToastStack";
 import { defaultCutConfig } from "./defaults";
-import { REVIEW_ONLY } from "./env";
+import { HIDE_PROCESSING_UI } from "./env";
 import { ipc, normalizeRecognizedText, waitForPaint, clamp } from "./lib";
 import { isTyping, useSettings, useShortcutOverlay, useTheme, useToasts } from "./hooks";
 import type {
@@ -62,7 +62,7 @@ function App() {
   const [selectedAudioId, setSelectedAudioId] = useState("");
   const [selectedSegmentId, setSelectedSegmentId] = useState("");
   const [annotationSegmentId, setAnnotationSegmentId] = useState("");
-  const [autoCutAfterScan, setAutoCutAfterScan] = useState(!REVIEW_ONLY);
+  const [autoCutAfterScan, setAutoCutAfterScan] = useState(!HIDE_PROCESSING_UI);
   const [autoRecognizeAfterCut, setAutoRecognizeAfterCut] = useState(false);
   const [autoPlayOnReady, setAutoPlayOnReady] = useState(false);
   const [status, setStatus] = useState("请选择音频文件夹开始");
@@ -543,7 +543,7 @@ function App() {
       let cutCount = 0;
       let recognizedCount = 0;
 
-      if (!REVIEW_ONLY && autoCutAfterScan && audioToCut.length > 0) {
+      if (!HIDE_PROCESSING_UI && autoCutAfterScan && audioToCut.length > 0) {
         const newSegments = await cutAudioBatch(result, audioToCut);
         const merged = await normalizeDialogueSequenceNames([
           ...restoredSegments,
@@ -1839,7 +1839,7 @@ function App() {
             onAutoCutChange={setAutoCutAfterScan}
             onScan={scanFolder}
           />
-          {!REVIEW_ONLY && (
+          {!HIDE_PROCESSING_UI && (
             <ConfigBand
               config={config}
               onConfigChange={setConfig}

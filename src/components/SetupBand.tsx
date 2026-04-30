@@ -1,5 +1,5 @@
 import { FileJson, FolderOpen, ScanSearch } from "lucide-react";
-import { REVIEW_ONLY } from "../env";
+import { HIDE_PROCESSING_UI } from "../env";
 
 type SetupBandProps = {
   folderPath: string;
@@ -63,7 +63,7 @@ export function SetupBand(props: SetupBandProps) {
             </button>
           </div>
         </label>
-        {!REVIEW_ONLY && (
+        {!HIDE_PROCESSING_UI && (
           <label className="checkbox-field">
             <input
               type="checkbox"
