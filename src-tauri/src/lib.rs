@@ -57,6 +57,7 @@ struct AudioFileInfo {
     path: String,
     file_name: String,
     role: Option<String>,
+    topic_id: Option<u32>,
     target_file_names: Vec<String>,
     duration_ms: Option<u64>,
     sample_rate: Option<u32>,
@@ -829,8 +830,15 @@ fn scan_project_folder_impl(
         }
     }
 
+    let audio_paths = files
+        .iter()
+        .filter(|path| is_audio(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let source_topic_ids = infer_source_topic_ids(&audio_paths, &manifest_records);
+
     let mut audio_files = Vec::new();
-    for path in files.iter().filter(|path| is_audio(path)) {
+    for path in &audio_paths {
         let probe = probe_audio(path).ok();
         let file_name = path_file_name(path);
         let matched = match_manifest(path, &manifest_records);
@@ -838,8 +846,15 @@ fn scan_project_folder_impl(
             .as_ref()
             .map(|record| record.role.clone())
             .or_else(|| infer_role(path));
-        let related_records =
-            matching_manifest_records_for_source(path, role.as_deref(), &manifest_records);
+        let topic_id = source_topic_key(path)
+            .and_then(|key| source_topic_ids.get(&key).copied())
+            .or_else(|| last_number(&path_file_stem(path)));
+        let related_records = matching_manifest_records_for_source(
+            path,
+            role.as_deref(),
+            topic_id,
+            &manifest_records,
+        );
         let target_file_names = related_records
             .iter()
             .filter_map(|record| record.audio_file.as_deref())
@@ -859,6 +874,7 @@ fn scan_project_folder_impl(
             path: path_to_string(path),
             file_name,
             role,
+            topic_id,
             target_file_names,
             duration_ms: probe.as_ref().and_then(|info| info.duration_ms),
             sample_rate: probe.as_ref().and_then(|info| info.sample_rate),
@@ -936,6 +952,7 @@ async fn cut_audio_file(
     segments_dir: String,
     config: CutConfig,
     role: Option<String>,
+    topic_id: Option<u32>,
     original_text: Option<String>,
     emotion: Option<Vec<String>>,
     target_file_names: Option<Vec<String>>,
@@ -946,6 +963,7 @@ async fn cut_audio_file(
             segments_dir,
             config,
             role,
+            topic_id,
             original_text,
             emotion,
             target_file_names.unwrap_or_default(),
@@ -955,11 +973,137 @@ async fn cut_audio_file(
     .map_err(|err| err.to_string())?
 }
 
+#[tauri::command]
+fn rename_segments_by_dialogue_sequence(
+    segments: Vec<SegmentRecord>,
+) -> Result<Vec<SegmentRecord>, String> {
+    rename_segments_by_dialogue_sequence_impl(segments)
+}
+
+fn rename_segments_by_dialogue_sequence_impl(
+    segments: Vec<SegmentRecord>,
+) -> Result<Vec<SegmentRecord>, String> {
+    let planned_names = plan_dialogue_sequence_file_names(&segments);
+    if planned_names.is_empty() {
+        return Ok(segments);
+    }
+
+    let mut target_paths: HashMap<PathBuf, usize> = HashMap::new();
+    let old_paths = segments
+        .iter()
+        .map(|segment| PathBuf::from(&segment.segment_path))
+        .collect::<Vec<_>>();
+
+    for (index, target_name) in &planned_names {
+        let old_path = &old_paths[*index];
+        let Some(parent) = old_path.parent() else {
+            return Err(format!(
+                "无法定位段文件父目录：{}",
+                segments[*index].segment_path
+            ));
+        };
+        let target_path = parent.join(target_name);
+        if let Some(other_index) = target_paths.insert(target_path.clone(), *index) {
+            return Err(format!(
+                "命名冲突：{} 同时对应 {} 和 {}",
+                path_to_string(&target_path),
+                segments[other_index].segment_file_name,
+                segments[*index].segment_file_name
+            ));
+        }
+    }
+
+    let planned_indices = planned_names.keys().copied().collect::<HashSet<_>>();
+    for (target_path, index) in &target_paths {
+        let old_path = &old_paths[*index];
+        if target_path == old_path || !target_path.exists() {
+            continue;
+        }
+        let occupied_by_planned_move = old_paths
+            .iter()
+            .position(|path| path == target_path)
+            .is_some_and(|occupied_index| planned_indices.contains(&occupied_index));
+        if !occupied_by_planned_move {
+            return Err(format!(
+                "迁移目标已存在，拒绝覆盖：{}",
+                path_to_string(target_path)
+            ));
+        }
+    }
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    let mut temp_moves: Vec<(usize, PathBuf, PathBuf, PathBuf)> = Vec::new();
+
+    for (index, target_name) in &planned_names {
+        let old_path = &old_paths[*index];
+        let Some(parent) = old_path.parent() else {
+            return Err(format!(
+                "无法定位段文件父目录：{}",
+                segments[*index].segment_path
+            ));
+        };
+        let target_path = parent.join(target_name);
+        if &target_path == old_path {
+            continue;
+        }
+        if !old_path.is_file() {
+            return Err(format!("切割片段文件不存在：{}", path_to_string(old_path)));
+        }
+        let temp_path = parent.join(format!(".rename_{}_{}.tmp", stamp, index));
+        fs::rename(old_path, &temp_path).map_err(|err| {
+            format!(
+                "重命名临时文件失败 {} → {}：{}",
+                path_to_string(old_path),
+                path_to_string(&temp_path),
+                err
+            )
+        })?;
+        temp_moves.push((*index, temp_path, target_path, PathBuf::from(target_name)));
+    }
+
+    for (_, temp_path, target_path, _) in &temp_moves {
+        fs::rename(temp_path, target_path).map_err(|err| {
+            format!(
+                "重命名目标文件失败 {} → {}：{}",
+                path_to_string(temp_path),
+                path_to_string(target_path),
+                err
+            )
+        })?;
+    }
+
+    let mut updated = segments;
+    for (index, _, target_path, target_name_path) in temp_moves {
+        updated[index].segment_path = path_to_string(&target_path);
+        updated[index].segment_file_name = path_file_name(&target_name_path);
+        updated[index].id = path_file_stem(&target_name_path);
+    }
+    for (index, target_name) in planned_names {
+        if updated[index].segment_file_name == target_name {
+            continue;
+        }
+        let old_path = PathBuf::from(&updated[index].segment_path);
+        let target_path = old_path
+            .parent()
+            .map(|parent| parent.join(&target_name))
+            .unwrap_or_else(|| PathBuf::from(&target_name));
+        updated[index].segment_path = path_to_string(&target_path);
+        updated[index].segment_file_name = target_name.clone();
+        updated[index].id = path_file_stem(Path::new(&target_name));
+    }
+
+    Ok(updated)
+}
+
 fn cut_audio_file_impl(
     input_path: String,
     segments_dir: String,
     config: CutConfig,
     role: Option<String>,
+    topic_id: Option<u32>,
     original_text: Option<String>,
     emotion: Option<Vec<String>>,
     target_file_names: Vec<String>,
@@ -993,6 +1137,7 @@ fn cut_audio_file_impl(
         let segment_file_name = build_segment_file_name(
             &input,
             role.as_deref(),
+            topic_id,
             &target_file_names,
             index,
             start_ms,
@@ -1187,119 +1332,16 @@ fn absolutize_payload(mut value: Value, project_dir: &Path) -> Value {
     value
 }
 
-/// Make a timestamped copy of the project.json so a destructive operation
-/// (e.g. re-cutting an audio whose segments were already annotated) can be
-/// rolled back manually. Returns the backup path. Silently no-ops if
-/// project.json doesn't exist yet.
-/// One-shot migration: rename segment WAV files on disk so they match
-/// the demo `<base>_<NN>_<role>.wav` layout, then return updated
-/// `SegmentRecord`s with new `segment_path` / `segment_file_name`. The
-/// frontend persists the result via `save_project_file`.
-///
-/// **Why a separate command?** Older builds wrote segments as
-/// `<source>_<NNNN>.wav` (no role suffix) when the source filename had
-/// the role token in the middle (`长沙方言-...-发音人-话题1`). The new
-/// `split_role_suffix` recognizes those, but already-cut projects still
-/// have the old names. Re-cutting throws away ASR + polish state, so
-/// we rename in place instead.
-///
-/// Behavior:
-///   - Groups segments by source, sorts each group by `start_ms`, and
-///     assigns 1-based sub-indices in temporal order.
-///   - For sources whose stem contains a role token (anywhere), the
-///     new name is `<base>_<NN>_<role>.wav`.
-///   - For sources without a role token, names stay as the legacy
-///     `<source>_<NNNN>.wav` format — nothing to migrate.
-///   - If the new name equals the existing one, the segment is skipped
-///     (no rename, no record change).
-///   - If a target name already exists on disk we fail with an error
-///     message containing the conflicting path — never silently
-///     overwrite a user's data.
+/// Back-compat command kept for old frontends. It now runs the same dialogue
+/// sequence naming pass as the normal cut/export flow:
+/// `<mode>_<topic>_<round>_<content>_<role>.wav`.
 #[tauri::command]
 fn migrate_segment_filenames(
     project_dir: String,
     segments: Vec<SegmentRecord>,
 ) -> Result<Vec<SegmentRecord>, String> {
-    let _ = project_dir; // not used directly — segment.segment_path is absolute
-                         // Group segments by source_path; preserve original order for output.
-    let mut by_source: HashMap<String, Vec<usize>> = HashMap::new();
-    for (idx, seg) in segments.iter().enumerate() {
-        by_source
-            .entry(seg.source_path.clone())
-            .or_default()
-            .push(idx);
-    }
-    // Within each source, sort by start_ms — the sub-index then matches
-    // temporal order, just like cut_audio_file_impl produced originally.
-    for indices in by_source.values_mut() {
-        indices.sort_by_key(|&i| segments[i].start_ms);
-    }
-
-    let mut updated = segments.clone();
-    let mut renamed = 0usize;
-    for indices in by_source.values() {
-        if let Some(&first) = indices.first() {
-            let source_stem = path_file_stem(Path::new(&segments[first].source_path));
-            let (base_stem, role_suffix) = split_role_suffix(&source_stem);
-            // No role token in the source — nothing to migrate. Legacy
-            // `<source>_<NNNN>.wav` names stay as-is.
-            let Some(role) = role_suffix else { continue };
-            let (true_base_stem, turn_number) = extract_turn_from_base(&base_stem);
-            let safe_base = safe_name(&true_base_stem);
-            let total = indices.len();
-
-            for (sub, &idx) in indices.iter().enumerate() {
-                let seg = &segments[idx];
-                // Spec rule (matches cut_audio_file_impl):
-                //   1 segment per turn  → `<base>_<turn>_<role>.wav`
-                //   N segments per turn → `<base>_<turn>_<sub>_<role>.wav`
-                let new_name = if total == 1 {
-                    format!("{}_{:02}_{}.wav", safe_base, turn_number, role)
-                } else {
-                    format!(
-                        "{}_{:02}_{:02}_{}.wav",
-                        safe_base,
-                        turn_number,
-                        sub + 1,
-                        role
-                    )
-                };
-                if seg.segment_file_name == new_name {
-                    continue;
-                }
-                let old_path = PathBuf::from(&seg.segment_path);
-                let parent = old_path
-                    .parent()
-                    .ok_or_else(|| format!("无法定位段文件父目录：{}", seg.segment_path))?;
-                let new_path = parent.join(&new_name);
-                if new_path.exists() {
-                    return Err(format!(
-                        "迁移目标已存在，拒绝覆盖：{}（来源段：{}）",
-                        path_to_string(&new_path),
-                        seg.segment_file_name
-                    ));
-                }
-                if old_path.is_file() {
-                    fs::rename(&old_path, &new_path).map_err(|err| {
-                        format!(
-                            "重命名失败 {} → {}：{}",
-                            seg.segment_file_name, new_name, err
-                        )
-                    })?;
-                    renamed += 1;
-                }
-                let entry = &mut updated[idx];
-                entry.segment_path = path_to_string(&new_path);
-                entry.segment_file_name = new_name;
-            }
-        }
-    }
-    eprintln!(
-        "[migrate] renamed {} of {} segments to demo layout",
-        renamed,
-        segments.len()
-    );
-    Ok(updated)
+    let _ = project_dir;
+    rename_segments_by_dialogue_sequence_impl(segments)
 }
 
 #[tauri::command]
@@ -2019,13 +2061,49 @@ struct SegmentOutputName {
     role: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TopicKey {
+    mode: String,
+    topic_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SourceTopicKey {
+    mode: String,
+    label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceTopicSortKey {
+    explicit_topic_rank: u8,
+    explicit_topic_id: u32,
+    descriptor_rank: u32,
+    trailing_number: u32,
+    descriptor: String,
+    label: String,
+}
+
+#[derive(Clone, Debug)]
+struct SegmentNameSeed {
+    topic: TopicKey,
+    role: String,
+}
+
 fn parse_dataset_source_audio_name(
     path: &Path,
     role_hint: Option<&str>,
 ) -> Option<DatasetSourceName> {
+    parse_dataset_source_audio_name_with_topic(path, role_hint, None)
+}
+
+fn parse_dataset_source_audio_name_with_topic(
+    path: &Path,
+    role_hint: Option<&str>,
+    topic_id_override: Option<u32>,
+) -> Option<DatasetSourceName> {
     let stem = path_file_stem(path);
     let mode = dataset_mode(&stem)?;
-    let topic_id = last_number(&stem)?;
+    let topic_id = topic_id_override.or_else(|| last_number(&stem))?;
     let role = role_hint
         .map(|value| value.to_string())
         .or_else(|| infer_role(path));
@@ -2035,6 +2113,110 @@ fn parse_dataset_source_audio_name(
         topic_id,
         role,
     })
+}
+
+fn infer_source_topic_ids(
+    audio_paths: &[PathBuf],
+    records: &[ManifestRecord],
+) -> HashMap<SourceTopicKey, u32> {
+    let mut source_by_mode: BTreeMap<String, Vec<SourceTopicKey>> = BTreeMap::new();
+    let mut seen_sources: HashSet<SourceTopicKey> = HashSet::new();
+    for path in audio_paths {
+        let Some(key) = source_topic_key(path) else {
+            continue;
+        };
+        if seen_sources.insert(key.clone()) {
+            source_by_mode
+                .entry(key.mode.clone())
+                .or_default()
+                .push(key);
+        }
+    }
+
+    let mut manifest_topics: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    for record in records {
+        let Some(audio_file) = record.audio_file.as_deref() else {
+            continue;
+        };
+        let Some(parts) = parse_segment_output_name(audio_file) else {
+            continue;
+        };
+        let topics = manifest_topics.entry(parts.key.mode).or_default();
+        if !topics.contains(&parts.key.topic_id) {
+            topics.push(parts.key.topic_id);
+        }
+    }
+    for topics in manifest_topics.values_mut() {
+        topics.sort_unstable();
+    }
+
+    let mut result = HashMap::new();
+    for (mode, mut source_keys) in source_by_mode {
+        source_keys.sort_by_key(source_topic_sort_key);
+        let manifest_ids = manifest_topics.get(&mode);
+        for (index, key) in source_keys.into_iter().enumerate() {
+            let topic_id = explicit_topic_id_from_source_label(&key.label)
+                .or_else(|| manifest_ids.and_then(|ids| ids.get(index).copied()))
+                .unwrap_or((index + 1) as u32);
+            result.insert(key, topic_id);
+        }
+    }
+
+    result
+}
+
+fn source_topic_key(path: &Path) -> Option<SourceTopicKey> {
+    let stem = path_file_stem(path);
+    let mode = dataset_mode(&stem)?;
+    let label = strip_role_token_from_stem(&stem);
+    Some(SourceTopicKey { mode, label })
+}
+
+fn source_topic_sort_key(key: &SourceTopicKey) -> SourceTopicSortKey {
+    let explicit_topic_id = explicit_topic_id_from_source_label(&key.label).unwrap_or(u32::MAX);
+    let (descriptor, trailing_number) = split_trailing_number(&key.label);
+    SourceTopicSortKey {
+        explicit_topic_rank: if explicit_topic_id == u32::MAX { 1 } else { 0 },
+        explicit_topic_id,
+        descriptor_rank: free_topic_descriptor_rank(&descriptor),
+        trailing_number: trailing_number.unwrap_or(u32::MAX),
+        descriptor,
+        label: key.label.clone(),
+    }
+}
+
+fn explicit_topic_id_from_source_label(value: &str) -> Option<u32> {
+    if value.contains("话题") {
+        last_number(value)
+    } else {
+        None
+    }
+}
+
+fn split_trailing_number(value: &str) -> (String, Option<u32>) {
+    let end = value
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    if end == value.len() {
+        return (value.to_string(), None);
+    }
+    let number = value[end..].parse::<u32>().ok();
+    (value[..end].to_string(), number)
+}
+
+fn free_topic_descriptor_rank(value: &str) -> u32 {
+    for (index, token) in ["惊讶", "开心", "疑问", "生气", "难过", "中立"]
+        .iter()
+        .enumerate()
+    {
+        if value.contains(token) {
+            return index as u32;
+        }
+    }
+    u32::MAX
 }
 
 fn parse_segment_output_name(value: &str) -> Option<SegmentOutputName> {
@@ -2068,6 +2250,7 @@ fn parse_segment_output_name(value: &str) -> Option<SegmentOutputName> {
 fn build_segment_file_name(
     input: &Path,
     role_hint: Option<&str>,
+    topic_id_override: Option<u32>,
     target_file_names: &[String],
     index: usize,
     start_ms: u64,
@@ -2081,19 +2264,22 @@ fn build_segment_file_name(
         return target;
     }
 
-    if let Some(source) = parse_dataset_source_audio_name(input, role_hint) {
-        let round_index = index + 1;
+    if let Some(source) =
+        parse_dataset_source_audio_name_with_topic(input, role_hint, topic_id_override)
+    {
+        let round_index = 1;
+        let content_index = index + 1;
         match source.role.as_deref() {
             Some("user") => {
                 return format!(
-                    "{}_{:04}_{:02}_陪聊.wav",
-                    source.mode, source.topic_id, round_index
+                    "{}_{:04}_{:02}_{:02}_陪聊.wav",
+                    source.mode, source.topic_id, round_index, content_index
                 );
             }
             Some("assistant") => {
                 return format!(
                     "{}_{:04}_{:02}_{:02}_发音人.wav",
-                    source.mode, source.topic_id, round_index, 1
+                    source.mode, source.topic_id, round_index, content_index
                 );
             }
             _ => {
@@ -2113,6 +2299,90 @@ fn build_segment_file_name(
         start_ms,
         end_ms
     )
+}
+
+fn plan_dialogue_sequence_file_names(segments: &[SegmentRecord]) -> HashMap<usize, String> {
+    let mut by_topic: BTreeMap<TopicKey, Vec<(usize, SegmentNameSeed)>> = BTreeMap::new();
+
+    for (index, segment) in segments.iter().enumerate() {
+        let Some(seed) = segment_name_seed(segment) else {
+            continue;
+        };
+        by_topic
+            .entry(seed.topic.clone())
+            .or_default()
+            .push((index, seed));
+    }
+
+    let mut planned = HashMap::new();
+    for (topic, mut items) in by_topic {
+        items.sort_by(|(left_index, left_seed), (right_index, right_seed)| {
+            let left = &segments[*left_index];
+            let right = &segments[*right_index];
+            left.start_ms
+                .cmp(&right.start_ms)
+                .then(left.end_ms.cmp(&right.end_ms))
+                .then(
+                    segment_role_order(Some(&left_seed.role))
+                        .cmp(&segment_role_order(Some(&right_seed.role))),
+                )
+                .then(left.segment_file_name.cmp(&right.segment_file_name))
+        });
+
+        let mut round_index = 0u32;
+        let mut last_role: Option<String> = None;
+        let mut content_counts: HashMap<(u32, String), u32> = HashMap::new();
+
+        for (index, seed) in items {
+            if round_index == 0 {
+                round_index = 1;
+            } else if seed.role == "user" && last_role.as_deref() == Some("assistant") {
+                round_index += 1;
+            }
+
+            let count_key = (round_index, seed.role.clone());
+            let content_index = content_counts.entry(count_key).or_insert(0);
+            *content_index += 1;
+
+            let role_label = role_label_for_export(&seed.role).unwrap_or("未知");
+            let target_name = format!(
+                "{}_{:04}_{:02}_{:02}_{}.wav",
+                topic.mode, topic.topic_id, round_index, *content_index, role_label
+            );
+
+            if segments[index].segment_file_name != target_name {
+                planned.insert(index, target_name);
+            }
+            last_role = Some(seed.role);
+        }
+    }
+
+    planned
+}
+
+fn segment_name_seed(segment: &SegmentRecord) -> Option<SegmentNameSeed> {
+    if let Some(parts) = parse_segment_output_name(&segment.segment_file_name) {
+        return Some(SegmentNameSeed {
+            topic: TopicKey {
+                mode: parts.key.mode,
+                topic_id: parts.key.topic_id,
+            },
+            role: parts.role,
+        });
+    }
+
+    let role = segment
+        .role
+        .clone()
+        .or_else(|| infer_role(Path::new(&segment.source_path)))?;
+    let source = parse_dataset_source_audio_name(Path::new(&segment.source_path), Some(&role))?;
+    Some(SegmentNameSeed {
+        topic: TopicKey {
+            mode: source.mode,
+            topic_id: source.topic_id,
+        },
+        role,
+    })
 }
 
 fn dataset_mode(value: &str) -> Option<String> {
@@ -2150,6 +2420,14 @@ fn role_from_label(value: &str) -> Option<String> {
     }
 }
 
+fn role_label_for_export(role: &str) -> Option<&'static str> {
+    match role {
+        "user" => Some("陪聊"),
+        "assistant" => Some("发音人"),
+        _ => None,
+    }
+}
+
 fn segment_role_order(role: Option<&str>) -> u8 {
     match role {
         Some("user") => 0,
@@ -2169,10 +2447,41 @@ fn target_audio_file_name(value: &str) -> String {
 
 fn normalize_target_file_name(value: &str) -> String {
     let file_name = target_audio_file_name(value);
-    if lower_extension(Path::new(&file_name)).as_deref() == Some("wav") {
+    let with_ext = if lower_extension(Path::new(&file_name)).as_deref() == Some("wav") {
         file_name
     } else {
         format!("{}.wav", file_name.trim_end_matches('.'))
+    };
+
+    if let Some(parts) = parse_segment_output_name(&with_ext) {
+        if parts.content_index.is_none() {
+            if let Some(role_label) = role_label_for_export(&parts.role) {
+                return format!(
+                    "{}_{:04}_{:02}_01_{}.wav",
+                    parts.key.mode, parts.key.topic_id, parts.key.round_index, role_label
+                );
+            }
+        }
+    }
+
+    with_ext
+}
+
+fn strip_role_token_from_stem(stem: &str) -> String {
+    // (left_sep) (role) (right_sep | end)
+    let re =
+        Regex::new(r"([_\-])(?:发音人|assistant|陪聊|user)(?:([_\-])|$)").expect("valid regex");
+    let cleaned = re
+        .replace(stem, |caps: &regex::Captures| match caps.get(2) {
+            Some(right) => right.as_str().to_string(),
+            None => String::new(),
+        })
+        .to_string();
+    let trimmed = cleaned.trim_end_matches(['_', '-']).to_string();
+    if trimmed.is_empty() {
+        stem.to_string()
+    } else {
+        trimmed
     }
 }
 
@@ -2212,27 +2521,7 @@ fn pair_key(segment: &SegmentRecord) -> String {
         );
     }
 
-    let stem = path_file_stem(Path::new(&segment.source_path));
-    // (left_sep) (role) (right_sep | end)
-    let re =
-        Regex::new(r"([_\-])(?:发音人|assistant|陪聊|user)(?:([_\-])|$)").expect("valid regex");
-    let cleaned = re
-        .replace(&stem, |caps: &regex::Captures| {
-            // If a right separator was captured we're in the middle of
-            // the stem — keep one separator so adjacent tokens don't
-            // fuse. If not, the role was at the end — drop everything.
-            match caps.get(2) {
-                Some(right) => right.as_str().to_string(),
-                None => String::new(),
-            }
-        })
-        .to_string();
-    let trimmed = cleaned.trim_end_matches(['_', '-']).to_string();
-    if trimmed.is_empty() {
-        stem
-    } else {
-        trimmed
-    }
+    strip_role_token_from_stem(&path_file_stem(Path::new(&segment.source_path)))
 }
 
 /// Detect whether the base stem already encodes a "话轮" (dialogue
@@ -2255,6 +2544,7 @@ fn pair_key(segment: &SegmentRecord) -> String {
 /// Actually the example above returns `("自由演绎_0001", 1)` on the
 /// `_01` match — `01` parses as 1. The cut filename will then encode
 /// the turn back as `_01_` regardless.
+#[cfg(test)]
 fn extract_turn_from_base(base: &str) -> (String, u32) {
     // Trailing `_<2 digits>` — the demo's turn marker.
     let re = Regex::new(r"_(\d{2})$").expect("valid regex");
@@ -2285,6 +2575,7 @@ fn extract_turn_from_base(base: &str) -> (String, u32) {
 /// from `长沙方言-...-发音人-话题1.wav` come out as
 /// `长沙方言-...-话题1_01_发音人.wav`, which matches the demo layout
 /// and lets `pair_key` align user/assistant turns automatically.
+#[cfg(test)]
 fn split_role_suffix(stem: &str) -> (String, Option<String>) {
     // (left_sep) (role) (right_sep | end_of_string)
     let re = Regex::new(r"([_\-])(发音人|assistant|陪聊|user)(?:([_\-])|$)").expect("valid regex");
@@ -3495,9 +3786,10 @@ fn match_manifest<'a>(path: &Path, records: &'a [ManifestRecord]) -> Option<&'a 
 fn matching_manifest_records_for_source<'a>(
     path: &Path,
     role_hint: Option<&str>,
+    topic_id: Option<u32>,
     records: &'a [ManifestRecord],
 ) -> Vec<&'a ManifestRecord> {
-    let Some(source) = parse_dataset_source_audio_name(path, role_hint) else {
+    let Some(source) = parse_dataset_source_audio_name_with_topic(path, role_hint, topic_id) else {
         return Vec::new();
     };
 
@@ -4062,20 +4354,73 @@ mod tests {
     fn builds_dataset_segment_names_from_source_names_and_manifest_targets() {
         let assistant = Path::new("/tmp/长沙方言-0413-自由演绎-发音人-惊讶1.wav");
         assert_eq!(
-            build_segment_file_name(assistant, Some("assistant"), &[], 0, 0, 1000),
+            build_segment_file_name(assistant, Some("assistant"), None, &[], 0, 0, 1000),
             "自由演绎_0001_01_01_发音人.wav"
         );
 
         let user = Path::new("/tmp/长沙方言-0413-文案演绎-陪聊-话题12.wav");
         assert_eq!(
-            build_segment_file_name(user, Some("user"), &[], 2, 0, 1000),
-            "文案演绎_0012_03_陪聊.wav"
+            build_segment_file_name(user, Some("user"), None, &[], 2, 0, 1000),
+            "文案演绎_0012_01_03_陪聊.wav"
         );
 
         let targets = vec!["oss://bucket/WAV/自由演绎_0001_01_02_发音人.wav".to_string()];
         assert_eq!(
-            build_segment_file_name(assistant, Some("assistant"), &targets, 0, 0, 1000),
+            build_segment_file_name(assistant, Some("assistant"), None, &targets, 0, 0, 1000),
             "自由演绎_0001_01_02_发音人.wav"
+        );
+
+        let legacy_user_targets = vec!["oss://bucket/WAV/文案演绎_0012_03_陪聊.wav".to_string()];
+        assert_eq!(
+            build_segment_file_name(user, Some("user"), None, &legacy_user_targets, 0, 0, 1000),
+            "文案演绎_0012_03_01_陪聊.wav"
+        );
+
+        let free_topic = Path::new("/tmp/长沙方言-0413-自由演绎-发音人-开心1.wav");
+        assert_eq!(
+            build_segment_file_name(free_topic, Some("assistant"), Some(2), &[], 0, 0, 1000),
+            "自由演绎_0002_01_01_发音人.wav"
+        );
+    }
+
+    #[test]
+    fn maps_free_source_topics_to_manifest_topic_order() {
+        let audio_paths = vec![
+            PathBuf::from("/tmp/长沙方言-0413-自由演绎-发音人-惊讶1.wav"),
+            PathBuf::from("/tmp/长沙方言-0413-自由演绎-陪聊-惊讶1.wav"),
+            PathBuf::from("/tmp/长沙方言-0413-自由演绎-发音人-开心1.wav"),
+            PathBuf::from("/tmp/长沙方言-0413-自由演绎-陪聊-开心1.wav"),
+            PathBuf::from("/tmp/长沙方言-0413-自由演绎-发音人-开心2.wav"),
+        ];
+        let records = ["0001", "0002", "0003"]
+            .iter()
+            .map(|topic| ManifestRecord {
+                role: "assistant".to_string(),
+                content: String::new(),
+                raw_content: String::new(),
+                audio_file: Some(format!("自由演绎_{}_01_01_发音人.wav", topic)),
+                emotion: Vec::new(),
+                tags: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let ids = infer_source_topic_ids(&audio_paths, &records);
+        let topic_id = |path: &str| {
+            ids.get(&source_topic_key(Path::new(path)).expect("source key"))
+                .copied()
+        };
+
+        assert_eq!(
+            topic_id("/tmp/长沙方言-0413-自由演绎-发音人-惊讶1.wav"),
+            Some(1)
+        );
+        assert_eq!(
+            topic_id("/tmp/长沙方言-0413-自由演绎-发音人-开心1.wav"),
+            Some(2)
+        );
+        assert_eq!(
+            topic_id("/tmp/长沙方言-0413-自由演绎-发音人-开心2.wav"),
+            Some(3)
         );
     }
 
@@ -4085,8 +4430,8 @@ mod tests {
             id: "u".to_string(),
             source_path: "/input/长沙方言-0413-自由演绎-陪聊-惊讶1.wav".to_string(),
             source_file_name: "长沙方言-0413-自由演绎-陪聊-惊讶1.wav".to_string(),
-            segment_path: "/out/segments/自由演绎_0001_01_陪聊.wav".to_string(),
-            segment_file_name: "自由演绎_0001_01_陪聊.wav".to_string(),
+            segment_path: "/out/segments/自由演绎_0001_01_01_陪聊.wav".to_string(),
+            segment_file_name: "自由演绎_0001_01_01_陪聊.wav".to_string(),
             role: Some("user".to_string()),
             start_ms: 0,
             end_ms: 1000,
@@ -4121,11 +4466,65 @@ mod tests {
         let messages = value["messages"].as_array().expect("messages");
         assert_eq!(
             messages[1]["audio_file"],
-            "/out/segments/自由演绎_0001_01_陪聊.wav"
+            "/out/segments/自由演绎_0001_01_01_陪聊.wav"
         );
         assert_eq!(
             messages[2]["audio_file"],
             "/out/segments/自由演绎_0001_01_01_发音人.wav"
+        );
+    }
+
+    #[test]
+    fn dialogue_sequence_names_rounds_from_two_track_timeline() {
+        let make_segment = |role: &str, start_ms: u64, file_name: &str| SegmentRecord {
+            id: file_name.trim_end_matches(".wav").to_string(),
+            source_path: format!(
+                "/input/长沙方言-0413-文案演绎-{}-话题1.wav",
+                if role == "user" {
+                    "陪聊"
+                } else {
+                    "发音人"
+                }
+            ),
+            source_file_name: format!(
+                "长沙方言-0413-文案演绎-{}-话题1.wav",
+                if role == "user" {
+                    "陪聊"
+                } else {
+                    "发音人"
+                }
+            ),
+            segment_path: format!("/out/segments/{}", file_name),
+            segment_file_name: file_name.to_string(),
+            role: Some(role.to_string()),
+            start_ms,
+            end_ms: start_ms + 500,
+            duration_ms: 500,
+            original_text: String::new(),
+            phonetic_text: String::new(),
+            emotion: Vec::new(),
+            tags: Vec::new(),
+            notes: String::new(),
+        };
+        let segments = vec![
+            make_segment("assistant", 1200, "文案演绎_0001_01_01_发音人.wav"),
+            make_segment("user", 0, "文案演绎_0001_01_01_陪聊.wav"),
+            make_segment("assistant", 1800, "文案演绎_0001_01_02_发音人.wav"),
+            make_segment("user", 3200, "文案演绎_0001_01_02_陪聊.wav"),
+            make_segment("assistant", 4200, "文案演绎_0001_01_03_发音人.wav"),
+        ];
+
+        let planned = plan_dialogue_sequence_file_names(&segments);
+        assert_eq!(planned.get(&0), None);
+        assert_eq!(planned.get(&1), None);
+        assert_eq!(planned.get(&2), None);
+        assert_eq!(
+            planned.get(&3).map(String::as_str),
+            Some("文案演绎_0001_02_01_陪聊.wav")
+        );
+        assert_eq!(
+            planned.get(&4).map(String::as_str),
+            Some("文案演绎_0001_02_01_发音人.wav")
         );
     }
 
@@ -4535,6 +4934,7 @@ mod tests {
             path_to_string(&segments_dir),
             config,
             Some("assistant".to_string()),
+            None,
             Some("ka".to_string()),
             Some(vec!["neutral".to_string()]),
             Vec::new(),
@@ -4589,6 +4989,7 @@ mod tests {
             path: "speaker/free_001.wav".to_string(),
             file_name: "free_001.wav".to_string(),
             role: Some("assistant".to_string()),
+            topic_id: None,
             target_file_names: Vec::new(),
             duration_ms: None,
             sample_rate: None,
@@ -4641,6 +5042,7 @@ pub fn run() {
             save_project_file,
             backup_project_file,
             migrate_segment_filenames,
+            rename_segments_by_dialogue_sequence,
             load_project_file,
             export_segments_jsonl,
             export_dataset_bundle

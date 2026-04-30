@@ -28,6 +28,7 @@ export const ipc = {
     segmentsDir: string;
     config: CutConfig;
     role?: string | null;
+    topicId?: number | null;
     originalText?: string | null;
     emotion?: string[] | null;
     targetFileNames?: string[];
@@ -104,6 +105,9 @@ export const ipc = {
     segments: SegmentRecord[];
   }) {
     return invoke<SegmentRecord[]>("migrate_segment_filenames", args);
+  },
+  renameSegmentsByDialogueSequence(args: { segments: SegmentRecord[] }) {
+    return invoke<SegmentRecord[]>("rename_segments_by_dialogue_sequence", args);
   },
   loadProjectFile(args: { projectDir: string }) {
     return invoke<ProjectFile>("load_project_file", args);

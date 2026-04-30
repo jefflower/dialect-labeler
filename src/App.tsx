@@ -555,14 +555,18 @@ function App() {
 
       if (!REVIEW_ONLY && autoCutAfterScan && audioToCut.length > 0) {
         const newSegments = await cutAudioBatch(result, audioToCut);
-        const merged = [...restoredSegments, ...newSegments];
-        setSegments(merged);
+        const merged = await normalizeDialogueSequenceNames([
+          ...restoredSegments,
+          ...newSegments,
+        ]);
         cutCount = newSegments.length;
         if (autoRecognizeAfterCut) {
+          const newSourcePaths = new Set(audioToCut.map((audio) => audio.path));
           // Only recognize segments whose phonetic text is still empty so we
           // don't burn cycles re-running Whisper / Ollama on done work.
           const targets = merged.filter(
-            (segment) => !segment.phoneticText.trim(),
+            (segment) =>
+              newSourcePaths.has(segment.sourcePath) && !segment.phoneticText.trim(),
           );
           if (targets.length > 0) {
             recognizedCount = await recognizeDraft(targets, {
@@ -620,6 +624,7 @@ function App() {
         segmentsDir: targetScan.segmentsDir,
         config,
         role: audio.role ?? null,
+        topicId: audio.topicId ?? null,
         originalText: audio.matchedText ?? "",
         emotion: audio.matchedEmotion ?? [],
         targetFileNames: audio.targetFileNames ?? [],
@@ -660,9 +665,17 @@ function App() {
       }
       setBusy(true);
       const newSegments = await cutAudioBatch(scan, audioToCut);
+      const newSourcePaths = new Set(audioToCut.map((audio) => audio.path));
+      const merged = await normalizeDialogueSequenceNames([
+        ...segments.filter((segment) => !newSourcePaths.has(segment.sourcePath)),
+        ...newSegments,
+      ]);
+      const renamedNewSegments = merged.filter((segment) =>
+        newSourcePaths.has(segment.sourcePath),
+      );
       const recognizedCount = autoRecognizeAfterCut
         ? await recognizeDraft(
-            newSegments.filter((segment) => !segment.phoneticText.trim()),
+            renamedNewSegments.filter((segment) => !segment.phoneticText.trim()),
             {
               manageBusy: false,
               overwrite: false,
@@ -723,16 +736,20 @@ function App() {
         segmentsDir: scan.segmentsDir,
         config,
         role: audio.role ?? null,
+        topicId: audio.topicId ?? null,
         originalText: audio.matchedText ?? "",
         emotion: audio.matchedEmotion ?? [],
         targetFileNames: audio.targetFileNames ?? [],
       });
-      setSegments((current) => [
-        ...current.filter((segment) => segment.sourcePath !== audio.path),
+      const merged = await normalizeDialogueSequenceNames([
+        ...segments.filter((segment) => segment.sourcePath !== audio.path),
         ...created,
       ]);
+      const renamedCreated = merged.filter(
+        (segment) => segment.sourcePath === audio.path,
+      );
       const recognizedCount = autoRecognizeAfterCut
-        ? await recognizeDraft(created, {
+        ? await recognizeDraft(renamedCreated, {
             manageBusy: false,
             overwrite: false,
             label: "自动识别",
@@ -1234,6 +1251,16 @@ function App() {
     }
   }
 
+  async function normalizeDialogueSequenceNames(snapshotSegments: SegmentRecord[]) {
+    if (snapshotSegments.length === 0) return snapshotSegments;
+    const updated = await ipc.renameSegmentsByDialogueSequence({
+      segments: snapshotSegments,
+    });
+    setSegments(updated);
+    void saveProjectSnapshot(updated);
+    return updated;
+  }
+
   async function saveProject() {
     if (!scan) return;
     setBusy(true);
@@ -1286,10 +1313,11 @@ function App() {
     if (!scan) return;
     setBusy(true);
     try {
+      const exportSegments = await normalizeDialogueSequenceNames(segments);
       const path = await ipc.exportSegmentsJsonl({
         projectDir: scan.projectDir,
         outputPath: exportJsonlPath.trim() || null,
-        segments,
+        segments: exportSegments,
         options: {
           systemPrompt: settings.systemPrompt,
           pairUserAssistant: settings.pairUserAssistant,
@@ -1325,19 +1353,20 @@ function App() {
     if (typeof target !== "string" || !target) return;
 
     setBusy(true);
-    setProgress({
-      visible: true,
-      label: "一键打包",
-      detail: `复制 ${segments.length} 段 + 源音频到 ${target}`,
-      current: 0,
-      total: segments.length,
-      indeterminate: true,
-    });
     try {
+      const bundleSegments = await normalizeDialogueSequenceNames(segments);
+      setProgress({
+        visible: true,
+        label: "一键打包",
+        detail: `复制 ${bundleSegments.length} 段 + 源音频到 ${target}`,
+        current: 0,
+        total: bundleSegments.length,
+        indeterminate: true,
+      });
       await waitForPaint();
       const result = await ipc.exportDatasetBundle({
         bundleDir: target,
-        segments,
+        segments: bundleSegments,
         includeSourceAudio: true,
         options: {
           systemPrompt: settings.systemPrompt,
