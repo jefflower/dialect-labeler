@@ -30,6 +30,7 @@ export const ipc = {
     role?: string | null;
     originalText?: string | null;
     emotion?: string[] | null;
+    targetFileNames?: string[];
   }) {
     return invoke<SegmentRecord[]>("cut_audio_file", args);
   },

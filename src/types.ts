@@ -12,6 +12,7 @@ export type AudioFileInfo = {
   path: string;
   fileName: string;
   role?: string;
+  targetFileNames?: string[];
   durationMs?: number;
   sampleRate?: number;
   channels?: number;

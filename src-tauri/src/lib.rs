@@ -57,6 +57,7 @@ struct AudioFileInfo {
     path: String,
     file_name: String,
     role: Option<String>,
+    target_file_names: Vec<String>,
     duration_ms: Option<u64>,
     sample_rate: Option<u32>,
     channels: Option<u16>,
@@ -837,22 +838,35 @@ fn scan_project_folder_impl(
             .as_ref()
             .map(|record| record.role.clone())
             .or_else(|| infer_role(path));
+        let related_records =
+            matching_manifest_records_for_source(path, role.as_deref(), &manifest_records);
+        let target_file_names = related_records
+            .iter()
+            .filter_map(|record| record.audio_file.as_deref())
+            .map(target_audio_file_name)
+            .collect::<Vec<_>>();
+        let matched_text = matched
+            .as_ref()
+            .map(|record| record.content.clone())
+            .or_else(|| joined_manifest_content(&related_records));
+        let matched_emotion = matched
+            .as_ref()
+            .map(|record| record.emotion.clone())
+            .unwrap_or_else(|| merged_manifest_emotion(&related_records));
 
         audio_files.push(AudioFileInfo {
             id: stable_id(path),
             path: path_to_string(path),
             file_name,
             role,
+            target_file_names,
             duration_ms: probe.as_ref().and_then(|info| info.duration_ms),
             sample_rate: probe.as_ref().and_then(|info| info.sample_rate),
             channels: probe.as_ref().and_then(|info| info.channels),
             codec_name: probe.as_ref().and_then(|info| info.codec_name.clone()),
             bits_per_sample: probe.as_ref().and_then(|info| info.bits_per_sample),
-            matched_text: matched.as_ref().map(|record| record.content.clone()),
-            matched_emotion: matched
-                .as_ref()
-                .map(|record| record.emotion.clone())
-                .unwrap_or_default(),
+            matched_text,
+            matched_emotion,
         });
     }
 
@@ -924,6 +938,7 @@ async fn cut_audio_file(
     role: Option<String>,
     original_text: Option<String>,
     emotion: Option<Vec<String>>,
+    target_file_names: Option<Vec<String>>,
 ) -> Result<Vec<SegmentRecord>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         cut_audio_file_impl(
@@ -933,6 +948,7 @@ async fn cut_audio_file(
             role,
             original_text,
             emotion,
+            target_file_names.unwrap_or_default(),
         )
     })
     .await
@@ -946,6 +962,7 @@ fn cut_audio_file_impl(
     role: Option<String>,
     original_text: Option<String>,
     emotion: Option<Vec<String>>,
+    target_file_names: Vec<String>,
 ) -> Result<Vec<SegmentRecord>, String> {
     ensure_ffmpeg()?;
 
@@ -965,50 +982,23 @@ fn cut_audio_file_impl(
 
     let events = detect_silence(&input, &config)?;
     let ranges = build_segment_ranges(duration_sec, &events, &config);
-    let source_stem = path_file_stem(&input);
-    let safe_source = safe_name(&source_stem);
-    let (base_stem, role_suffix) = split_role_suffix(&source_stem);
-    // Three-number naming per spec: 话题号_话轮号_音频序号.
-    //   - When the source already encodes a turn (`...0001_01_发音人`),
-    //     extract_turn_from_base pulls out `01` and we use it.
-    //   - When the source has only a topic (`...-话题1`), treat the
-    //     whole file as a single turn → turn = 1.
-    let (true_base_stem, turn_number) = extract_turn_from_base(&base_stem);
-    let safe_base = safe_name(&true_base_stem);
-    let source_dir = segments_root.join(&safe_source);
-    fs::create_dir_all(&source_dir).map_err(|err| err.to_string())?;
-
     let codec = output_pcm_codec(&probe);
     let mut segments = Vec::new();
     let text = original_text.clone().unwrap_or_default();
     let text_chunks = split_text_by_ranges(&text, &ranges);
-    // Spec quirk: a turn that splits into a single segment uses ONLY two
-    // numbers (`<base>_<turn>_<role>.wav`); a turn that splits into ≥2
-    // segments uses three (`<base>_<turn>_<sub>_<role>.wav`). The cutter
-    // knows the count up front from `ranges.len()`.
-    let total_segs = ranges.len();
 
     for (index, (start_sec, end_sec)) in ranges.iter().enumerate() {
         let start_ms = seconds_to_ms(*start_sec);
         let end_ms = seconds_to_ms(*end_sec);
-        let segment_file_name = match &role_suffix {
-            Some(suffix) if total_segs == 1 => {
-                // Single-segment turn → no sub-index, two numbers only.
-                format!("{}_{:02}_{}.wav", safe_base, turn_number, suffix)
-            }
-            Some(suffix) => {
-                // Multi-segment turn → three numbers per spec.
-                format!(
-                    "{}_{:02}_{:02}_{}.wav",
-                    safe_base,
-                    turn_number,
-                    index + 1,
-                    suffix
-                )
-            }
-            None => format!("{}_{:04}.wav", safe_source, index + 1),
-        };
-        let output = source_dir.join(&segment_file_name);
+        let segment_file_name = build_segment_file_name(
+            &input,
+            role.as_deref(),
+            &target_file_names,
+            index,
+            start_ms,
+            end_ms,
+        );
+        let output = segments_root.join(&segment_file_name);
         write_pcm_wav_segment(
             &input,
             &output,
@@ -1020,7 +1010,7 @@ fn cut_audio_file_impl(
 
         let segment_text = text_chunks.get(index).cloned().unwrap_or_default();
         segments.push(SegmentRecord {
-            id: format!("{}_{:04}", safe_source, index + 1),
+            id: path_file_stem(Path::new(&segment_file_name)),
             source_path: path_to_string(&input),
             source_file_name: path_file_name(&input),
             segment_path: path_to_string(&output),
@@ -1231,10 +1221,13 @@ fn migrate_segment_filenames(
     segments: Vec<SegmentRecord>,
 ) -> Result<Vec<SegmentRecord>, String> {
     let _ = project_dir; // not used directly — segment.segment_path is absolute
-    // Group segments by source_path; preserve original order for output.
+                         // Group segments by source_path; preserve original order for output.
     let mut by_source: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, seg) in segments.iter().enumerate() {
-        by_source.entry(seg.source_path.clone()).or_default().push(idx);
+        by_source
+            .entry(seg.source_path.clone())
+            .or_default()
+            .push(idx);
     }
     // Within each source, sort by start_ms — the sub-index then matches
     // temporal order, just like cut_audio_file_impl produced originally.
@@ -1275,9 +1268,9 @@ fn migrate_segment_filenames(
                     continue;
                 }
                 let old_path = PathBuf::from(&seg.segment_path);
-                let parent = old_path.parent().ok_or_else(|| {
-                    format!("无法定位段文件父目录：{}", seg.segment_path)
-                })?;
+                let parent = old_path
+                    .parent()
+                    .ok_or_else(|| format!("无法定位段文件父目录：{}", seg.segment_path))?;
                 let new_path = parent.join(&new_name);
                 if new_path.exists() {
                     return Err(format!(
@@ -1401,9 +1394,7 @@ fn export_dataset_bundle_impl(
 
     let bundle = PathBuf::from(&bundle_dir);
     fs::create_dir_all(&bundle).map_err(|err| err.to_string())?;
-    let bundle_canonical = bundle
-        .canonicalize()
-        .map_err(|err| err.to_string())?;
+    let bundle_canonical = bundle.canonicalize().map_err(|err| err.to_string())?;
     let bundle_root_str = path_to_string(&bundle_canonical);
 
     let segments_out = bundle_canonical.join("segments");
@@ -1433,9 +1424,8 @@ fn export_dataset_bundle_impl(
             };
             let dst = source_out.join(&file_name);
             fs::copy(&src_path, &dst).map_err(|err| err.to_string())?;
-            total_bytes = total_bytes.saturating_add(
-                fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
-            );
+            total_bytes =
+                total_bytes.saturating_add(fs::metadata(&dst).map(|m| m.len()).unwrap_or(0));
             source_path_map.insert(src.clone(), path_to_string(&dst));
         }
     }
@@ -1452,13 +1442,15 @@ fn export_dataset_bundle_impl(
             .and_then(|n| n.to_str())
             .unwrap_or("misc")
             .to_string();
-        let dst_dir = segments_out.join(&parent_name);
+        let dst_dir = if parent_name == "segments" {
+            segments_out.clone()
+        } else {
+            segments_out.join(&parent_name)
+        };
         fs::create_dir_all(&dst_dir).map_err(|err| err.to_string())?;
         let dst = dst_dir.join(&segment.segment_file_name);
         fs::copy(&src, &dst).map_err(|err| err.to_string())?;
-        total_bytes = total_bytes.saturating_add(
-            fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
-        );
+        total_bytes = total_bytes.saturating_add(fs::metadata(&dst).map(|m| m.len()).unwrap_or(0));
 
         let new_source = source_path_map
             .get(&segment.source_path)
@@ -1473,7 +1465,7 @@ fn export_dataset_bundle_impl(
 
     let system_prompt = options.system_prompt.clone().unwrap_or_default();
     let pair = options.pair_user_assistant.unwrap_or(true);
-    let user_use_source = options.use_source_audio_for_user.unwrap_or(true);
+    let user_use_source = options.use_source_audio_for_user.unwrap_or(false);
     let prefix = options.audio_file_prefix.clone().unwrap_or_default();
     // Always rewrite paths relative to the bundle root, so when the user
     // uploads the whole bundle to OSS the JSONL references line up.
@@ -1498,8 +1490,7 @@ fn export_dataset_bundle_impl(
     // Pretty records separated by a single newline (no blank line
     // between records). Each record is still a self-contained JSON
     // object — pretty over multiple lines, then `}\n{` between them.
-    fs::write(&jsonl_path, format!("{}\n", lines.join("\n")))
-        .map_err(|err| err.to_string())?;
+    fs::write(&jsonl_path, format!("{}\n", lines.join("\n"))).map_err(|err| err.to_string())?;
 
     // Also write project.json into the bundle so a downstream reviewer
     // (e.g. the Windows audit build) can resume editing with all
@@ -1565,7 +1556,11 @@ fn export_dataset_bundle_impl(
         } else {
             "├── source/          # 源音频原文件，供 user 角色引用\n"
         },
-        if source_path_map.is_empty() { "" } else { "source/ " }
+        if source_path_map.is_empty() {
+            ""
+        } else {
+            "source/ "
+        }
     );
     let _ = fs::write(&readme_path, readme);
 
@@ -1598,7 +1593,7 @@ fn export_segments_jsonl(
     let opts = options.unwrap_or_default();
     let system_prompt = opts.system_prompt.unwrap_or_default();
     let pair = opts.pair_user_assistant.unwrap_or(true);
-    let user_use_source = opts.use_source_audio_for_user.unwrap_or(true);
+    let user_use_source = opts.use_source_audio_for_user.unwrap_or(false);
     let prefix = opts.audio_file_prefix.unwrap_or_default();
     let input_root = opts.input_root.unwrap_or_default();
 
@@ -1738,10 +1733,29 @@ fn build_paired_jsonl(
     let mut lines = Vec::new();
     for key in order {
         let mut group = by_pair.get(&key).cloned().unwrap_or_default();
-        // Stable order within each role: by start_ms so the assistant
-        // sub-sentences come out in temporal order (and so the audio_file
-        // array matches the content array index by index).
-        group.sort_by_key(|s| s.start_ms);
+        // Stable order within each role: prefer the index encoded in the
+        // target file name, then fall back to start_ms so the audio_file
+        // array matches the content array index by index.
+        group.sort_by(|left, right| {
+            let left_parts = parse_segment_output_name(&left.segment_file_name);
+            let right_parts = parse_segment_output_name(&right.segment_file_name);
+            segment_role_order(left.role.as_deref())
+                .cmp(&segment_role_order(right.role.as_deref()))
+                .then(
+                    left_parts
+                        .as_ref()
+                        .and_then(|parts| parts.content_index)
+                        .unwrap_or(0)
+                        .cmp(
+                            &right_parts
+                                .as_ref()
+                                .and_then(|parts| parts.content_index)
+                                .unwrap_or(0),
+                        ),
+                )
+                .then(left.start_ms.cmp(&right.start_ms))
+                .then(left.segment_file_name.cmp(&right.segment_file_name))
+        });
 
         let user_segs: Vec<&SegmentRecord> = group
             .iter()
@@ -1805,23 +1819,19 @@ fn build_paired_jsonl(
         // boundary so we join with the empty string — adjacent segments
         // already include their own punctuation.
         if !user_segs.is_empty() {
-            let user_text = user_segs.iter().map(|s| pick_text(s)).collect::<Vec<_>>().join("");
+            let user_text = user_segs
+                .iter()
+                .map(|s| pick_text(s))
+                .collect::<Vec<_>>()
+                .join("");
             // Audio: when `user_use_source=true` (the demo default), point
             // at the un-split source file once. Otherwise emit the cut
             // pieces — single string when there's just one, array when
             // there are several.
             let audio_value: Value = if user_use_source {
-                Value::String(with_prefix(
-                    prefix,
-                    &user_segs[0].source_path,
-                    input_root,
-                ))
+                Value::String(with_prefix(prefix, &user_segs[0].source_path, input_root))
             } else if user_segs.len() == 1 {
-                Value::String(with_prefix(
-                    prefix,
-                    &user_segs[0].segment_path,
-                    input_root,
-                ))
+                Value::String(with_prefix(prefix, &user_segs[0].segment_path, input_root))
             } else {
                 Value::Array(
                     user_segs
@@ -1988,6 +1998,184 @@ fn compute_relative_for_oss(path: &str, input_root: &str) -> String {
         .to_string()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DatasetSourceName {
+    mode: String,
+    topic_id: u32,
+    role: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DialogueKey {
+    mode: String,
+    topic_id: u32,
+    round_index: u32,
+}
+
+#[derive(Clone, Debug)]
+struct SegmentOutputName {
+    key: DialogueKey,
+    content_index: Option<u32>,
+    role: String,
+}
+
+fn parse_dataset_source_audio_name(
+    path: &Path,
+    role_hint: Option<&str>,
+) -> Option<DatasetSourceName> {
+    let stem = path_file_stem(path);
+    let mode = dataset_mode(&stem)?;
+    let topic_id = last_number(&stem)?;
+    let role = role_hint
+        .map(|value| value.to_string())
+        .or_else(|| infer_role(path));
+
+    Some(DatasetSourceName {
+        mode,
+        topic_id,
+        role,
+    })
+}
+
+fn parse_segment_output_name(value: &str) -> Option<SegmentOutputName> {
+    let file_name = target_audio_file_name(value);
+    let stem = Path::new(&file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(file_name.as_str());
+    let re = Regex::new(r"^(文案演绎|自由演绎)_(\d+)_(\d+)(?:_(\d+))?_(陪聊|发音人)$")
+        .expect("valid output file name regex");
+    let caps = re.captures(stem)?;
+    let mode = caps.get(1)?.as_str().to_string();
+    let topic_id = caps.get(2)?.as_str().parse::<u32>().ok()?;
+    let round_index = caps.get(3)?.as_str().parse::<u32>().ok()?;
+    let content_index = caps
+        .get(4)
+        .and_then(|value| value.as_str().parse::<u32>().ok());
+    let role = role_from_label(caps.get(5)?.as_str())?;
+
+    Some(SegmentOutputName {
+        key: DialogueKey {
+            mode,
+            topic_id,
+            round_index,
+        },
+        content_index,
+        role,
+    })
+}
+
+fn build_segment_file_name(
+    input: &Path,
+    role_hint: Option<&str>,
+    target_file_names: &[String],
+    index: usize,
+    start_ms: u64,
+    end_ms: u64,
+) -> String {
+    if let Some(target) = target_file_names
+        .get(index)
+        .map(|value| normalize_target_file_name(value))
+        .filter(|value| !value.trim().is_empty())
+    {
+        return target;
+    }
+
+    if let Some(source) = parse_dataset_source_audio_name(input, role_hint) {
+        let round_index = index + 1;
+        match source.role.as_deref() {
+            Some("user") => {
+                return format!(
+                    "{}_{:04}_{:02}_陪聊.wav",
+                    source.mode, source.topic_id, round_index
+                );
+            }
+            Some("assistant") => {
+                return format!(
+                    "{}_{:04}_{:02}_{:02}_发音人.wav",
+                    source.mode, source.topic_id, round_index, 1
+                );
+            }
+            _ => {
+                return format!(
+                    "{}_{:04}_{:02}_{:02}.wav",
+                    source.mode, source.topic_id, round_index, 1
+                );
+            }
+        }
+    }
+
+    let safe_source = safe_name(&path_file_stem(input));
+    format!(
+        "{}_{:04}_{}-{}.wav",
+        safe_source,
+        index + 1,
+        start_ms,
+        end_ms
+    )
+}
+
+fn dataset_mode(value: &str) -> Option<String> {
+    ["文案演绎", "自由演绎"]
+        .iter()
+        .find(|mode| value.contains(**mode))
+        .map(|mode| (*mode).to_string())
+}
+
+fn last_number(value: &str) -> Option<u32> {
+    let mut current = String::new();
+    let mut last = None;
+
+    for ch in value.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            last = current.parse::<u32>().ok();
+            current.clear();
+        }
+    }
+
+    if !current.is_empty() {
+        last = current.parse::<u32>().ok();
+    }
+
+    last
+}
+
+fn role_from_label(value: &str) -> Option<String> {
+    match value {
+        "陪聊" => Some("user".to_string()),
+        "发音人" => Some("assistant".to_string()),
+        _ => None,
+    }
+}
+
+fn segment_role_order(role: Option<&str>) -> u8 {
+    match role {
+        Some("user") => 0,
+        Some("assistant") => 1,
+        _ => 2,
+    }
+}
+
+fn target_audio_file_name(value: &str) -> String {
+    value
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(value)
+        .to_string()
+}
+
+fn normalize_target_file_name(value: &str) -> String {
+    let file_name = target_audio_file_name(value);
+    if lower_extension(Path::new(&file_name)).as_deref() == Some("wav") {
+        file_name
+    } else {
+        format!("{}.wav", file_name.trim_end_matches('.'))
+    }
+}
+
 /// Group key for the "one dialogue turn = one JSONL line" rule.
 ///
 /// Two source filenames belong to the same dialogue turn when their stems
@@ -2017,10 +2205,17 @@ fn compute_relative_for_oss(path: &str, input_root: &str) -> String {
 /// role token (and one of the surrounding separators) is removed so the
 /// remaining text stays coherent.
 fn pair_key(segment: &SegmentRecord) -> String {
+    if let Some(parts) = parse_segment_output_name(&segment.segment_file_name) {
+        return format!(
+            "{}_{:04}_{:02}",
+            parts.key.mode, parts.key.topic_id, parts.key.round_index
+        );
+    }
+
     let stem = path_file_stem(Path::new(&segment.source_path));
     // (left_sep) (role) (right_sep | end)
-    let re = Regex::new(r"([_\-])(?:发音人|assistant|陪聊|user)(?:([_\-])|$)")
-        .expect("valid regex");
+    let re =
+        Regex::new(r"([_\-])(?:发音人|assistant|陪聊|user)(?:([_\-])|$)").expect("valid regex");
     let cleaned = re
         .replace(&stem, |caps: &regex::Captures| {
             // If a right separator was captured we're in the middle of
@@ -2092,8 +2287,7 @@ fn extract_turn_from_base(base: &str) -> (String, u32) {
 /// and lets `pair_key` align user/assistant turns automatically.
 fn split_role_suffix(stem: &str) -> (String, Option<String>) {
     // (left_sep) (role) (right_sep | end_of_string)
-    let re = Regex::new(r"([_\-])(发音人|assistant|陪聊|user)(?:([_\-])|$)")
-        .expect("valid regex");
+    let re = Regex::new(r"([_\-])(发音人|assistant|陪聊|user)(?:([_\-])|$)").expect("valid regex");
     if let Some(caps) = re.captures(stem) {
         let role = caps.get(2).unwrap().as_str().to_string();
         let whole = caps.get(0).unwrap();
@@ -2405,10 +2599,7 @@ fn recognize_segments_impl(
                     let raw = match read_whisper_json_text(&output_dir_clone, &segment_path) {
                         Ok(r) => r,
                         Err(err) => {
-                            eprintln!(
-                                "[whisper-{}] missing output for {}: {}",
-                                w, segment.id, err
-                            );
+                            eprintln!("[whisper-{}] missing output for {}: {}", w, segment.id, err);
                             continue;
                         }
                     };
@@ -2643,14 +2834,8 @@ fn recognize_segments_impl(
                         }
                     };
                     let started = Instant::now();
-                    let res = polish_text(
-                        &url,
-                        &mdl,
-                        &prompt,
-                        &task.raw_text,
-                        &task.role,
-                        &task.hint,
-                    );
+                    let res =
+                        polish_text(&url, &mdl, &prompt, &task.raw_text, &task.role, &task.hint);
                     let elapsed_ms = started.elapsed().as_millis();
                     eprintln!(
                         "[polish] {} · {} · {:.1}s · {}",
@@ -3213,7 +3398,7 @@ fn parse_manifest_text(data: &str) -> Vec<ManifestRecord> {
             continue;
         };
         let role = caps.get(1).map(|value| value.as_str()).unwrap_or_default();
-        if role != "user" && role != "assistant" {
+        if role != "user" && role != "assistant" && role != "system" {
             continue;
         }
 
@@ -3307,6 +3492,70 @@ fn match_manifest<'a>(path: &Path, records: &'a [ManifestRecord]) -> Option<&'a 
     })
 }
 
+fn matching_manifest_records_for_source<'a>(
+    path: &Path,
+    role_hint: Option<&str>,
+    records: &'a [ManifestRecord],
+) -> Vec<&'a ManifestRecord> {
+    let Some(source) = parse_dataset_source_audio_name(path, role_hint) else {
+        return Vec::new();
+    };
+
+    records
+        .iter()
+        .filter(|record| {
+            if record.role != "user" && record.role != "assistant" {
+                return false;
+            }
+            if source
+                .role
+                .as_deref()
+                .is_some_and(|role| role != record.role)
+            {
+                return false;
+            }
+
+            let Some(audio_file) = record.audio_file.as_deref() else {
+                return false;
+            };
+            let Some(target) = parse_segment_output_name(audio_file) else {
+                return false;
+            };
+
+            target.key.mode == source.mode
+                && target.key.topic_id == source.topic_id
+                && target.role == record.role
+        })
+        .collect()
+}
+
+fn joined_manifest_content(records: &[&ManifestRecord]) -> Option<String> {
+    let content = records
+        .iter()
+        .map(|record| record.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
+fn merged_manifest_emotion(records: &[&ManifestRecord]) -> Vec<String> {
+    let mut values = Vec::new();
+    for record in records {
+        for emotion in &record.emotion {
+            if !values.contains(emotion) {
+                values.push(emotion.clone());
+            }
+        }
+    }
+    values
+}
+
 fn normalize_name(value: &str) -> String {
     value
         .chars()
@@ -3330,10 +3579,7 @@ fn normalize_name(value: &str) -> String {
 /// `-user`, `.user`, or whole-stem `user`) — substring `user` inside a
 /// longer ASCII token is ignored.
 fn infer_role(path: &Path) -> Option<String> {
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let parent_name = path
         .parent()
         .and_then(|p| p.file_name())
@@ -3813,6 +4059,77 @@ mod tests {
     }
 
     #[test]
+    fn builds_dataset_segment_names_from_source_names_and_manifest_targets() {
+        let assistant = Path::new("/tmp/长沙方言-0413-自由演绎-发音人-惊讶1.wav");
+        assert_eq!(
+            build_segment_file_name(assistant, Some("assistant"), &[], 0, 0, 1000),
+            "自由演绎_0001_01_01_发音人.wav"
+        );
+
+        let user = Path::new("/tmp/长沙方言-0413-文案演绎-陪聊-话题12.wav");
+        assert_eq!(
+            build_segment_file_name(user, Some("user"), &[], 2, 0, 1000),
+            "文案演绎_0012_03_陪聊.wav"
+        );
+
+        let targets = vec!["oss://bucket/WAV/自由演绎_0001_01_02_发音人.wav".to_string()];
+        assert_eq!(
+            build_segment_file_name(assistant, Some("assistant"), &targets, 0, 0, 1000),
+            "自由演绎_0001_01_02_发音人.wav"
+        );
+    }
+
+    #[test]
+    fn paired_export_groups_by_dataset_segment_file_name() {
+        let user = SegmentRecord {
+            id: "u".to_string(),
+            source_path: "/input/长沙方言-0413-自由演绎-陪聊-惊讶1.wav".to_string(),
+            source_file_name: "长沙方言-0413-自由演绎-陪聊-惊讶1.wav".to_string(),
+            segment_path: "/out/segments/自由演绎_0001_01_陪聊.wav".to_string(),
+            segment_file_name: "自由演绎_0001_01_陪聊.wav".to_string(),
+            role: Some("user".to_string()),
+            start_ms: 0,
+            end_ms: 1000,
+            duration_ms: 1000,
+            original_text: "你好".to_string(),
+            phonetic_text: "你好".to_string(),
+            emotion: Vec::new(),
+            tags: Vec::new(),
+            notes: String::new(),
+        };
+        let assistant = SegmentRecord {
+            id: "a".to_string(),
+            source_path: "/input/长沙方言-0413-自由演绎-发音人-惊讶1.wav".to_string(),
+            source_file_name: "长沙方言-0413-自由演绎-发音人-惊讶1.wav".to_string(),
+            segment_path: "/out/segments/自由演绎_0001_01_01_发音人.wav".to_string(),
+            segment_file_name: "自由演绎_0001_01_01_发音人.wav".to_string(),
+            role: Some("assistant".to_string()),
+            start_ms: 0,
+            end_ms: 1000,
+            duration_ms: 1000,
+            original_text: "好嘞".to_string(),
+            phonetic_text: "好嘞".to_string(),
+            emotion: vec!["中立".to_string()],
+            tags: Vec::new(),
+            notes: String::new(),
+        };
+
+        let lines = build_paired_jsonl(&[user, assistant], "长沙本地人", false, "", "")
+            .expect("paired jsonl");
+        assert_eq!(lines.len(), 1);
+        let value: Value = serde_json::from_str(&lines[0]).expect("valid json");
+        let messages = value["messages"].as_array().expect("messages");
+        assert_eq!(
+            messages[1]["audio_file"],
+            "/out/segments/自由演绎_0001_01_陪聊.wav"
+        );
+        assert_eq!(
+            messages[2]["audio_file"],
+            "/out/segments/自由演绎_0001_01_01_发音人.wav"
+        );
+    }
+
+    #[test]
     fn split_role_suffix_recognizes_known_markers() {
         // End position, `_` separator (demo convention).
         assert_eq!(
@@ -3886,10 +4203,7 @@ mod tests {
         );
 
         // Single-digit suffixes don't match (must be exactly 2 digits).
-        assert_eq!(
-            extract_turn_from_base("foo_5"),
-            ("foo_5".to_string(), 1),
-        );
+        assert_eq!(extract_turn_from_base("foo_5"), ("foo_5".to_string(), 1),);
     }
 
     #[test]
@@ -3956,6 +4270,8 @@ mod tests {
         let assistant_turn2 = SegmentRecord {
             source_path: "/audio/自由演绎_0001_02_发音人.wav".into(),
             source_file_name: "自由演绎_0001_02_发音人.wav".into(),
+            segment_path: "/segments/自由演绎_0001_02_01_发音人.wav".into(),
+            segment_file_name: "自由演绎_0001_02_01_发音人.wav".into(),
             ..assistant.clone()
         };
         assert_eq!(pair_key(&assistant_turn2), "自由演绎_0001_02");
@@ -3971,11 +4287,7 @@ mod tests {
         let mk = |path: &str, role: &str| SegmentRecord {
             id: "x".into(),
             source_path: path.into(),
-            source_file_name: path
-                .rsplit('/')
-                .next()
-                .unwrap_or(path)
-                .to_string(),
+            source_file_name: path.rsplit('/').next().unwrap_or(path).to_string(),
             segment_path: "/segments/x.wav".into(),
             segment_file_name: "x.wav".into(),
             role: Some(role.into()),
@@ -4077,14 +4389,10 @@ mod tests {
     /// and use delimiter-bounded matching for ASCII keywords.
     #[test]
     fn infer_role_ignores_macos_users_in_path() {
-        let p = Path::new(
-            "/Users/sunpeak/Work/dialect/长沙方言/发音人/长沙方言-话题1.wav",
-        );
+        let p = Path::new("/Users/sunpeak/Work/dialect/长沙方言/发音人/长沙方言-话题1.wav");
         assert_eq!(infer_role(p).as_deref(), Some("assistant"));
 
-        let p = Path::new(
-            "/Users/sunpeak/Work/dialect/长沙方言/陪聊/长沙方言-话题1.wav",
-        );
+        let p = Path::new("/Users/sunpeak/Work/dialect/长沙方言/陪聊/长沙方言-话题1.wav");
         assert_eq!(infer_role(p).as_deref(), Some("user"));
 
         // Filename token wins when the parent dir doesn't have a role hint.
@@ -4145,8 +4453,7 @@ mod tests {
             make_assistant(3, "句三", "中立"),
         ];
 
-        let lines = build_paired_jsonl(&segments, "system话", true, "", "")
-            .expect("paired");
+        let lines = build_paired_jsonl(&segments, "system话", true, "", "").expect("paired");
         assert_eq!(lines.len(), 1, "all four segments fold into one line");
 
         let value: Value = serde_json::from_str(&lines[0]).expect("valid json");
@@ -4230,6 +4537,7 @@ mod tests {
             Some("assistant".to_string()),
             Some("ka".to_string()),
             Some(vec!["neutral".to_string()]),
+            Vec::new(),
         )
         .expect("audio should be cut");
 
@@ -4281,6 +4589,7 @@ mod tests {
             path: "speaker/free_001.wav".to_string(),
             file_name: "free_001.wav".to_string(),
             role: Some("assistant".to_string()),
+            target_file_names: Vec::new(),
             duration_ms: None,
             sample_rate: None,
             channels: None,

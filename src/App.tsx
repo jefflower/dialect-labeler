@@ -54,6 +54,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [folderPath, setFolderPath] = useState("");
+  const [manifestPath, setManifestPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
   const [exportJsonlPath, setExportJsonlPath] = useState("");
   const [scan, setScan] = useState<ProjectScan | null>(null);
@@ -427,6 +428,14 @@ function App() {
     if (typeof selected === "string") setOutputPath(selected);
   }
 
+  async function chooseManifestFile() {
+    const selected = await openDialog({
+      multiple: false,
+      filters: [{ name: "JSONL", extensions: ["jsonl"] }],
+    });
+    if (typeof selected === "string") setManifestPath(selected);
+  }
+
   async function chooseExportJsonl() {
     const selected = await saveDialog({
       filters: [{ name: "JSONL", extensions: ["jsonl"] }],
@@ -456,7 +465,7 @@ function App() {
       await waitForPaint();
       const result = await ipc.scanProjectFolder({
         folderPath,
-        manifestPath: null,
+        manifestPath: manifestPath.trim() || null,
         outputPath: outputPath.trim() || null,
       });
       setScan(result);
@@ -470,6 +479,9 @@ function App() {
       // sourcePath to the current scan's audio.path so all subsequent
       // operations (LLM polish, export) work without further path drift.
       const existing = result.existingProject ?? null;
+      const manifestSystemPrompt = result.manifestRecords.find(
+        (record) => record.role === "system",
+      )?.content;
       const audioByAbsPath = new Map(
         result.audioFiles.map((audio) => [audio.path, audio]),
       );
@@ -527,6 +539,8 @@ function App() {
       if (existing?.config) setConfig(existing.config);
       if (existing?.systemPrompt) {
         updateSettings({ systemPrompt: existing.systemPrompt });
+      } else if (manifestSystemPrompt) {
+        updateSettings({ systemPrompt: manifestSystemPrompt });
       }
 
       const cutSourcePaths = new Set(
@@ -608,6 +622,7 @@ function App() {
         role: audio.role ?? null,
         originalText: audio.matchedText ?? "",
         emotion: audio.matchedEmotion ?? [],
+        targetFileNames: audio.targetFileNames ?? [],
       });
       created.push(...newSegs);
       setSegments((current) => [
@@ -710,6 +725,7 @@ function App() {
         role: audio.role ?? null,
         originalText: audio.matchedText ?? "",
         emotion: audio.matchedEmotion ?? [],
+        targetFileNames: audio.targetFileNames ?? [],
       });
       setSegments((current) => [
         ...current.filter((segment) => segment.sourcePath !== audio.path),
@@ -1277,7 +1293,7 @@ function App() {
         options: {
           systemPrompt: settings.systemPrompt,
           pairUserAssistant: settings.pairUserAssistant,
-          useSourceAudioForUser: true,
+          useSourceAudioForUser: false,
           audioFilePrefix: settings.audioFilePrefix,
           inputRoot: scan.rootPath,
         },
@@ -1326,7 +1342,7 @@ function App() {
         options: {
           systemPrompt: settings.systemPrompt,
           pairUserAssistant: settings.pairUserAssistant,
-          useSourceAudioForUser: true,
+          useSourceAudioForUser: false,
           audioFilePrefix: settings.audioFilePrefix,
         },
       });
@@ -1791,14 +1807,17 @@ function App() {
         <div className="app-body">
           <SetupBand
             folderPath={folderPath}
+            manifestPath={manifestPath}
             outputPath={outputPath}
             exportJsonlPath={exportJsonlPath}
             autoCutAfterScan={autoCutAfterScan}
             busy={busy}
             onFolderPathChange={setFolderPath}
+            onManifestPathChange={setManifestPath}
             onOutputPathChange={setOutputPath}
             onExportPathChange={setExportJsonlPath}
             onChooseFolder={chooseFolder}
+            onChooseManifest={chooseManifestFile}
             onChooseOutput={chooseOutputFolder}
             onChooseExport={chooseExportJsonl}
             onAutoCutChange={setAutoCutAfterScan}

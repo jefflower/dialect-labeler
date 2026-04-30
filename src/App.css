@@ -430,7 +430,7 @@ button:disabled {
 
 .setup-grid {
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) minmax(240px, 1fr) minmax(240px, 1fr) auto auto;
+  grid-template-columns: repeat(2, minmax(260px, 1fr)) auto auto;
   gap: var(--space-5);
   padding: var(--space-5);
   align-items: end;

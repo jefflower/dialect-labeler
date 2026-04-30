@@ -3,14 +3,17 @@ import { REVIEW_ONLY } from "../env";
 
 type SetupBandProps = {
   folderPath: string;
+  manifestPath: string;
   outputPath: string;
   exportJsonlPath: string;
   autoCutAfterScan: boolean;
   busy: boolean;
   onFolderPathChange: (value: string) => void;
+  onManifestPathChange: (value: string) => void;
   onOutputPathChange: (value: string) => void;
   onExportPathChange: (value: string) => void;
   onChooseFolder: () => void;
+  onChooseManifest: () => void;
   onChooseOutput: () => void;
   onChooseExport: () => void;
   onAutoCutChange: (value: boolean) => void;
@@ -45,6 +48,20 @@ export function SetupBand(props: SetupBandProps) {
             />
             <button onClick={props.onChooseOutput} disabled={props.busy}>
               <FolderOpen size={14} />
+              选择
+            </button>
+          </div>
+        </label>
+        <label>
+          <span>文案 JSONL</span>
+          <div className="path-row">
+            <input
+              value={props.manifestPath}
+              onChange={(event) => props.onManifestPathChange(event.target.value)}
+              placeholder="可选：用于匹配轮次、文本和目标音频名"
+            />
+            <button onClick={props.onChooseManifest} disabled={props.busy}>
+              <FileJson size={14} />
               选择
             </button>
           </div>
