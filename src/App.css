@@ -387,6 +387,48 @@ button:disabled {
   opacity: 0.85;
 }
 
+/* Role-split duration row right under each pane header — surfaces the
+   spec-required split between 陪聊 (user) and 发音人 (assistant), since
+   "有效时长不包含陪聊时长" makes the assistant total the more important
+   number to track. */
+.pane-role-totals {
+  display: flex;
+  gap: var(--space-3);
+  padding: 6px var(--space-4);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: var(--text-xs);
+}
+.role-total {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  flex: 1;
+  padding: 3px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-1, var(--surface));
+}
+.role-total.user {
+  border-left: 3px solid var(--role-user, #c9a76a);
+}
+.role-total.assistant {
+  border-left: 3px solid var(--role-assistant, #5b9bd5);
+}
+.role-total .role-label {
+  color: var(--text-tertiary);
+  letter-spacing: 0.04em;
+}
+.role-total strong {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  font-weight: var(--weight-medium);
+}
+.role-total .role-count {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  margin-left: auto;
+}
+
 .badge-role {
   display: inline-flex;
   align-items: center;

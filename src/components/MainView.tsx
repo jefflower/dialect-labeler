@@ -143,6 +143,38 @@ export function MainView(props: MainViewProps) {
     [props.segments],
   );
 
+  // Per-role breakdown — the spec calls out 陪聊 (user) vs 发音人
+  // (assistant) durations separately because "有效时长不包含陪聊时长".
+  // Splitting both source-audio and segment totals lets reviewers verify
+  // the spec at a glance without doing arithmetic.
+  const audioByRole = useMemo(() => {
+    let user = 0;
+    let assistant = 0;
+    for (const audio of props.scan?.audioFiles ?? []) {
+      const ms = audio.durationMs ?? 0;
+      if (audio.role === "user") user += ms;
+      else if (audio.role === "assistant") assistant += ms;
+    }
+    return { user, assistant };
+  }, [props.scan?.audioFiles]);
+  const segmentByRole = useMemo(() => {
+    const stats = {
+      user: { ms: 0, count: 0 },
+      assistant: { ms: 0, count: 0 },
+    };
+    for (const s of props.segments) {
+      const ms = s.durationMs ?? 0;
+      if (s.role === "user") {
+        stats.user.ms += ms;
+        stats.user.count += 1;
+      } else if (s.role === "assistant") {
+        stats.assistant.ms += ms;
+        stats.assistant.count += 1;
+      }
+    }
+    return stats;
+  }, [props.segments]);
+
   // Two-stage progress per audio file:
   //   asrDone    — segments with non-empty phoneticText (Whisper landed)
   //   polishDone — segments with a non-empty emotion array (Ollama polished)
@@ -191,16 +223,23 @@ export function MainView(props: MainViewProps) {
           </h2>
           <span
             className="pane-total"
-            title={`原始音频累计时长 ${formatLongDuration(audioTotalMs)} · 切割后累计 ${formatLongDuration(segmentTotalMs)}（${props.segments.length} 段）`}
+            title={`原始音频：陪聊 ${formatLongDuration(audioByRole.user)} · 发音人 ${formatLongDuration(audioByRole.assistant)} · 共 ${formatLongDuration(audioTotalMs)}`}
           >
             ⏱ {formatLongDuration(audioTotalMs)}
-            {segmentTotalMs > 0 && (
-              <span className="pane-total-sub">
-                · 切割 {formatLongDuration(segmentTotalMs)} / {props.segments.length} 段
-              </span>
-            )}
           </span>
         </div>
+        {(audioByRole.user > 0 || audioByRole.assistant > 0) && (
+          <div className="pane-role-totals" title="原音频按角色累计时长">
+            <span className="role-total user">
+              <span className="role-label">陪聊</span>
+              <strong>{formatLongDuration(audioByRole.user)}</strong>
+            </span>
+            <span className="role-total assistant">
+              <span className="role-label">发音人</span>
+              <strong>{formatLongDuration(audioByRole.assistant)}</strong>
+            </span>
+          </div>
+        )}
         <div className="pane-search">
           <div className="search-input">
             <Search size={14} />
@@ -312,12 +351,33 @@ export function MainView(props: MainViewProps) {
           {segmentTotalMs > 0 && (
             <span
               className="pane-total"
-              title="当前所选音频里所有切割片段时长合计"
+              title={`切割段累计：陪聊 ${formatLongDuration(segmentByRole.user.ms)}（${segmentByRole.user.count} 段）· 发音人 ${formatLongDuration(segmentByRole.assistant.ms)}（${segmentByRole.assistant.count} 段）· 共 ${formatLongDuration(segmentTotalMs)}（${props.segments.length} 段）`}
             >
               ⏱ {formatLongDuration(segmentTotalMs)}
             </span>
           )}
         </div>
+        {(segmentByRole.user.count > 0 || segmentByRole.assistant.count > 0) && (
+          <div
+            className="pane-role-totals"
+            title="切割段按角色累计时长 — 规范要求陪聊与发音人分开统计；有效时长不含陪聊"
+          >
+            <span className="role-total user">
+              <span className="role-label">陪聊</span>
+              <strong>{formatLongDuration(segmentByRole.user.ms)}</strong>
+              <span className="role-count">{segmentByRole.user.count} 段</span>
+            </span>
+            <span className="role-total assistant">
+              <span className="role-label">发音人</span>
+              <strong>
+                {formatLongDuration(segmentByRole.assistant.ms)}
+              </strong>
+              <span className="role-count">
+                {segmentByRole.assistant.count} 段
+              </span>
+            </span>
+          </div>
+        )}
         <div className="player-bar">
           <div className="player-bar-top">
             <button
