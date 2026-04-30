@@ -1855,15 +1855,16 @@ fn build_paired_jsonl(
         }
 
         // --- user message ---
-        // Text: concatenate all user sub-segments. Chinese has no word
-        // boundary so we join with the empty string — adjacent segments
-        // already include their own punctuation.
+        // Text: when user audio is emitted as cut pieces, content must mirror
+        // audio_file one by one. If the legacy "use source audio for user"
+        // option is enabled, keep the old single-string shape.
         if !user_segs.is_empty() {
-            let user_text = user_segs
-                .iter()
-                .map(|s| pick_text(s))
-                .collect::<Vec<_>>()
-                .join("");
+            let user_texts = user_segs.iter().map(|s| pick_text(s)).collect::<Vec<_>>();
+            let content_value: Value = if user_use_source || user_segs.len() == 1 {
+                Value::String(user_texts.join(""))
+            } else {
+                Value::Array(user_texts.into_iter().map(Value::String).collect())
+            };
             // Audio: when `user_use_source=true` (the demo default), point
             // at the un-split source file once. Otherwise emit the cut
             // pieces — single string when there's just one, array when
@@ -1882,7 +1883,7 @@ fn build_paired_jsonl(
             };
             messages.push(json!({
                 "role": "user",
-                "content": user_text,
+                "content": content_value,
                 "audio_file": audio_value,
             }));
         }
@@ -4848,6 +4849,73 @@ mod tests {
 
         let emotions = assistant_msg["emotion"].as_array().unwrap();
         assert_eq!(emotions, &vec![json!("中立"), json!("开心"), json!("中立")]);
+    }
+
+    #[test]
+    fn export_paired_mirrors_multi_user_content_and_audio_arrays() {
+        let make_segment = |role: &str, index: u64, text: &str| SegmentRecord {
+            id: format!("{}_{}", role, index),
+            source_path: format!("/audio/文案演绎_0001_04_{}.wav", role),
+            source_file_name: format!("文案演绎_0001_04_{}.wav", role),
+            segment_path: format!(
+                "/segments/文案演绎_0001_04_{:02}_{}.wav",
+                index,
+                if role == "user" {
+                    "陪聊"
+                } else {
+                    "发音人"
+                }
+            ),
+            segment_file_name: format!(
+                "文案演绎_0001_04_{:02}_{}.wav",
+                index,
+                if role == "user" {
+                    "陪聊"
+                } else {
+                    "发音人"
+                }
+            ),
+            role: Some(role.to_string()),
+            start_ms: index * 1000,
+            end_ms: index * 1000 + 800,
+            duration_ms: 800,
+            original_text: String::new(),
+            phonetic_text: text.to_string(),
+            emotion: if role == "assistant" {
+                vec!["中立".to_string()]
+            } else {
+                Vec::new()
+            },
+            tags: Vec::new(),
+            notes: String::new(),
+        };
+
+        let segments = vec![
+            make_segment("user", 1, "陪聊第一段"),
+            make_segment("user", 2, "陪聊第二段"),
+            make_segment("assistant", 1, "发音人第一段"),
+        ];
+
+        let lines = build_paired_jsonl(&segments, "", false, "", "").expect("paired");
+        let value: Value = serde_json::from_str(&lines[0]).expect("valid json");
+        let messages = value["messages"].as_array().unwrap();
+        let user_msg = &messages[0];
+        let user_content = user_msg["content"].as_array().unwrap();
+        let user_audio = user_msg["audio_file"].as_array().unwrap();
+
+        assert_eq!(
+            user_content,
+            &vec![json!("陪聊第一段"), json!("陪聊第二段")]
+        );
+        assert_eq!(user_audio.len(), 2);
+        assert!(user_audio[0]
+            .as_str()
+            .unwrap()
+            .ends_with("文案演绎_0001_04_01_陪聊.wav"));
+        assert!(user_audio[1]
+            .as_str()
+            .unwrap()
+            .ends_with("文案演绎_0001_04_02_陪聊.wav"));
     }
 
     #[test]
