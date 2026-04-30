@@ -15,6 +15,61 @@ import type {
 } from "../types";
 import { roleLabels } from "../defaults";
 import { formatClock, formatDuration, formatLongDuration, formatMsRange } from "../lib";
+
+/// Pull `(turn_number, group_key, topic)` out of a segment file name.
+///
+/// Filename layouts produced by the cutter (per dataset spec):
+///   `<base>_<topic>_<turn:NN>_<sub:NN>_<role>.wav` — multi-segment turn
+///   `<base>_<topic>_<turn:NN>_<role>.wav`         — single-segment turn
+///   `<source>_<NNNN>.wav`                          — legacy / no role
+///
+/// We strip the trailing `_<role>` (with `_` or `-` separator), then look
+/// for the trailing 2-digit turn number — optionally followed by a
+/// 2-digit sub-index. `groupKey` is the prefix up to and including the
+/// turn number, so all segments from the same (base, turn) collapse to
+/// one key (matching the export-time `pair_key` semantics on the
+/// frontend side).
+function extractTurnInfo(fileName: string): {
+  turn: number | null;
+  groupKey: string;
+  topic: string;
+} {
+  const stem = fileName.replace(/\.wav$/i, "");
+  const roleStripped = stem.replace(
+    /[_-](?:发音人|陪聊|assistant|user)$/i,
+    "",
+  );
+  // Multi-segment: <base>_<turn>_<sub>
+  const multi = roleStripped.match(/^(.+?)_(\d{2})_(\d{2})$/);
+  if (multi) {
+    return {
+      turn: parseInt(multi[2], 10),
+      groupKey: `${multi[1]}_${multi[2]}`,
+      topic: multi[1],
+    };
+  }
+  // Single-segment: <base>_<turn>
+  const single = roleStripped.match(/^(.+?)_(\d{2})$/);
+  if (single) {
+    return {
+      turn: parseInt(single[2], 10),
+      groupKey: `${single[1]}_${single[2]}`,
+      topic: single[1],
+    };
+  }
+  // Legacy `<source>_<NNNN>.wav` — no spec-style turn marker.
+  return { turn: null, groupKey: stem, topic: stem };
+}
+
+/// Cheap "topic display name" extraction — pulls the last `话题N`-like
+/// chunk out of the topic string for the group header label, falling
+/// back to the last `_`/`-` delimited token, then to the whole string.
+function topicDisplayName(topic: string): string {
+  const m = topic.match(/(话题\d+|_(\d{4})$)/);
+  if (m) return m[0].replace(/^_/, "");
+  const parts = topic.split(/[_\-]/);
+  return parts[parts.length - 1] || topic;
+}
 import { Waveform } from "./Waveform";
 import { EmptyState } from "./EmptyState";
 
@@ -184,7 +239,12 @@ export function MainView(props: MainViewProps) {
                     {roleLabels[audio.role ?? "unknown"]}
                   </span>
                   <span className="dot">·</span>
-                  <span>{formatDuration(audio.durationMs)}</span>
+                  <span
+                    className="audio-duration"
+                    title="原音频总时长"
+                  >
+                    {formatDuration(audio.durationMs)}
+                  </span>
                   <span className="dot">·</span>
                   <span>{audio.sampleRate ? `${audio.sampleRate}Hz` : "—"}</span>
                   <span className="dot">·</span>
@@ -330,42 +390,104 @@ export function MainView(props: MainViewProps) {
               }
             />
           )}
-          {filteredSegments.map((segment, index) => {
-            return (
-              <button
-                key={segment.id}
-                className={`segment-row ${segment.id === props.selectedSegmentId ? "active" : ""}`}
-                onClick={() => props.onSelectSegment(segment)}
-                title={segment.segmentFileName}
-              >
-                <span className="segment-index">
-                  {String(index + 1).padStart(2, "0")}
-                </span>
-                <span
-                  className={`segment-text ${segment.phoneticText ? "" : "empty"}`}
+          {(() => {
+            // Walk segments in order, opening a new group whenever the
+            // (base, turn) key changes. Each group gets:
+            //   - a header banner with its topic + turn label, segment
+            //     count, and total duration
+            //   - alternating background tint (turn-even / turn-odd) so
+            //     adjacent groups are visually distinct
+            // Segment rows themselves carry the same tint plus a duration
+            // chip so reviewers can spot outlier-length segments fast.
+            const rows: React.ReactNode[] = [];
+            let prevKey: string | null = null;
+            let groupIndex = -1;
+            // Pre-compute total duration per group so the header can show
+            // it without a second pass.
+            const groupTotals = new Map<string, { ms: number; count: number }>();
+            for (const segment of filteredSegments) {
+              const info = extractTurnInfo(segment.segmentFileName);
+              const entry =
+                groupTotals.get(info.groupKey) ?? { ms: 0, count: 0 };
+              entry.ms += segment.durationMs ?? 0;
+              entry.count += 1;
+              groupTotals.set(info.groupKey, entry);
+            }
+            filteredSegments.forEach((segment, index) => {
+              const info = extractTurnInfo(segment.segmentFileName);
+              const isNewGroup = info.groupKey !== prevKey;
+              if (isNewGroup) {
+                groupIndex += 1;
+                prevKey = info.groupKey;
+              }
+              const parity = groupIndex % 2 === 0 ? "even" : "odd";
+              if (isNewGroup) {
+                const total = groupTotals.get(info.groupKey) ?? {
+                  ms: 0,
+                  count: 0,
+                };
+                const turnLabel =
+                  info.turn !== null
+                    ? `第 ${String(info.turn).padStart(2, "0")} 轮`
+                    : "未编号";
+                rows.push(
+                  <div
+                    key={`hdr-${info.groupKey}`}
+                    className={`segment-group-header turn-${parity}`}
+                    title={info.groupKey}
+                  >
+                    <span className="group-label">
+                      {topicDisplayName(info.topic)} · {turnLabel}
+                    </span>
+                    <span className="group-stats">
+                      {total.count} 段 · {formatLongDuration(total.ms)}
+                    </span>
+                  </div>,
+                );
+              }
+              rows.push(
+                <button
+                  key={segment.id}
+                  className={`segment-row turn-${parity} ${segment.id === props.selectedSegmentId ? "active" : ""}`}
+                  onClick={() => props.onSelectSegment(segment)}
+                  title={segment.segmentFileName}
                 >
-                  {segment.phoneticText ||
-                    segment.originalText ||
-                    "未标注"}
-                </span>
-                <span className="segment-time">
-                  {formatMsRange(segment.startMs, segment.endMs)}
-                </span>
-                <div className="segment-meta-row">
-                  {segment.emotion.map((e) => (
-                    <span className="segment-tag emotion" key={e}>
-                      {e}
-                    </span>
-                  ))}
-                  {segment.tags.map((t) => (
-                    <span className={`segment-tag tag-${t}`} key={t}>
-                      {t}
-                    </span>
-                  ))}
-                </div>
-              </button>
-            );
-          })}
+                  <span className="segment-index">
+                    {String(index + 1).padStart(2, "0")}
+                  </span>
+                  <span
+                    className={`segment-text ${segment.phoneticText ? "" : "empty"}`}
+                  >
+                    {segment.phoneticText ||
+                      segment.originalText ||
+                      "未标注"}
+                  </span>
+                  <span className="segment-time">
+                    {formatMsRange(segment.startMs, segment.endMs)}
+                  </span>
+                  <span
+                    className="segment-duration"
+                    title="本段时长"
+                  >
+                    {formatClock(segment.durationMs)}
+                  </span>
+                  <div className="segment-meta-row">
+                    {segment.emotion.map((e) => (
+                      <span className="segment-tag emotion" key={e}>
+                        {e}
+                      </span>
+                    ))}
+                    {segment.tags.map((t) => (
+                      <span className={`segment-tag tag-${t}`} key={t}>
+                        {t}
+                      </span>
+                    ))}
+                  </div>
+                </button>,
+              );
+            });
+            return rows;
+          })()}
         </div>
       </section>
 
