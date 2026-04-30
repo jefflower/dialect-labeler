@@ -54,7 +54,6 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [folderPath, setFolderPath] = useState("");
-  const [manifestPath, setManifestPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
   const [exportJsonlPath, setExportJsonlPath] = useState("");
   const [scan, setScan] = useState<ProjectScan | null>(null);
@@ -428,14 +427,6 @@ function App() {
     if (typeof selected === "string") setOutputPath(selected);
   }
 
-  async function chooseManifestFile() {
-    const selected = await openDialog({
-      multiple: false,
-      filters: [{ name: "JSONL", extensions: ["jsonl"] }],
-    });
-    if (typeof selected === "string") setManifestPath(selected);
-  }
-
   async function chooseExportJsonl() {
     const selected = await saveDialog({
       filters: [{ name: "JSONL", extensions: ["jsonl"] }],
@@ -465,7 +456,6 @@ function App() {
       await waitForPaint();
       const result = await ipc.scanProjectFolder({
         folderPath,
-        manifestPath: manifestPath.trim() || null,
         outputPath: outputPath.trim() || null,
       });
       setScan(result);
@@ -1836,17 +1826,14 @@ function App() {
         <div className="app-body">
           <SetupBand
             folderPath={folderPath}
-            manifestPath={manifestPath}
             outputPath={outputPath}
             exportJsonlPath={exportJsonlPath}
             autoCutAfterScan={autoCutAfterScan}
             busy={busy}
             onFolderPathChange={setFolderPath}
-            onManifestPathChange={setManifestPath}
             onOutputPathChange={setOutputPath}
             onExportPathChange={setExportJsonlPath}
             onChooseFolder={chooseFolder}
-            onChooseManifest={chooseManifestFile}
             onChooseOutput={chooseOutputFolder}
             onChooseExport={chooseExportJsonl}
             onAutoCutChange={setAutoCutAfterScan}

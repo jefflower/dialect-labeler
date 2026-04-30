@@ -14,8 +14,8 @@ export const defaultCutConfig: CutConfig = {
   // Spec: 句首静音不超过 100ms（preRoll), 句尾静音不超过 200ms（postRoll).
   preRollMs: 100,
   postRollMs: 200,
-  // Spec: 单段最长不超过 30s — hard cap when no silence is detected.
-  maxSegmentMs: 30_000,
+  // 0 = no forced split. Dialogue rounds are kept by silence/timeline only.
+  maxSegmentMs: 0,
 };
 
 /**
@@ -34,14 +34,14 @@ export const defaultCutPresets: CutPresetDef[] = [
   {
     name: "演讲 / 朗读",
     builtin: true,
-    hint: "句间停顿明显，最短语音 1s，最长 30s 强制拆",
+    hint: "句间停顿明显，最短语音 1s，不按固定时长强制拆",
     config: {
       silenceDb: -38,
       minSilenceMs: 600,
       minSegmentMs: 1000,
       preRollMs: 80,
       postRollMs: 200,
-      maxSegmentMs: 30_000,
+      maxSegmentMs: 0,
     },
   },
   {
@@ -54,7 +54,7 @@ export const defaultCutPresets: CutPresetDef[] = [
       minSegmentMs: 200,
       preRollMs: 60,
       postRollMs: 140,
-      maxSegmentMs: 15_000,
+      maxSegmentMs: 0,
     },
   },
 ];

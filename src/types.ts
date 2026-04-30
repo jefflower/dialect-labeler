@@ -38,7 +38,7 @@ export type CutConfig = {
   minSegmentMs: number;
   preRollMs: number;
   postRollMs: number;
-  /** Hard upper bound; 0 = no cap. Default 30000 ms aligns with spec. */
+  /** Kept for project-file compatibility. The cutter no longer force-splits by length. */
   maxSegmentMs: number;
 };
 

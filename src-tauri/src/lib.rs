@@ -90,10 +90,8 @@ struct CutConfig {
     min_segment_ms: u64,
     pre_roll_ms: u64,
     post_roll_ms: u64,
-    /// Hard upper bound on segment duration. Any silence-bounded range that
-    /// exceeds this is force-split into ⌈len / max⌉ equal-ish chunks. Set to
-    /// 0 (or omit) to disable. Default 30000 ms aligns with the labeling
-    /// spec's "最长不超过 30s".
+    /// Kept for compatibility with existing project.json files. The cutter no
+    /// longer force-splits by length; dialogue timing is driven by silence.
     #[serde(default)]
     max_segment_ms: u64,
 }
@@ -1555,7 +1553,7 @@ fn export_dataset_bundle_impl(
             "minSegmentMs": 300,
             "preRollMs": 100,
             "postRollMs": 200,
-            "maxSegmentMs": 30000
+            "maxSegmentMs": 0
         },
         "audioFiles": Vec::<Value>::new(),
         "manifestRecords": Vec::<Value>::new(),
@@ -4095,31 +4093,6 @@ fn build_segment_ranges(
         ranges.push((0.0, duration_sec));
     }
 
-    // Enforce maxSegmentMs as a hard upper bound — any silence-free stretch
-    // longer than this gets force-split into N equal-ish chunks. The split
-    // doesn't try to land on natural boundaries (no silence info available),
-    // it just slices time uniformly. Users can still tweak silence params
-    // first; this is a safety net for the spec's 30s limit.
-    if config.max_segment_ms > 0 {
-        let max_sec = config.max_segment_ms as f64 / 1000.0;
-        let mut adjusted = Vec::with_capacity(ranges.len());
-        for (start, end) in ranges {
-            let len = end - start;
-            if len > max_sec {
-                let chunks = (len / max_sec).ceil() as usize;
-                let chunk_len = len / chunks as f64;
-                for i in 0..chunks {
-                    let cs = start + chunk_len * i as f64;
-                    let ce = (cs + chunk_len).min(end);
-                    adjusted.push((cs, ce));
-                }
-            } else {
-                adjusted.push((start, end));
-            }
-        }
-        return adjusted;
-    }
-
     ranges
 }
 
@@ -4951,9 +4924,9 @@ mod tests {
     }
 
     #[test]
-    fn max_segment_force_splits_overlong_ranges() {
-        // 50s of audio, no silence detected → one big range; with max=20s
-        // we expect ⌈50/20⌉ = 3 chunks of ~16.67s each.
+    fn max_segment_setting_does_not_force_split_ranges() {
+        // 50s of audio, no silence detected → one big range. max_segment_ms is
+        // retained for old project files but no longer forces uniform splitting.
         let config = CutConfig {
             silence_db: -35.0,
             min_silence_ms: 450,
@@ -4963,14 +4936,6 @@ mod tests {
             max_segment_ms: 20_000,
         };
         let ranges = build_segment_ranges(50.0, &[], &config);
-        assert_eq!(ranges.len(), 3);
-        assert!((ranges[0].1 - ranges[0].0 - 50.0 / 3.0).abs() < 0.001);
-        // No max → keeps the long single range.
-        let unbounded = CutConfig {
-            max_segment_ms: 0,
-            ..config
-        };
-        let ranges = build_segment_ranges(50.0, &[], &unbounded);
         assert_eq!(ranges.len(), 1);
     }
 

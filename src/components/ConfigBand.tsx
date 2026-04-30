@@ -86,14 +86,6 @@ const fields: ParamField[] = [
     max: 800,
     step: 20,
   },
-  {
-    key: "maxSegmentMs",
-    label: "最长片段",
-    unit: "ms",
-    hint: "硬上限：超过这个时长会强制等分。规范要求 ≤ 30000；填 0 则不限制",
-    min: 0,
-    step: 500,
-  },
 ];
 
 /** Two CutConfig objects equal? Used to detect "current = preset". */
@@ -103,8 +95,7 @@ function configEqual(a: CutConfig, b: CutConfig) {
     a.minSilenceMs === b.minSilenceMs &&
     a.minSegmentMs === b.minSegmentMs &&
     a.preRollMs === b.preRollMs &&
-    a.postRollMs === b.postRollMs &&
-    a.maxSegmentMs === b.maxSegmentMs
+    a.postRollMs === b.postRollMs
   );
 }
 

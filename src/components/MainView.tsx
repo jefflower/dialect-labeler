@@ -1,6 +1,5 @@
 import { useMemo, useState } from "react";
 import {
-  AlertTriangle,
   CheckCircle2,
   CircleDashed,
   Folder,
@@ -332,17 +331,12 @@ export function MainView(props: MainViewProps) {
             />
           )}
           {filteredSegments.map((segment, index) => {
-            const tooLong = segment.durationMs > 30_000;
             return (
               <button
                 key={segment.id}
                 className={`segment-row ${segment.id === props.selectedSegmentId ? "active" : ""}`}
                 onClick={() => props.onSelectSegment(segment)}
-                title={
-                  tooLong
-                    ? `${segment.segmentFileName} · 时长 ${(segment.durationMs / 1000).toFixed(1)}s 超过 30s 上限，建议手动拆分或调小切割阈值`
-                    : segment.segmentFileName
-                }
+                title={segment.segmentFileName}
               >
                 <span className="segment-index">
                   {String(index + 1).padStart(2, "0")}
@@ -355,24 +349,9 @@ export function MainView(props: MainViewProps) {
                     "未标注"}
                 </span>
                 <span className="segment-time">
-                  {tooLong && (
-                    <AlertTriangle
-                      size={12}
-                      style={{
-                        color: "var(--warning)",
-                        verticalAlign: "-2px",
-                        marginRight: 4,
-                      }}
-                    />
-                  )}
                   {formatMsRange(segment.startMs, segment.endMs)}
                 </span>
                 <div className="segment-meta-row">
-                  {tooLong && (
-                    <span className="segment-tag tag-overlong">
-                      &gt;30s
-                    </span>
-                  )}
                   {segment.emotion.map((e) => (
                     <span className="segment-tag emotion" key={e}>
                       {e}
