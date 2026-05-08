@@ -7,7 +7,10 @@ import type {
 } from "./types";
 
 export const defaultCutConfig: CutConfig = {
-  silenceDb: -35,
+  // Spec: anything quieter than -30dB at the head/tail is treated as
+  // silence (covers ambient noise + breath sounds, both of which the
+  // spec says should be trimmed). Stricter than the previous -35.
+  silenceDb: -30,
   // Spec: 句间静音段最长不超过 0.4s — anything longer is a cut point.
   minSilenceMs: 400,
   minSegmentMs: 300,

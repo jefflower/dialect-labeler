@@ -1704,11 +1704,16 @@ fn build_flat_jsonl(
         } else {
             json!(segment.phonetic_text.clone())
         };
-        let mut message = json!({
-            "role": role,
-            "content": content_value,
-            "audio_file": audio_path,
-        });
+        // Spec: user (陪聊) carries `content_refine`; assistant + system
+        // keep `content`. Build the message in the right order.
+        let content_key = if role == "user" {
+            "content_refine"
+        } else {
+            "content"
+        };
+        let mut message = json!({ "role": role });
+        message[content_key] = content_value;
+        message["audio_file"] = json!(audio_path);
         if !segment.emotion.is_empty() {
             message["emotion"] = json!(segment.emotion);
         }
@@ -1881,9 +1886,13 @@ fn build_paired_jsonl(
                         .collect(),
                 )
             };
+            // Per spec: user (陪聊) text uses `content_refine` rather
+            // than `content`. The chat-style `content` slot is reserved
+            // for the assistant's polished output; the user side carries
+            // a "refined" transcript suitable for re-prompting.
             messages.push(json!({
                 "role": "user",
-                "content": content_value,
+                "content_refine": content_value,
                 "audio_file": audio_value,
             }));
         }
@@ -1980,16 +1989,20 @@ fn build_single_message_line(
     } else {
         segment.phonetic_text.clone()
     };
-    let content = if role == "assistant" {
+    let content_value = if role == "assistant" {
         json!([text])
     } else {
         json!(text)
     };
-    let mut msg = json!({
-        "role": role,
-        "content": content,
-        "audio_file": with_prefix(prefix, &segment.segment_path, input_root),
-    });
+    // Spec: user (陪聊) carries `content_refine`; everyone else keeps `content`.
+    let content_key = if role == "user" {
+        "content_refine"
+    } else {
+        "content"
+    };
+    let mut msg = json!({ "role": role });
+    msg[content_key] = content_value;
+    msg["audio_file"] = json!(with_prefix(prefix, &segment.segment_path, input_root));
     if !segment.emotion.is_empty() {
         msg["emotion"] = json!(segment.emotion);
     }
@@ -4900,8 +4913,13 @@ mod tests {
         let value: Value = serde_json::from_str(&lines[0]).expect("valid json");
         let messages = value["messages"].as_array().unwrap();
         let user_msg = &messages[0];
-        let user_content = user_msg["content"].as_array().unwrap();
+        // Spec: user side is `content_refine`, not `content`.
+        let user_content = user_msg["content_refine"].as_array().unwrap();
         let user_audio = user_msg["audio_file"].as_array().unwrap();
+        assert!(
+            user_msg.get("content").is_none(),
+            "user message must not carry the regular `content` key"
+        );
 
         assert_eq!(
             user_content,
