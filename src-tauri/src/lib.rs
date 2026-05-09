@@ -1150,6 +1150,11 @@ fn cut_audio_file_impl(
             &probe,
             codec,
         )?;
+        // Spec: "其他发音人无关的杂音清零（即变静音）" — replace the
+        // residual noise floor at the head/tail of the cut with bit-true
+        // zeros. Threshold matches the silence detector so what cut
+        // considered "silence" becomes literal silence on disk too.
+        let _ = gate_segment_head_tail(&output, config.silence_db as f32);
 
         let segment_text = text_chunks.get(index).cloned().unwrap_or_default();
         segments.push(SegmentRecord {
@@ -1685,6 +1690,62 @@ fn normalize_segment_roles(segments: &[SegmentRecord]) -> Vec<SegmentRecord> {
         .collect()
 }
 
+/// Render a `{"messages": [...]}` payload in the dataset spec's exact
+/// formatting style. Hand-rolled because `serde_json::to_string_pretty`
+/// produces a different layout (`"key": "value"` with a space, arrays
+/// broken across multiple lines) and the spec's downstream parser is
+/// strict about layout.
+///
+/// Per the spec figure annotations:
+/// - colon `:` is **never** followed by a space
+/// - array values (content_refine, audio_file, emotion_refine) are
+///   emitted **inline** — every element on the same line as the key
+/// - top-level `messages` and each message object still get newlines
+///   so individual entries remain readable
+fn render_messages_payload(messages: &[Value]) -> String {
+    let mut out = String::new();
+    out.push_str("{\n  \"messages\":[\n");
+    for (i, msg) in messages.iter().enumerate() {
+        out.push_str("    {\n");
+        let obj = msg
+            .as_object()
+            .expect("each message must be a JSON object");
+        let entries: Vec<String> = obj
+            .iter()
+            .map(|(k, v)| format!("      {}:{}", json_quote(k), inline_value(v)))
+            .collect();
+        out.push_str(&entries.join(",\n"));
+        out.push_str("\n    }");
+        if i + 1 < messages.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("  ]\n}");
+    out
+}
+
+/// Quote a string as a JSON string literal (with proper escaping).
+fn json_quote(s: &str) -> String {
+    serde_json::to_string(&Value::String(s.to_string())).unwrap_or_else(|_| {
+        // Fallback: just wrap in quotes. Should never trigger.
+        format!("\"{}\"", s.replace('"', "\\\""))
+    })
+}
+
+/// Serialize a JSON value with arrays kept inline (no element-level
+/// newlines). Strings, numbers, and booleans use their compact form.
+fn inline_value(v: &Value) -> String {
+    match v {
+        Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(inline_value).collect();
+            format!("[{}]", items.join(","))
+        }
+        Value::Object(_) => serde_json::to_string(v).unwrap_or_default(),
+        _ => serde_json::to_string(v).unwrap_or_default(),
+    }
+}
+
 fn build_flat_jsonl(
     segments: &[SegmentRecord],
     system_prompt: &str,
@@ -1704,18 +1765,20 @@ fn build_flat_jsonl(
         } else {
             json!(segment.phonetic_text.clone())
         };
-        // Spec: user (陪聊) carries `content_refine`; assistant + system
-        // keep `content`. Build the message in the right order.
-        let content_key = if role == "user" {
-            "content_refine"
-        } else {
+        // Spec: user (陪聊) AND assistant (发音人) both carry the
+        // refined-content key (`content_refine`). Only `system` keeps
+        // the bare `content`.
+        let content_key = if role == "system" {
             "content"
+        } else {
+            "content_refine"
         };
         let mut message = json!({ "role": role });
         message[content_key] = content_value;
         message["audio_file"] = json!(audio_path);
         if !segment.emotion.is_empty() {
-            message["emotion"] = json!(segment.emotion);
+            // Spec rename: `emotion` → `emotion_refine` (mirrors content_refine).
+            message["emotion_refine"] = json!(segment.emotion);
         }
         // `tags` deliberately omitted — paralinguistic markers live
         // inline in the text (e.g. `[breath]`, `<laugh>...</laugh>`),
@@ -1724,12 +1787,7 @@ fn build_flat_jsonl(
             message["notes"] = json!(segment.notes);
         }
         messages.push(message);
-        // Pretty-print to match the demo `自由演绎.jsonl` layout —
-        // technically not strict JSONL anymore, but readable by `jq -s`
-        // and friends because every record is still a self-contained
-        // JSON object separated by a blank line.
-        let line = serde_json::to_string_pretty(&json!({"messages": messages}))
-            .map_err(|err| err.to_string())?;
+        let line = render_messages_payload(&messages);
         lines.push(line);
     }
     Ok(lines)
@@ -1886,10 +1944,8 @@ fn build_paired_jsonl(
                         .collect(),
                 )
             };
-            // Per spec: user (陪聊) text uses `content_refine` rather
-            // than `content`. The chat-style `content` slot is reserved
-            // for the assistant's polished output; the user side carries
-            // a "refined" transcript suitable for re-prompting.
+            // Per spec: both user (陪聊) and assistant text use
+            // `content_refine`. Only `system` keeps the bare `content`.
             messages.push(json!({
                 "role": "user",
                 "content_refine": content_value,
@@ -1926,15 +1982,19 @@ fn build_paired_jsonl(
         } else {
             Value::Array(audios)
         };
+        // Spec: assistant uses `content_refine` + `emotion_refine`
+        // (mirroring user). Insert in the order the spec demands so
+        // serde_json's preserve_order keeps `role / content_refine /
+        // audio_file / emotion_refine` lined up.
         let mut a_msg = json!({
             "role": "assistant",
-            "content": Value::Array(texts),
+            "content_refine": Value::Array(texts),
             "audio_file": audio_value,
         });
-        // Emit `emotion` only when the labelers actually picked one — an
-        // all-empty group means the polish step never ran or was cleared.
+        // Emit `emotion_refine` only when the labelers actually picked
+        // one — an all-empty group means the polish step never ran.
         if assistant_segs.iter().any(|s| !s.emotion.is_empty()) {
-            a_msg["emotion"] = if single {
+            a_msg["emotion_refine"] = if single {
                 emotions[0].clone()
             } else {
                 Value::Array(emotions)
@@ -1954,10 +2014,7 @@ fn build_paired_jsonl(
         }
         messages.push(a_msg);
 
-        lines.push(
-            serde_json::to_string_pretty(&json!({"messages": messages}))
-                .map_err(|err| err.to_string())?,
-        );
+        lines.push(render_messages_payload(&messages));
 
         // Stragglers with neither user nor assistant role get their own
         // single-message line — rare, but preserves the data.
@@ -1994,24 +2051,25 @@ fn build_single_message_line(
     } else {
         json!(text)
     };
-    // Spec: user (陪聊) carries `content_refine`; everyone else keeps `content`.
-    let content_key = if role == "user" {
-        "content_refine"
-    } else {
+    // Spec: user/assistant both use `content_refine`; only `system`
+    // keeps the bare `content`.
+    let content_key = if role == "system" {
         "content"
+    } else {
+        "content_refine"
     };
     let mut msg = json!({ "role": role });
     msg[content_key] = content_value;
     msg["audio_file"] = json!(with_prefix(prefix, &segment.segment_path, input_root));
     if !segment.emotion.is_empty() {
-        msg["emotion"] = json!(segment.emotion);
+        msg["emotion_refine"] = json!(segment.emotion);
     }
     // `tags` deliberately omitted — see build_paired_jsonl.
     if !segment.notes.trim().is_empty() {
         msg["notes"] = json!(segment.notes);
     }
     messages.push(msg);
-    serde_json::to_string_pretty(&json!({"messages": messages})).map_err(|err| err.to_string())
+    Ok(render_messages_payload(&messages))
 }
 
 /// Compute the audio_file value for export.
@@ -4180,6 +4238,161 @@ fn push_padded_range(
     }
 }
 
+/// Hard noise gate on the head and tail of a PCM WAV file.
+///
+/// Walks samples from the start until the first one whose magnitude
+/// exceeds `threshold_db`, then zeroes everything before that point.
+/// Repeats from the tail. Middle samples (the actual speech) are
+/// untouched. The output WAV keeps its original duration — only the
+/// pre/post-roll noise floor is replaced with true silence.
+///
+/// Why not an ffmpeg `agate` / `silenceremove` filter chain?
+///   - `agate` is an envelope follower with attack/release, so quiet
+///     residue still leaks through near the threshold.
+///   - `silenceremove` removes audio entirely, shrinking the segment.
+/// We need bit-perfect zeroes in the boundary samples without changing
+/// segment length, so we just rewrite the PCM data in place.
+///
+/// Supports 16-bit and 24-bit little-endian PCM, mono or multi-channel.
+/// Other formats are silently skipped (file unchanged).
+fn gate_segment_head_tail(path: &Path, threshold_db: f32) -> Result<(), String> {
+    let mut bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return Ok(()),
+    };
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Ok(());
+    }
+
+    // Walk RIFF chunks to locate `fmt ` (sample format) and `data` (PCM).
+    let mut bps = 0u16;
+    let mut channels = 0u16;
+    let mut data_start = 0usize;
+    let mut data_len = 0usize;
+    let mut i = 12usize;
+    while i + 8 <= bytes.len() {
+        let chunk_id = [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]];
+        let chunk_size = u32::from_le_bytes([
+            bytes[i + 4],
+            bytes[i + 5],
+            bytes[i + 6],
+            bytes[i + 7],
+        ]) as usize;
+        let chunk_data = i + 8;
+        match &chunk_id {
+            b"fmt " => {
+                if chunk_data + 16 <= bytes.len() {
+                    channels = u16::from_le_bytes([
+                        bytes[chunk_data + 2],
+                        bytes[chunk_data + 3],
+                    ]);
+                    bps = u16::from_le_bytes([
+                        bytes[chunk_data + 14],
+                        bytes[chunk_data + 15],
+                    ]);
+                }
+            }
+            b"data" => {
+                data_start = chunk_data;
+                data_len = chunk_size;
+                break;
+            }
+            _ => {}
+        }
+        i = chunk_data + chunk_size + (chunk_size & 1);
+    }
+
+    if data_start == 0 || data_len == 0 || channels == 0 {
+        return Ok(());
+    }
+    let bytes_per_channel_sample = bps as usize / 8;
+    if !matches!(bps, 16 | 24) {
+        return Ok(()); // only 16/24-bit PCM supported
+    }
+    let frame_size = bytes_per_channel_sample * channels as usize;
+    if frame_size == 0 {
+        return Ok(());
+    }
+    let data_end = (data_start + data_len).min(bytes.len());
+    let usable = (data_end - data_start) / frame_size * frame_size;
+    if usable == 0 {
+        return Ok(());
+    }
+    let frame_count = usable / frame_size;
+
+    let max_amp: i32 = match bps {
+        16 => i16::MAX as i32,
+        24 => 0x7F_FFFF,
+        _ => return Ok(()),
+    };
+    let amp_threshold = (10.0_f32.powf(threshold_db / 20.0) * max_amp as f32) as i32;
+
+    let read_peak = |bytes: &[u8], frame_off: usize| -> i32 {
+        let mut peak = 0i32;
+        for ch in 0..channels as usize {
+            let p = frame_off + ch * bytes_per_channel_sample;
+            let val = match bps {
+                16 => i16::from_le_bytes([bytes[p], bytes[p + 1]]) as i32,
+                24 => {
+                    let raw = (bytes[p] as i32)
+                        | ((bytes[p + 1] as i32) << 8)
+                        | ((bytes[p + 2] as i32) << 16);
+                    if raw & 0x80_0000 != 0 {
+                        raw | !0xFF_FFFF
+                    } else {
+                        raw
+                    }
+                }
+                _ => 0,
+            };
+            let abs = val.abs();
+            if abs > peak {
+                peak = abs;
+            }
+        }
+        peak
+    };
+
+    // Head scan — find first frame above threshold.
+    let mut head = 0usize;
+    while head < frame_count {
+        let off = data_start + head * frame_size;
+        if read_peak(&bytes, off) > amp_threshold {
+            break;
+        }
+        head += 1;
+    }
+    // Tail scan — last frame above threshold.
+    let mut tail = frame_count;
+    while tail > head {
+        let off = data_start + (tail - 1) * frame_size;
+        if read_peak(&bytes, off) > amp_threshold {
+            break;
+        }
+        tail -= 1;
+    }
+    // Zero head [0, head) and tail [tail, frame_count).
+    let head_bytes = head * frame_size;
+    if head_bytes > 0 {
+        for b in &mut bytes[data_start..data_start + head_bytes] {
+            *b = 0;
+        }
+    }
+    let tail_start = data_start + tail * frame_size;
+    let tail_end = data_start + frame_count * frame_size;
+    if tail_end > tail_start {
+        for b in &mut bytes[tail_start..tail_end] {
+            *b = 0;
+        }
+    }
+
+    // Skip writeback if everything is signal (no edits).
+    if head == 0 && tail == frame_count {
+        return Ok(());
+    }
+    fs::write(path, bytes).map_err(|err| err.to_string())
+}
+
 fn write_pcm_wav_segment(
     input: &Path,
     output: &Path,
@@ -4759,12 +4972,14 @@ mod tests {
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[2]["role"], "assistant");
-        assert!(messages[2]["content"].is_array());
+        // Spec: assistant uses `content_refine`, not `content`.
+        assert!(messages[2]["content_refine"].is_array());
+        assert!(messages[2].get("content").is_none());
         // Single assistant sub-segment → audio_file collapses to a string
-        // and `emotion` is a single string (matching demo's pattern for
-        // length-1 turns).
+        // and `emotion_refine` is a single string (matching demo's
+        // pattern for length-1 turns).
         assert!(messages[2]["audio_file"].is_string());
-        assert_eq!(messages[2]["emotion"], "中立");
+        assert_eq!(messages[2]["emotion_refine"], "中立");
     }
 
     /// Regression: paths under `/Users/<name>/` (every macOS project)
@@ -4847,7 +5062,8 @@ mod tests {
         assert_eq!(messages.len(), 3); // system + user + assistant
 
         let assistant_msg = &messages[2];
-        let content = assistant_msg["content"].as_array().unwrap();
+        // Spec key rename: content → content_refine, emotion → emotion_refine.
+        let content = assistant_msg["content_refine"].as_array().unwrap();
         // Sorted by start_ms — sub-segments emerge in temporal order.
         assert_eq!(content[0], "句一");
         assert_eq!(content[1], "句二");
@@ -4860,7 +5076,7 @@ mod tests {
             .unwrap()
             .ends_with("free_001_02_01_发音人.wav"));
 
-        let emotions = assistant_msg["emotion"].as_array().unwrap();
+        let emotions = assistant_msg["emotion_refine"].as_array().unwrap();
         assert_eq!(emotions, &vec![json!("中立"), json!("开心"), json!("中立")]);
     }
 
