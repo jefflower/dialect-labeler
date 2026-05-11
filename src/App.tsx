@@ -949,6 +949,7 @@ function App() {
           llmPrompt: settings.llmPrompt,
           llmConcurrency: settings.llmConcurrency,
           whisperConcurrency: settings.whisperConcurrency,
+          whisperEndpoints: settings.whisperEndpoints,
         },
       });
 

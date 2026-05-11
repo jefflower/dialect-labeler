@@ -128,7 +128,10 @@ export const defaultAppSettings: AppSettings = {
     "以下是中文方言（长沙话）口语转写，请用汉字记录听到的字音，不要翻译。",
   useAsrCache: true,
   useLlm: true,
-  ollamaUrl: "http://localhost:11434",
+  // Tailnet 双机并发池：主端点 .4 + extra .6，统一 qwen2.5:32b。
+  // .2 在拉模型中，完成后通过设置抽屉手动加入即可（参考 hooks.ts 迁移逻辑）。
+  // 工作池按 worker_idx % endpoint_count 钉端点，慢机自然只接更少任务。
+  ollamaUrl: "http://100.64.0.4:11434",
   ollamaModel: "qwen2.5:32b",
   llmPrompt: "",
   systemPrompt: "长沙本地人，女性，25岁左右，声音娇柔，声音清亮",
@@ -138,9 +141,21 @@ export const defaultAppSettings: AppSettings = {
   segmentTags: defaultSegmentTags,
   emotions: defaultEmotions,
   cutPresets: defaultCutPresets,
-  llmConcurrency: 2,
-  whisperConcurrency: 1,
-  ollamaExtraEndpoints: [],
+  // 端点数 × 2（2 台 × 2）— 经验值，端点上设了 OLLAMA_NUM_PARALLEL>1 可再加。
+  llmConcurrency: 4,
+  // 与 whisperEndpoints 配套：4 端点 × 2 = 8 个并发 HTTP 请求。
+  whisperConcurrency: 8,
+  ollamaExtraEndpoints: [{ url: "http://100.64.0.6:11434" }],
+  // 远端 faster-whisper 池（参考 services/whisper-server/）：
+  //   .4 / .6  — 同时跑 Ollama 32b；whisper 共存（CPU vs UMA 不抢）
+  //   .11 周总 — M5 Pro 24GB，只跑 whisper；24GB 不适合跑 32b
+  //   .2 mac-mini — M4 32GB，只跑 whisper；32GB 跑 32b 临界 swap 不划算
+  whisperEndpoints: [
+    { url: "http://100.64.0.4:9090" },
+    { url: "http://100.64.0.6:9090" },
+    { url: "http://100.64.0.11:9090" },
+    { url: "http://100.64.0.2:9090" },
+  ],
 };
 
 export const roleLabels: Record<string, string> = {

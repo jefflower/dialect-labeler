@@ -95,6 +95,17 @@ export type OllamaEndpointDef = {
   /** Model name to use on this endpoint. Empty / undefined → fallback to
    *  the primary `ollamaModel`. */
   model?: string;
+  /** Master switch. `false` keeps the entry in config but the dispatcher
+   *  skips it (so you can stage an endpoint before its model finishes
+   *  pulling, then flip it on). Default / undefined = enabled. */
+  enabled?: boolean;
+};
+
+/** Remote whisper-server endpoint (see `services/whisper-server/`). */
+export type WhisperEndpointDef = {
+  url: string;
+  /** Master switch — see OllamaEndpointDef.enabled. Default = enabled. */
+  enabled?: boolean;
 };
 
 export type RecognitionOptions = {
@@ -117,6 +128,10 @@ export type RecognitionOptions = {
    *  if you have GPU/RAM headroom and the LLM pool is starving for
    *  input. Each process loads its own model. */
   whisperConcurrency?: number;
+  /** Pool of remote `services/whisper-server` endpoints. When non-empty,
+   *  the ASR phase POSTs each segment WAV to the pool instead of running
+   *  the local `whisper` CLI. Same work-stealing scheduler as the LLM pool. */
+  whisperEndpoints?: WhisperEndpointDef[];
 };
 
 export type ExportOptions = {
@@ -245,4 +260,10 @@ export type AppSettings = {
    *  round-robined for the LLM polish step. Each entry may pin its own
    *  model (e.g. local 32b paired with a remote 122b). */
   ollamaExtraEndpoints: OllamaEndpointDef[];
+  /** Remote whisper-server endpoints (faster-whisper HTTP, see
+   *  `services/whisper-server/`). Non-empty → ASR runs in a HTTP work-stealing
+   *  pool just like the LLM polish phase, with `whisperConcurrency`
+   *  controlling pool size (default 2 × endpoint count). Empty list keeps
+   *  the legacy local `whisper` CLI path. */
+  whisperEndpoints: WhisperEndpointDef[];
 };

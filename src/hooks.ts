@@ -2,6 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { AppSettings, Theme, Toast } from "./types";
 import { defaultAppSettings, SETTINGS_KEY } from "./defaults";
 
+const ENDPOINTS_MIGRATION_KEY = "dialect-labeler/migrations/v3-tailnet-endpoints";
+const WHISPER_ENDPOINTS_MIGRATION_KEY =
+  "dialect-labeler/migrations/v4-whisper-endpoints";
+
 export function useTheme(theme: Theme) {
   useEffect(() => {
     const root = document.documentElement;
@@ -32,6 +36,31 @@ export function useSettings() {
         merged.ollamaExtraEndpoints = legacyUrls
           .filter((u): u is string => typeof u === "string" && u.trim() !== "")
           .map((url) => ({ url, model: undefined }));
+      }
+      // 一次性迁移：把旧的单机 localhost / 老 IP 设置迁到三机 tailnet 池。
+      // 只覆盖端点/并发/模型四个字段；prompt、tags、systemPrompt 等保留用户改动。
+      if (!localStorage.getItem(ENDPOINTS_MIGRATION_KEY)) {
+        merged.ollamaUrl = defaultAppSettings.ollamaUrl;
+        merged.ollamaExtraEndpoints = defaultAppSettings.ollamaExtraEndpoints;
+        merged.llmConcurrency = defaultAppSettings.llmConcurrency;
+        merged.ollamaModel = defaultAppSettings.ollamaModel;
+        try {
+          localStorage.setItem(ENDPOINTS_MIGRATION_KEY, "1");
+        } catch {
+          // ignore — 下次还会再跑一次，幂等
+        }
+      }
+      // v4: 引入 whisperEndpoints。旧版本字段不存在 → 用默认双机池填充；
+      // 不去碰用户 whisperConcurrency（如有自定义则保留）。
+      if (!localStorage.getItem(WHISPER_ENDPOINTS_MIGRATION_KEY)) {
+        if (!Array.isArray(merged.whisperEndpoints)) {
+          merged.whisperEndpoints = defaultAppSettings.whisperEndpoints;
+        }
+        try {
+          localStorage.setItem(WHISPER_ENDPOINTS_MIGRATION_KEY, "1");
+        } catch {
+          // ignore
+        }
       }
       return merged;
     } catch {

@@ -295,15 +295,96 @@ export function SettingsDrawer({
               <input
                 type="number"
                 min={1}
-                max={4}
+                max={16}
                 value={settings.whisperConcurrency ?? 1}
                 onChange={(event) =>
                   onChange({
                     whisperConcurrency: Math.max(1, Number(event.target.value)),
                   })
                 }
-                title="同时跑多少个 Whisper 进程。每个进程独占一份模型 (≈1.5GB RAM/large-v3-turbo)。默认 1；2-3 仅在你有 GPU 显存或大内存时再开。"
+                title="单机模式 = 同时跑的 whisper CLI 进程数（每个独占一份模型，≈1.5GB RAM）。分布式模式 = 同时发出的 HTTP 请求数，建议 = 端点数 × 2。"
               />
+            </div>
+            <div className="drawer-row stack">
+              <label>Whisper 分布式端点（faster-whisper HTTP 池）</label>
+              {(settings.whisperEndpoints ?? []).map((ep, idx) => {
+                const enabled = ep.enabled !== false;
+                return (
+                <div
+                  key={idx}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "auto 1fr auto",
+                    gap: 6,
+                    marginTop: 6,
+                    alignItems: "center",
+                    opacity: enabled ? 1 : 0.55,
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={enabled}
+                    title={enabled ? "已启用 — 点击禁用此端点" : "已禁用 — 点击启用"}
+                    onChange={(event) =>
+                      onChange({
+                        whisperEndpoints: (
+                          settings.whisperEndpoints ?? []
+                        ).map((e, i) =>
+                          i === idx ? { ...e, enabled: event.target.checked } : e,
+                        ),
+                      })
+                    }
+                  />
+                  <input
+                    value={ep.url}
+                    placeholder="http://192.168.x.x:9090"
+                    onChange={(event) =>
+                      onChange({
+                        whisperEndpoints: (
+                          settings.whisperEndpoints ?? []
+                        ).map((e, i) =>
+                          i === idx ? { ...e, url: event.target.value } : e,
+                        ),
+                      })
+                    }
+                  />
+                  <button
+                    className="btn-ghost btn-icon"
+                    onClick={() =>
+                      onChange({
+                        whisperEndpoints: (
+                          settings.whisperEndpoints ?? []
+                        ).filter((_, i) => i !== idx),
+                      })
+                    }
+                    title="删除此端点"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+                );
+              })}
+              <button
+                className="btn-ghost"
+                onClick={() =>
+                  onChange({
+                    whisperEndpoints: [
+                      ...(settings.whisperEndpoints ?? []),
+                      { url: "" },
+                    ],
+                  })
+                }
+                style={{ alignSelf: "flex-start", marginTop: 6 }}
+              >
+                <Plus size={12} /> 添加端点
+              </button>
+              <p className="help-tip" style={{ marginTop: 6 }}>
+                启用后 ASR 阶段会把每段 wav POST 到端点池（参考{" "}
+                <code>services/whisper-server/</code>）。列表为空 → 退回
+                本机 <code>whisper</code> CLI。新装一台端点：
+                <br />
+                <code>scp -r services/whisper-server user@host:~/ && ssh user@host "bash ~/whisper-server/setup.sh"</code>
+              </p>
             </div>
           </section>}
 
@@ -373,16 +454,34 @@ export function SettingsDrawer({
             </p>
             <div className="drawer-row stack">
               <label>额外 Ollama 端点（可选，多机并发）</label>
-              {(settings.ollamaExtraEndpoints ?? []).map((ep, idx) => (
+              {(settings.ollamaExtraEndpoints ?? []).map((ep, idx) => {
+                const enabled = ep.enabled !== false;
+                return (
                 <div
                   key={idx}
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "minmax(180px, 2fr) minmax(120px, 1fr) auto",
+                    gridTemplateColumns: "auto minmax(180px, 2fr) minmax(120px, 1fr) auto",
                     gap: 6,
                     marginTop: 6,
+                    alignItems: "center",
+                    opacity: enabled ? 1 : 0.55,
                   }}
                 >
+                  <input
+                    type="checkbox"
+                    checked={enabled}
+                    title={enabled ? "已启用 — 点击禁用此端点" : "已禁用 — 点击启用"}
+                    onChange={(event) =>
+                      onChange({
+                        ollamaExtraEndpoints: (
+                          settings.ollamaExtraEndpoints ?? []
+                        ).map((e, i) =>
+                          i === idx ? { ...e, enabled: event.target.checked } : e,
+                        ),
+                      })
+                    }
+                  />
                   <input
                     value={ep.url}
                     placeholder="http://192.168.x.x:11434"
@@ -429,7 +528,8 @@ export function SettingsDrawer({
                     <Trash2 size={14} />
                   </button>
                 </div>
-              ))}
+                );
+              })}
               <button
                 className="btn-ghost"
                 onClick={() =>

@@ -132,12 +132,31 @@ struct PlaybackState {
     is_playing: bool,
 }
 
+fn default_enabled() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OllamaEndpointDef {
     url: String,
     #[serde(default)]
     model: Option<String>,
+    /// Default true. Lets the user stage an endpoint in config while its
+    /// model is still pulling, then flip it on without re-editing URLs.
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WhisperEndpointDef {
+    /// Base URL of a `services/whisper-server` instance. The Rust client
+    /// POSTs the segment WAV to `<url>/transcribe`.
+    url: String,
+    /// See `OllamaEndpointDef::enabled`.
+    #[serde(default = "default_enabled")]
+    enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -181,6 +200,13 @@ struct RecognitionOptions {
     /// model (so RAM cost scales linearly).
     #[serde(default)]
     whisper_concurrency: Option<u32>,
+    /// Optional pool of remote whisper-server endpoints (each runs
+    /// `services/whisper-server`). When non-empty, the ASR phase switches
+    /// from spawning a local `whisper` CLI to POSTing each segment WAV to
+    /// the pool, work-stealing across nodes — same scheduler shape as the
+    /// Ollama polish pool. Empty → fall back to local CLI.
+    #[serde(default)]
+    whisper_endpoints: Option<Vec<WhisperEndpointDef>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2754,7 +2780,9 @@ fn recognize_segments_impl(
     }
 
     ensure_ffmpeg()?;
-    let whisper = find_whisper_command()?;
+    // Whisper CLI is only required when no remote whisper-server endpoints
+    // are configured — defer the lookup so an HTTP-only setup doesn't need
+    // `whisper` installed locally.
     let project_dir = PathBuf::from(project_dir);
     let cache_dir = project_dir.join(".asr").join("cache");
     fs::create_dir_all(&cache_dir).map_err(|err| err.to_string())?;
@@ -2843,13 +2871,152 @@ fn recognize_segments_impl(
     let asr_total = to_run.len();
     let asr_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    if !to_run.is_empty() {
+    // Resolve the optional remote whisper-server pool. When at least one
+    // endpoint URL parses, the ASR phase dispatches per-segment HTTP calls
+    // across the pool (mirroring the Ollama polish pool). Empty → fall back
+    // to the legacy local-CLI chunk loop below.
+    let whisper_eps: Vec<String> = options
+        .whisper_endpoints
+        .as_ref()
+        .map(|v| {
+            v.iter()
+                .filter(|def| def.enabled)
+                .filter_map(|def| normalise_http_url(&def.url))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if !to_run.is_empty() && !whisper_eps.is_empty() {
+        // ============================================================
+        // REMOTE WHISPER POOL — HTTP work-stealing across endpoints.
+        // ============================================================
+        let endpoint_count = whisper_eps.len();
+        let concurrency = options
+            .whisper_concurrency
+            .unwrap_or((endpoint_count as u32 * 2).min(8))
+            .max(1) as usize;
+
+        eprintln!(
+            "[recognize] phase=whisper(http) · {} segs · {} endpoint(s) · concurrency={} · pool={:?}",
+            asr_total, endpoint_count, concurrency, whisper_eps,
+        );
+
+        let (seg_tx, seg_rx) = mpsc::channel::<SegmentRecord>();
+        for s in to_run.iter().cloned() {
+            let _ = seg_tx.send(s);
+        }
+        drop(seg_tx);
+        let seg_rx = std::sync::Arc::new(Mutex::new(seg_rx));
+        let prompt_arc = std::sync::Arc::new(initial_prompt.clone());
+
+        let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(concurrency);
+        for w in 0..concurrency {
+            let url = whisper_eps[w % endpoint_count].clone();
+            let rx = std::sync::Arc::clone(&seg_rx);
+            let app_clone = app.clone();
+            let counter = std::sync::Arc::clone(&asr_counter);
+            let results_arc = std::sync::Arc::clone(&results);
+            let cancel_clone = std::sync::Arc::clone(&cancel);
+            let id_to_idx_clone = id_to_idx.clone();
+            let cache_keys_clone = cache_keys.clone();
+            let cache_dir_clone = cache_dir.clone();
+            let prompt = std::sync::Arc::clone(&prompt_arc);
+            let h = std::thread::spawn(move || loop {
+                if cancel_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+                let segment = {
+                    let guard = match rx.lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    match guard.recv() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    }
+                };
+                let started = Instant::now();
+                let res = transcribe_remote(
+                    &url,
+                    Path::new(&segment.segment_path),
+                    "zh",
+                    &prompt,
+                );
+                let elapsed_ms = started.elapsed().as_millis();
+                eprintln!(
+                    "[whisper-http {}] {} · {} · {:.1}s · {}",
+                    w,
+                    url,
+                    segment.id,
+                    elapsed_ms as f64 / 1000.0,
+                    if res.is_ok() { "ok" } else { "fail" },
+                );
+                let raw = match res {
+                    Ok(r) => r,
+                    Err(err) => {
+                        eprintln!(
+                            "[whisper-http {}] {} via {} error: {}",
+                            w, segment.id, url, err,
+                        );
+                        // Skip — front-end shows nothing for this segment;
+                        // the user can re-run after fixing the endpoint.
+                        continue;
+                    }
+                };
+                if let Some(key) = cache_keys_clone.get(&segment.id) {
+                    let cache_file = cache_dir_clone.join(format!("{}.json", key));
+                    let _ = fs::write(&cache_file, json!({ "text": raw }).to_string());
+                }
+                let Some(&idx) = id_to_idx_clone.get(&segment.id) else {
+                    continue;
+                };
+                let completed = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = app_clone.emit(
+                    "recognize:segment_done",
+                    SegmentProgressEvent {
+                        segment_id: segment.id.clone(),
+                        phase: "asr".into(),
+                        text: raw.clone(),
+                        emotion: None,
+                        tags: Vec::new(),
+                        polish_endpoint: None,
+                        polish_model: None,
+                        cached: false,
+                        completed,
+                        total: asr_total,
+                    },
+                );
+                if let Ok(mut g) = results_arc.lock() {
+                    g[idx] = Some(RecognitionResult {
+                        segment_id: segment.id.clone(),
+                        text: raw.clone(),
+                        raw_text: raw,
+                        polished: false,
+                        cached: false,
+                        emotion: None,
+                        tags: Vec::new(),
+                        polish_endpoint: None,
+                        polish_model: None,
+                    });
+                }
+            });
+            handles.push(h);
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+    } else if !to_run.is_empty() {
+        // ============================================================
+        // LEGACY LOCAL WHISPER CLI — chunked, one model per process.
+        // ============================================================
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_millis())
             .unwrap_or_default();
         let output_dir = project_dir.join(".asr").join(format!("run_{}", stamp));
         fs::create_dir_all(&output_dir).map_err(|err| err.to_string())?;
+
+        let whisper = find_whisper_command()?;
 
         const WHISPER_CHUNK_SIZE: usize = 8;
         let total_chunks = to_run.len().div_ceil(WHISPER_CHUNK_SIZE);
@@ -3083,43 +3250,16 @@ fn recognize_segments_impl(
                 .clone()
                 .ok_or_else(|| "未指定 Ollama 模型".to_string())?;
 
-            // URL normaliser — tolerates user typos.
-            fn normalise_url(raw: &str) -> Option<String> {
-                let trimmed = raw.trim().trim_end_matches('/');
-                if trimmed.is_empty() {
-                    return None;
-                }
-                let lower = trimmed.to_ascii_lowercase();
-                if let Some(rest) = lower.strip_prefix("https://") {
-                    let len = "https://".len();
-                    let rest_orig = &trimmed[len..len + rest.len()];
-                    return Some(format!("https://{}", rest_orig));
-                }
-                let candidates = [
-                    "https://", "http://", "https//", "http//", "https:", "http:",
-                ];
-                let mut tail = trimmed;
-                for prefix in candidates.iter() {
-                    let lower_tail = tail.to_ascii_lowercase();
-                    if lower_tail.starts_with(prefix) {
-                        tail = &tail[prefix.len()..];
-                        break;
-                    }
-                }
-                let tail = tail.trim_start_matches('/');
-                if tail.is_empty() {
-                    return None;
-                }
-                Some(format!("http://{}", tail))
-            }
-
             let mut endpoints: Vec<(String, String)> = Vec::new();
-            if let Some(url) = normalise_url(&ollama_url) {
+            if let Some(url) = normalise_http_url(&ollama_url) {
                 endpoints.push((url, model_name.clone()));
             }
             if let Some(defs) = options.ollama_extra_endpoints.as_ref() {
                 for def in defs {
-                    let Some(url) = normalise_url(&def.url) else {
+                    if !def.enabled {
+                        continue;
+                    }
+                    let Some(url) = normalise_http_url(&def.url) else {
                         continue;
                     };
                     let mdl = def
@@ -3137,7 +3277,7 @@ fn recognize_segments_impl(
             }
             if let Some(extras) = options.ollama_extra_urls.as_ref() {
                 for url in extras {
-                    let Some(url) = normalise_url(url) else {
+                    let Some(url) = normalise_http_url(url) else {
                         continue;
                     };
                     if endpoints.iter().any(|(u, _)| u == &url) {
@@ -3377,6 +3517,127 @@ fn polish_text(
         });
     }
     Ok(parsed)
+}
+
+/// Lenient URL normaliser shared by the ASR and polish endpoint pools.
+/// Tolerates the typical typos users hand-enter (`http//`, missing scheme,
+/// trailing slash, mixed case). Returns `None` if there's nothing usable.
+fn normalise_http_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("https://") {
+        let len = "https://".len();
+        let rest_orig = &trimmed[len..len + rest.len()];
+        return Some(format!("https://{}", rest_orig));
+    }
+    let candidates = [
+        "https://", "http://", "https//", "http//", "https:", "http:",
+    ];
+    let mut tail = trimmed;
+    for prefix in candidates.iter() {
+        let lower_tail = tail.to_ascii_lowercase();
+        if lower_tail.starts_with(prefix) {
+            tail = &tail[prefix.len()..];
+            break;
+        }
+    }
+    let tail = tail.trim_start_matches('/');
+    if tail.is_empty() {
+        return None;
+    }
+    Some(format!("http://{}", tail))
+}
+
+/// POST a WAV to `<base_url>/transcribe` (faster-whisper server, see
+/// `services/whisper-server/whisper_server.py`) and return the recognised text.
+///
+/// Multipart body is hand-rolled — ureq has no native multipart and pulling
+/// in reqwest for one endpoint would drag the whole tokio stack. The wire
+/// shape is just five form fields wrapped by a boundary, ≤30 lines.
+fn transcribe_remote(
+    base_url: &str,
+    segment_path: &Path,
+    language: &str,
+    initial_prompt: &str,
+) -> Result<String, String> {
+    let bytes = fs::read(segment_path).map_err(|err| {
+        format!(
+            "读取切片失败 {}: {}",
+            segment_path.display(),
+            err
+        )
+    })?;
+    let filename = segment_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("segment.wav");
+
+    let boundary = format!("----dlbWhisper{}", uniq_token());
+    let mut body: Vec<u8> = Vec::with_capacity(bytes.len() + 1024);
+    let crlf = b"\r\n";
+
+    let mut field_text = |name: &str, value: &str| {
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(crlf);
+    };
+    field_text("language", language);
+    field_text("initial_prompt", initial_prompt);
+
+    // The audio file part.
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"audio\"; filename=\"{}\"\r\n",
+            filename.replace('"', "_")
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(b"Content-Type: audio/wav\r\n\r\n");
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(crlf);
+    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+    let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
+    // 10-minute timeout — even a 30s WAV through a saturated cold endpoint
+    // shouldn't approach this; matches the polish pool's generous budget so
+    // a sluggish node degrades gracefully instead of cascading failures.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(600))
+        .build();
+    let resp = agent
+        .post(&url)
+        .set(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={}", boundary),
+        )
+        .send_bytes(&body)
+        .map_err(|err| format!("whisper HTTP {}: {}", url, err))?;
+    let raw = resp
+        .into_string()
+        .map_err(|err| format!("whisper 响应读取失败：{}", err))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("whisper 响应非法 JSON：{} (body={})", err, raw))?;
+    Ok(value
+        .get("text")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// Cheap unique-ish token for multipart boundaries (not security-critical;
+/// only needs to not collide with the file's bytes).
+fn uniq_token() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| format!("{}{}", d.as_secs(), d.subsec_nanos()))
+        .unwrap_or_else(|_| "x".into())
 }
 
 fn strip_thinking(text: &str) -> String {
