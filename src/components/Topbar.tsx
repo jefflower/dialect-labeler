@@ -7,6 +7,7 @@ import {
   Settings,
   Sun,
   Sunrise,
+  XCircle,
 } from "lucide-react";
 import type { Theme } from "../types";
 import { BUILD_CHANNEL, REVIEW_ONLY } from "../env";
@@ -25,6 +26,9 @@ type TopbarProps = {
   onLoad: () => void;
   onExport: () => void;
   onExportBundle: () => void;
+  /** Clear all project-scoped state so the user can pick a fresh
+   *  input/output pair. Doesn't touch the disk. */
+  onCloseProject: () => void;
 };
 
 const themeIcon = {
@@ -47,6 +51,7 @@ export function Topbar({
   onLoad,
   onExport,
   onExportBundle,
+  onCloseProject,
 }: TopbarProps) {
   const ThemeIcon = themeIcon[theme] ?? Sunrise;
   const dotClass = hasError ? "error" : busy ? "busy" : hasProject ? "" : "idle";
@@ -103,6 +108,14 @@ export function Topbar({
         <button onClick={onSave} disabled={!hasProject || busy}>
           <Save size={14} />
           保存
+        </button>
+        <button
+          onClick={onCloseProject}
+          disabled={!hasProject || busy}
+          title="清空当前界面状态，便于切换不同的输入/输出目录配对（不删磁盘文件）"
+        >
+          <XCircle size={14} />
+          关闭项目
         </button>
         <button
           onClick={onExport}

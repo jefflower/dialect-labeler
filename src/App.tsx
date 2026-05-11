@@ -458,8 +458,6 @@ function App() {
         folderPath,
         outputPath: outputPath.trim() || null,
       });
-      setScan(result);
-      setSelectedAudioId(result.audioFiles[0]?.id ?? "");
 
       // Hydrate from existing project.json so previous cut/recognize/annotate
       // work isn't lost when the user re-scans the same folder.
@@ -503,20 +501,41 @@ function App() {
       // Safety guard: refuse to overlay an empty segments array on top of a
       // file that had non-empty segments. This was the bug class where one
       // bad scan wiped 1212 segments from disk.
+      //
+      // Stronger version: when mismatch is detected we now ALSO refuse to
+      // commit the new scan state to React. Without this, the user could
+      // see the warning and still hit "切割", which would overwrite the
+      // mismatched output dir with cuts from the wrong input. Leaving
+      // `scan` at its previous value (or null on first scan) makes the
+      // cut / recognize buttons inert until the user picks a matching
+      // input/output pair and re-scans.
       if (rawSegments.length > 0 && restoredSegments.length === 0) {
+        // Show up to 3 sample sourceFileNames from the existing project so
+        // the user can tell at a glance which input folder this output
+        // actually belongs to.
+        const sampleNames = Array.from(
+          new Set(rawSegments.map((s) => s.sourceFileName)),
+        )
+          .slice(0, 3)
+          .join("、");
         showError(
-          "已恢复的片段为零（可能路径不匹配）",
-          `磁盘上有 ${rawSegments.length} 段但都对不上当前音频文件名。已自动备份 project.json 到 .backups/，然后保留磁盘原状不覆盖`,
+          "已恢复的片段为零（输入/输出不匹配）",
+          `这个输出文件夹里 ${rawSegments.length} 段标注引用的源音频是: ${sampleNames}…，但当前输入文件夹里没有这些文件。可能你输入选错了——请确认配对再扫描。\n\n旧 project.json 已自动备份到 .backups/，磁盘内容未被覆盖。`,
         );
-        // Backup AND skip setSegments — leave React state empty but don't
-        // auto-save (the busy state we'll set + the empty-array detection
-        // in our save layer will block the destructive overwrite).
         await ipc
           .backupProjectFile({ projectDir: result.projectDir })
           .catch(() => undefined);
-        // Continue scanning but DO NOT touch segments state on disk.
+        // Critical: do NOT setScan(result). Keeping the previous scan
+        // state (likely null) means cut / recognize buttons stay
+        // disabled — the user can't accidentally overwrite this output's
+        // segments by clicking 切割 after dismissing the warning.
         return;
       }
+
+      // Mismatch check passed (or no existing project) — commit the scan
+      // state so the rest of the UI can act on it.
+      setScan(result);
+      setSelectedAudioId(result.audioFiles[0]?.id ?? "");
 
       if (droppedCount > 0) {
         pushToast({
@@ -1251,6 +1270,48 @@ function App() {
     return updated;
   }
 
+  /**
+   * Reset every piece of workspace state back to "no project loaded".
+   * Used by the toolbar's 「关闭项目」 button so the user can switch
+   * between input/output dir pairs without leftover state from the
+   * previous project (which is how the 包1/2/3 mismatch happened).
+   *
+   * Notes:
+   * - **Does NOT touch the disk** — segments WAVs, project.json,
+   *   .asr cache stay where they are. Re-scanning the same output
+   *   folder restores everything.
+   * - Global settings (model, prompts, OSS prefix, etc.) are
+   *   preserved — only project-scoped state is wiped.
+   */
+  function closeWorkspace() {
+    if (
+      scan &&
+      !window.confirm(
+        "关闭当前项目（清空界面状态）？\n\n" +
+          "磁盘上的切片、project.json、缓存都会保留，下次重新选择" +
+          "目录扫描可恢复。已修改但未保存的标注会丢失。",
+      )
+    ) {
+      return;
+    }
+    setScan(null);
+    setSegments([]);
+    setFolderPath("");
+    setOutputPath("");
+    setExportJsonlPath("");
+    setSelectedAudioId("");
+    setSelectedSegmentId("");
+    setAnnotationSegmentId("");
+    setTimelineSelection(null);
+    setStatusMsg("已关闭项目，请重新选择输入/输出文件夹");
+    setProgress((current) => ({ ...current, visible: false }));
+    pushToast({
+      variant: "info",
+      title: "已关闭项目",
+      detail: "界面状态已清空，重新选目录后扫描可恢复磁盘上的标注",
+    });
+  }
+
   async function saveProject() {
     if (!scan) return;
     setBusy(true);
@@ -1822,6 +1883,7 @@ function App() {
           onLoad={loadProject}
           onExport={exportJsonl}
           onExportBundle={exportBundle}
+          onCloseProject={closeWorkspace}
         />
         <div className="app-body">
           <SetupBand
