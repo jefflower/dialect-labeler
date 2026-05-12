@@ -1,12 +1,21 @@
-FROM python:3.11-slim
+# --- Stage 1: build the React SPA ------------------------------------------
+FROM node:20-alpine AS web
+WORKDIR /web
+COPY web/package.json ./
+RUN npm install --no-fund --no-audit
+COPY web/ ./
+RUN npm run build
 
+# --- Stage 2: runtime ------------------------------------------------------
+FROM python:3.11-slim
 WORKDIR /srv
 
-# Install deps first so they're cached across code changes.
+# Python deps first so they're cached across code changes.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY --from=web /web/dist ./web/dist
 
 # Where the SQLite DB lives. The bind mount in docker-compose maps this
 # to a host volume so data survives container rebuilds.

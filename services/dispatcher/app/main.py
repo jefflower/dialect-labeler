@@ -77,12 +77,26 @@ def create_app() -> FastAPI:
 
     # Serve the built React SPA if it's there. The web/dist dir is
     # populated by `npm run build` in services/dispatcher/web — absent
-    # in the test container, present in production images.
-    web_root = Path(__file__).parent.parent / "web" / "dist"
+    # in the test container, present in production images. We use a
+    # catch-all instead of StaticFiles(html=True) so deep links like
+    # /tasks/<id> fall back to index.html (the SPA handles them client-side)
+    # while real assets under /assets/* are served as-is.
+    web_root = (Path(__file__).parent.parent / "web" / "dist").resolve()
     if web_root.is_dir():
-        from fastapi.staticfiles import StaticFiles
+        from fastapi.responses import FileResponse
 
-        app.mount("/", StaticFiles(directory=str(web_root), html=True), name="web")
+        index_html = web_root / "index.html"
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        def serve_spa(full_path: str) -> FileResponse:
+            candidate = (web_root / full_path).resolve()
+            try:
+                candidate.relative_to(web_root)
+            except ValueError:
+                return FileResponse(index_html)
+            if full_path and candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(index_html)
 
     return app
 
