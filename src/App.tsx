@@ -23,6 +23,7 @@ import { isTyping, useSettings, useShortcutOverlay, useTheme, useToasts } from "
 import type {
   AudioFileInfo,
   CutConfig,
+  CutValidationResult,
   InlineTagDef,
   PlaybackAudio,
   PlaybackState,
@@ -62,6 +63,9 @@ function App() {
   const [scan, setScan] = useState<ProjectScan | null>(null);
   const [config, setConfig] = useState<CutConfig>(defaultCutConfig);
   const [segments, setSegments] = useState<SegmentRecord[]>([]);
+  const [cutValidationById, setCutValidationById] = useState<
+    Record<string, CutValidationResult | undefined>
+  >({});
   const [selectedAudioId, setSelectedAudioId] = useState("");
   const [selectedSegmentId, setSelectedSegmentId] = useState("");
   const [annotationSegmentId, setAnnotationSegmentId] = useState("");
@@ -82,6 +86,7 @@ function App() {
   const [playbackDurationMs, setPlaybackDurationMs] = useState(0);
   const [playbackCurrentMs, setPlaybackCurrentMs] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackRefreshKey, setPlaybackRefreshKey] = useState(0);
   // Reviewer-friendly fast modes: 1x default, 1.25x for catch-the-detail
   // listens, 1.5x for skim. Persists across the session, applies to
   // every play() call, and propagates live to the running sink.
@@ -154,6 +159,15 @@ function App() {
     return segments.filter((segment) => segment.sourcePath === selectedAudio.path);
   }, [segments, selectedAudio]);
 
+  const cutValidationSummary = useMemo(() => {
+    const checked = Object.values(cutValidationById).filter(Boolean).length;
+    if (checked === 0) return null;
+    const failed = Object.values(cutValidationById).filter(
+      (item) => item && !item.ok,
+    ).length;
+    return { checked, failed };
+  }, [cutValidationById]);
+
   const playbackTargetPath = annotationSegment?.segmentPath ?? selectedAudio?.path ?? "";
   const activeDurationMs =
     playbackDurationMs ||
@@ -163,6 +177,11 @@ function App() {
   const setStatusMsg = useCallback((message: string, error = false) => {
     setStatus(message);
     setHasError(error);
+  }, []);
+
+  const updateCutConfig = useCallback((next: CutConfig) => {
+    setConfig(next);
+    setCutValidationById({});
   }, []);
 
   const showError = useCallback(
@@ -324,7 +343,7 @@ function App() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playbackTargetPath, scan?.projectDir]);
+  }, [playbackTargetPath, scan?.projectDir, playbackRefreshKey]);
 
   // Poll playback while playing
   useEffect(() => {
@@ -481,6 +500,7 @@ function App() {
     setBusy(true);
     setAnnotationSegmentId("");
     setSelectedSegmentId("");
+    setCutValidationById({});
     setStatusMsg("正在扫描音频…");
     setProgress({
       visible: true,
@@ -697,6 +717,7 @@ function App() {
     if (!scan || scan.audioFiles.length === 0) return;
     setAnnotationSegmentId("");
     setSelectedSegmentId("");
+    setCutValidationById({});
     try {
       const cutSourcePaths = new Set(segments.map((segment) => segment.sourcePath));
       const audioToCut = scan.audioFiles.filter(
@@ -765,6 +786,7 @@ function App() {
     if (existing.length > 0) {
       void backupProjectJson().catch(() => undefined);
     }
+    setCutValidationById({});
     setBusy(true);
     selectAudio(audio);
     setStatusMsg(`正在切割：${audio.fileName}`);
@@ -810,6 +832,178 @@ function App() {
       );
     } catch (error) {
       showError(`切割失败 ${audio.fileName}`, error);
+    } finally {
+      setProgress((current) => ({ ...current, visible: false }));
+      setBusy(false);
+    }
+  }
+
+  async function validateCutQuality() {
+    if (!scan || segments.length === 0) {
+      pushToast({ variant: "warning", title: "还没有可检测的切割片段" });
+      return;
+    }
+    setBusy(true);
+    setStatusMsg("正在检测切割留空…");
+    setProgress({
+      visible: true,
+      label: "切片检测",
+      detail: `按当前策略检测 ${segments.length} 段`,
+      current: 0,
+      total: segments.length,
+      indeterminate: true,
+    });
+    try {
+      await waitForPaint();
+      const results = await ipc.validateCutSegments({ segments, config });
+      const next = Object.fromEntries(
+        results.map((result) => [result.segmentId, result]),
+      ) as Record<string, CutValidationResult>;
+      setCutValidationById(next);
+
+      const failed = results.filter((result) => !result.ok);
+      if (failed.length > 0) {
+        const firstBad = segments.find(
+          (segment) => segment.id === failed[0]?.segmentId,
+        );
+        const sourceAudio = firstBad
+          ? scan.audioFiles.find((audio) => audio.path === firstBad.sourcePath)
+          : null;
+        if (sourceAudio) setSelectedAudioId(sourceAudio.id);
+        if (firstBad) setSelectedSegmentId(firstBad.id);
+        pushToast({
+          variant: "error",
+          title: `检测发现 ${failed.length} 段不达标`,
+          detail: "已在原音频和切割片段列表标红",
+        });
+        setStatusMsg(`切片检测：${failed.length}/${results.length} 段不达标`, true);
+      } else {
+        showSuccess("切片检测通过", `共 ${results.length} 段`);
+      }
+    } catch (error) {
+      showError("切片检测失败", error);
+    } finally {
+      setProgress((current) => ({ ...current, visible: false }));
+      setBusy(false);
+    }
+  }
+
+  async function cleanCutNoise() {
+    if (!scan || segments.length === 0) {
+      pushToast({ variant: "warning", title: "还没有可清除底噪的切割片段" });
+      return;
+    }
+    setBusy(true);
+    setStatusMsg("正在清除切片头尾底噪…");
+    setProgress({
+      visible: true,
+      label: "清除底噪",
+      detail: `阈值 ${config.silenceDb}dB · ${segments.length} 段`,
+      current: 0,
+      total: segments.length,
+      indeterminate: true,
+    });
+    try {
+      await waitForPaint();
+      await ipc.stopAudio().catch(() => undefined);
+      const result = await ipc.cleanCutSegmentNoise({ segments, config });
+      const next = Object.fromEntries(
+        result.validation.map((item) => [item.segmentId, item]),
+      ) as Record<string, CutValidationResult>;
+      setCutValidationById(next);
+      setPlaybackCurrentMs(0);
+      setIsPlaying(false);
+      setPlaybackRefreshKey((value) => value + 1);
+
+      const failed = result.validation.filter((item) => !item.ok);
+      if (failed.length > 0) {
+        const firstBad = segments.find(
+          (segment) => segment.id === failed[0]?.segmentId,
+        );
+        const sourceAudio = firstBad
+          ? scan.audioFiles.find((audio) => audio.path === firstBad.sourcePath)
+          : null;
+        if (sourceAudio) setSelectedAudioId(sourceAudio.id);
+        if (firstBad) setSelectedSegmentId(firstBad.id);
+        pushToast({
+          variant: "warning",
+          title: `底噪已清除，仍有 ${failed.length} 段不达标`,
+          detail: "已按当前策略重新检测并标红",
+        });
+        setStatusMsg(
+          `清除底噪完成：${failed.length}/${result.processedCount} 段仍不达标`,
+          true,
+        );
+      } else {
+        showSuccess(
+          "底噪已清除",
+          `${result.processedCount} 段已按 ${config.silenceDb}dB 处理并通过检测`,
+        );
+      }
+    } catch (error) {
+      showError("清除底噪失败", error);
+    } finally {
+      setProgress((current) => ({ ...current, visible: false }));
+      setBusy(false);
+    }
+  }
+
+  async function repairCutSilence() {
+    if (!scan || segments.length === 0) {
+      pushToast({ variant: "warning", title: "还没有可修复留空的切割片段" });
+      return;
+    }
+    setBusy(true);
+    setStatusMsg("正在修复切片前后留空…");
+    setProgress({
+      visible: true,
+      label: "修复留空",
+      detail: `前 ${config.preRollMs}ms / 后 ${config.postRollMs}ms · 阈值 ${config.silenceDb}dB`,
+      current: 0,
+      total: segments.length,
+      indeterminate: true,
+    });
+    try {
+      await waitForPaint();
+      await backupProjectJson().catch(() => undefined);
+      await ipc.stopAudio().catch(() => undefined);
+      const result = await ipc.repairCutSegmentSilence({ segments, config });
+      const next = Object.fromEntries(
+        result.validation.map((item) => [item.segmentId, item]),
+      ) as Record<string, CutValidationResult>;
+      setSegments(result.updatedSegments);
+      setCutValidationById(next);
+      setPlaybackCurrentMs(0);
+      setIsPlaying(false);
+      setPlaybackRefreshKey((value) => value + 1);
+
+      const failed = result.validation.filter((item) => !item.ok);
+      if (failed.length > 0) {
+        const firstBad = result.updatedSegments.find(
+          (segment) => segment.id === failed[0]?.segmentId,
+        );
+        const sourceAudio = firstBad
+          ? scan.audioFiles.find((audio) => audio.path === firstBad.sourcePath)
+          : null;
+        if (sourceAudio) setSelectedAudioId(sourceAudio.id);
+        if (firstBad) setSelectedSegmentId(firstBad.id);
+        pushToast({
+          variant: "warning",
+          title: `留空已修复，仍有 ${failed.length} 段不达标`,
+          detail: "通常是整段低于阈值、语音太短，或阈值仍需调整",
+        });
+        setStatusMsg(
+          `修复留空完成：${failed.length}/${result.processedCount} 段仍不达标`,
+          true,
+        );
+      } else {
+        showSuccess(
+          "留空已修复",
+          `${result.processedCount} 段已裁到前 ${config.preRollMs}ms / 后 ${config.postRollMs}ms，并已清除边界底噪`,
+        );
+      }
+    } catch (error) {
+      showError("修复留空失败", error);
     } finally {
       setProgress((current) => ({ ...current, visible: false }));
       setBusy(false);
@@ -1949,7 +2143,7 @@ function App() {
           {!HIDE_PROCESSING_UI && (
             <ConfigBand
               config={config}
-              onConfigChange={setConfig}
+              onConfigChange={updateCutConfig}
               presets={settings.cutPresets}
               onPresetsChange={(next) => updateSettings({ cutPresets: next })}
               autoRecognizeAfterCut={autoRecognizeAfterCut}
@@ -1958,6 +2152,7 @@ function App() {
               hasAudio={Boolean(scan && scan.audioFiles.length > 0)}
               hasSegments={segments.length > 0}
               llmEnabled={settings.useLlm}
+              cutValidationSummary={cutValidationSummary}
               pendingCount={
                 segments.filter((s) => {
                   const asrDone = s.phoneticText.trim().length > 0;
@@ -1968,6 +2163,9 @@ function App() {
                 }).length
               }
               onCutAll={cutAll}
+              onCleanCutNoise={cleanCutNoise}
+              onRepairCutSilence={repairCutSilence}
+              onValidateCuts={validateCutQuality}
               onRecognizeVisible={recognizeVisibleDraft}
               onRecognizeAllPending={recognizeAllPending}
               onReRecognizeVisible={reRecognizeVisible}
@@ -1991,6 +2189,7 @@ function App() {
             selectedAudioId={selectedAudioId}
             selectedSegmentId={selectedSegmentId}
             visibleSegments={visibleSegments}
+            cutValidationById={cutValidationById}
             busy={busy}
             isPlaying={isPlaying}
             playbackPath={playbackPath}

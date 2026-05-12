@@ -2,7 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AudioFileInfo,
   BundleResult,
+  CleanCutNoiseResult,
   CutConfig,
+  CutValidationResult,
   DependencyStatus,
   ExportOptions,
   PlaybackAudio,
@@ -12,6 +14,7 @@ import type {
   ProjectScan,
   RecognitionOptions,
   RecognitionResult,
+  RepairCutSilenceResult,
   SegmentRecord,
 } from "./types";
 
@@ -34,6 +37,24 @@ export const ipc = {
     targetFileNames?: string[];
   }) {
     return invoke<SegmentRecord[]>("cut_audio_file", args);
+  },
+  validateCutSegments(args: {
+    segments: SegmentRecord[];
+    config: CutConfig;
+  }) {
+    return invoke<CutValidationResult[]>("validate_cut_segments", args);
+  },
+  cleanCutSegmentNoise(args: {
+    segments: SegmentRecord[];
+    config: CutConfig;
+  }) {
+    return invoke<CleanCutNoiseResult>("clean_cut_segment_noise", args);
+  },
+  repairCutSegmentSilence(args: {
+    segments: SegmentRecord[];
+    config: CutConfig;
+  }) {
+    return invoke<RepairCutSilenceResult>("repair_cut_segment_silence", args);
   },
   recognizeSegments(args: {
     projectDir: string;

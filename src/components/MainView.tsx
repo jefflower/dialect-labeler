@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import {
+  AlertTriangle,
   CheckCircle2,
   CircleDashed,
   Folder,
@@ -10,6 +11,7 @@ import {
 } from "lucide-react";
 import type {
   AudioFileInfo,
+  CutValidationResult,
   ProjectScan,
   SegmentRecord,
 } from "../types";
@@ -80,6 +82,7 @@ type MainViewProps = {
   selectedAudioId: string;
   selectedSegmentId: string;
   visibleSegments: SegmentRecord[];
+  cutValidationById: Record<string, CutValidationResult | undefined>;
   busy: boolean;
   isPlaying: boolean;
   playbackPath: string;
@@ -183,18 +186,35 @@ export function MainView(props: MainViewProps) {
   const statsByAudio = useMemo(() => {
     const map = new Map<
       string,
-      { total: number; asrDone: number; polishDone: number }
+      {
+        total: number;
+        asrDone: number;
+        polishDone: number;
+        qualityChecked: number;
+        qualityFailed: number;
+      }
     >();
     for (const segment of props.segments) {
       const entry =
-        map.get(segment.sourcePath) ?? { total: 0, asrDone: 0, polishDone: 0 };
+        map.get(segment.sourcePath) ?? {
+          total: 0,
+          asrDone: 0,
+          polishDone: 0,
+          qualityChecked: 0,
+          qualityFailed: 0,
+        };
       entry.total += 1;
       if (segment.phoneticText.trim()) entry.asrDone += 1;
       if (segment.emotion.length > 0) entry.polishDone += 1;
+      const quality = props.cutValidationById[segment.id];
+      if (quality) {
+        entry.qualityChecked += 1;
+        if (!quality.ok) entry.qualityFailed += 1;
+      }
       map.set(segment.sourcePath, entry);
     }
     return map;
-  }, [props.segments]);
+  }, [props.segments, props.cutValidationById]);
 
   if (!props.scan) {
     return (
@@ -265,10 +285,13 @@ export function MainView(props: MainViewProps) {
               !!stats && stats.asrDone === stats.total && stats.total > 0;
             const polishFullyDone =
               !!stats && stats.polishDone === stats.total && stats.total > 0;
+            const qualityFailed = (stats?.qualityFailed ?? 0) > 0;
             return (
               <button
                 key={audio.id}
-                className={`audio-row ${audio.id === props.selectedAudioId ? "active" : ""}`}
+                className={`audio-row ${audio.id === props.selectedAudioId ? "active" : ""} ${
+                  qualityFailed ? "quality-fail" : ""
+                }`}
                 onClick={() => props.onSelectAudio(audio)}
                 title={audio.path}
               >
@@ -313,6 +336,15 @@ export function MainView(props: MainViewProps) {
                         )}
                         AI {stats.polishDone}/{stats.total}
                       </span>
+                      {qualityFailed && (
+                        <span
+                          className="segment-tag tag-quality-fail"
+                          title={`切片检测：${stats.qualityFailed}/${stats.qualityChecked} 段不达标`}
+                        >
+                          <AlertTriangle size={11} />
+                          异常 {stats.qualityFailed}
+                        </span>
+                      )}
                     </>
                   )}
                 </div>
@@ -475,6 +507,8 @@ export function MainView(props: MainViewProps) {
             }
             filteredSegments.forEach((segment, index) => {
               const info = extractTurnInfo(segment.segmentFileName);
+              const quality = props.cutValidationById[segment.id];
+              const qualityFailed = quality?.ok === false;
               const isNewGroup = info.groupKey !== prevKey;
               if (isNewGroup) {
                 groupIndex += 1;
@@ -508,9 +542,17 @@ export function MainView(props: MainViewProps) {
               rows.push(
                 <button
                   key={segment.id}
-                  className={`segment-row turn-${parity} ${segment.id === props.selectedSegmentId ? "active" : ""}`}
+                  className={`segment-row turn-${parity} ${
+                    segment.id === props.selectedSegmentId ? "active" : ""
+                  } ${qualityFailed ? "quality-fail" : ""}`}
                   onClick={() => props.onSelectSegment(segment)}
-                  title={segment.segmentFileName}
+                  title={
+                    qualityFailed
+                      ? `${segment.segmentFileName}\n${
+                          quality?.message ?? "切片策略不达标"
+                        }`
+                      : segment.segmentFileName
+                  }
                 >
                   <span className="segment-index">
                     {String(index + 1).padStart(2, "0")}
@@ -542,6 +584,16 @@ export function MainView(props: MainViewProps) {
                         {t}
                       </span>
                     ))}
+                    {qualityFailed && quality && (
+                      <span
+                        className="segment-tag tag-quality-fail"
+                        title={quality.message ?? "切片策略不达标"}
+                      >
+                        <AlertTriangle size={10} />
+                        切片异常 前{quality.leadingSilenceMs}ms / 后
+                        {quality.trailingSilenceMs}ms
+                      </span>
+                    )}
                   </div>
                 </button>,
               );

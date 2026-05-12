@@ -559,8 +559,8 @@ fn run_task(app: &AppHandle, client: &CloudClient, claim: &TaskClaim) -> Result<
         .try_state::<CloudState>()
         .ok_or_else(|| CloudError::Pipeline("CloudState missing".into()))?;
 
-    let workdir = tempfile::tempdir()
-        .map_err(|err| CloudError::Pipeline(format!("tempdir: {err}")))?;
+    let workdir =
+        tempfile::tempdir().map_err(|err| CloudError::Pipeline(format!("tempdir: {err}")))?;
     let input_zip = workdir.path().join("input.zip");
     let extract_dir = workdir.path().join("extract");
     fs::create_dir_all(&extract_dir)?;
@@ -582,8 +582,14 @@ fn run_task(app: &AppHandle, client: &CloudClient, claim: &TaskClaim) -> Result<
     let hb_cancel = Arc::new(AtomicBool::new(false));
     let hb_handle = spawn_heartbeat(client.clone(), task_id.clone(), hb_cancel.clone());
 
-    let pipeline_result =
-        run_pipeline(app, claim, &input_zip, &extract_dir, &bundle_dir, &output_zip);
+    let pipeline_result = run_pipeline(
+        app,
+        claim,
+        &input_zip,
+        &extract_dir,
+        &bundle_dir,
+        &output_zip,
+    );
 
     hb_cancel.store(true, Ordering::Relaxed);
     let _ = hb_handle.join();
@@ -650,12 +656,8 @@ fn run_pipeline(
         started_at_unix_ms: unix_ms(),
     }));
     let _ = app.emit("cloud://status-changed", ());
-    let scan = scan_project_folder_impl(
-        extract_dir.to_string_lossy().to_string(),
-        None,
-        None,
-    )
-    .map_err(CloudError::Pipeline)?;
+    let scan = scan_project_folder_impl(extract_dir.to_string_lossy().to_string(), None, None)
+        .map_err(CloudError::Pipeline)?;
     if scan.audio_files.is_empty() {
         return Err(CloudError::Pipeline(
             "input zip contained no audio files".into(),
@@ -740,9 +742,7 @@ fn run_pipeline(
     let mut duration_by_role: serde_json::Map<String, Value> = Default::default();
     for seg in &all_segments {
         let key = seg.role.clone().unwrap_or_else(|| "unknown".to_string());
-        let entry = duration_by_role
-            .entry(key)
-            .or_insert_with(|| json!(0u64));
+        let entry = duration_by_role.entry(key).or_insert_with(|| json!(0u64));
         if let Some(current) = entry.as_u64() {
             *entry = json!(current + seg.duration_ms);
         }
@@ -822,10 +822,8 @@ fn unzip_into(zip_path: &Path, dest: &Path) -> std::result::Result<(), String> {
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {e}"))?;
             }
-            let mut out_file =
-                fs::File::create(&out_path).map_err(|e| format!("create: {e}"))?;
-            std::io::copy(&mut entry, &mut out_file)
-                .map_err(|e| format!("extract: {e}"))?;
+            let mut out_file = fs::File::create(&out_path).map_err(|e| format!("create: {e}"))?;
+            std::io::copy(&mut entry, &mut out_file).map_err(|e| format!("extract: {e}"))?;
         }
     }
     Ok(())
@@ -838,7 +836,10 @@ fn zip_dir(src: &Path, dest_zip: &Path) -> std::result::Result<(), String> {
         .compression_method(zip::CompressionMethod::Deflated)
         .unix_permissions(0o644);
 
-    for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(src)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         let path = entry.path();
         let rel = match path.strip_prefix(src) {
             Ok(r) => r,
@@ -857,8 +858,7 @@ fn zip_dir(src: &Path, dest_zip: &Path) -> std::result::Result<(), String> {
                 .start_file(&rel_str, options)
                 .map_err(|e| format!("zip start: {e}"))?;
             let mut f = fs::File::open(path).map_err(|e| format!("open: {e}"))?;
-            std::io::copy(&mut f, &mut writer)
-                .map_err(|e| format!("copy: {e}"))?;
+            std::io::copy(&mut f, &mut writer).map_err(|e| format!("copy: {e}"))?;
         }
     }
     writer.finish().map_err(|e| format!("zip finish: {e}"))?;

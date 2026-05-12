@@ -72,6 +72,31 @@ export type SegmentRecord = {
   lastPolishModel?: string | null;
 };
 
+export type CutValidationResult = {
+  segmentId: string;
+  segmentPath: string;
+  segmentFileName: string;
+  ok: boolean;
+  leadingSilenceMs: number;
+  trailingSilenceMs: number;
+  maxLeadingSilenceMs: number;
+  maxTrailingSilenceMs: number;
+  thresholdDb: number;
+  allSilence: boolean;
+  message?: string | null;
+};
+
+export type CleanCutNoiseResult = {
+  processedCount: number;
+  validation: CutValidationResult[];
+};
+
+export type RepairCutSilenceResult = {
+  processedCount: number;
+  updatedSegments: SegmentRecord[];
+  validation: CutValidationResult[];
+};
+
 export type RecognitionResult = {
   segmentId: string;
   text: string;

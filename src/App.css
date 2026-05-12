@@ -163,6 +163,24 @@ button:disabled {
   border-radius: var(--radius-md);
 }
 
+.button-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 18px;
+}
+.button-pill.success {
+  background: var(--success-soft);
+  color: var(--success);
+}
+.button-pill.danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
 .btn-pill {
   border-radius: var(--radius-pill);
   padding-left: 14px;
@@ -737,6 +755,20 @@ button:disabled {
   background: var(--accent-muted);
 }
 
+.audio-row.quality-fail {
+  background: color-mix(in oklab, var(--danger-soft) 58%, transparent);
+}
+
+.audio-row.quality-fail::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--danger);
+}
+
 .audio-row.active::before {
   content: "";
   position: absolute;
@@ -812,6 +844,22 @@ button:disabled {
 .segment-row.turn-even.active,
 .segment-row.turn-odd.active {
   background: var(--accent-muted);
+}
+
+.segment-row.quality-fail,
+.segment-row.turn-even.quality-fail,
+.segment-row.turn-odd.quality-fail {
+  background: color-mix(in oklab, var(--danger-soft) 70%, var(--surface)) !important;
+}
+
+.segment-row.quality-fail::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--danger);
 }
 
 /* Group header — sits between segment groups, shows topic + turn label
@@ -971,6 +1019,11 @@ button:disabled {
 .segment-tag.tag-cut {
   background: var(--info-soft);
   color: var(--info);
+}
+
+.segment-tag.tag-quality-fail {
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .player-bar {

@@ -2,8 +2,11 @@ import { useMemo } from "react";
 import {
   ChevronDown,
   ChevronRight,
+  Eraser,
+  ShieldCheck,
   ListChecks,
   RefreshCcw,
+  Ruler,
   Save,
   Scissors,
   Sliders,
@@ -25,7 +28,11 @@ type ConfigBandProps = {
   hasSegments: boolean;
   llmEnabled: boolean;
   pendingCount: number;
+  cutValidationSummary: { checked: number; failed: number } | null;
   onCutAll: () => void;
+  onCleanCutNoise: () => void;
+  onRepairCutSilence: () => void;
+  onValidateCuts: () => void;
   onRecognizeVisible: () => void;
   onRecognizeAllPending: () => void;
   onReRecognizeVisible: () => void;
@@ -234,6 +241,41 @@ export function ConfigBand(props: ConfigBandProps) {
         >
           <Scissors size={14} />
           全部切割
+        </button>
+        <button
+          onClick={props.onCleanCutNoise}
+          disabled={props.busy || !props.hasSegments}
+          title="按当前静音阈值，把所有已切割 WAV 开头/结尾低于阈值的底噪写成 0；不重新切割、不改变片段长度"
+        >
+          <Eraser size={14} />
+          清除底噪
+        </button>
+        <button
+          onClick={props.onRepairCutSilence}
+          disabled={props.busy || !props.hasSegments}
+          title="按当前前/后留空和静音阈值，重新裁掉已切片多余静音并清除边界底噪；会更新片段时长"
+        >
+          <Ruler size={14} />
+          修复留空
+        </button>
+        <button
+          onClick={props.onValidateCuts}
+          disabled={props.busy || !props.hasSegments}
+          title="按当前切割策略检测所有已切割片段的前/后留空和最短语音，异常片段会标红"
+        >
+          <ShieldCheck size={14} />
+          检测切片
+          {props.cutValidationSummary && (
+            <span
+              className={`button-pill ${
+                props.cutValidationSummary.failed > 0 ? "danger" : "success"
+              }`}
+            >
+              {props.cutValidationSummary.failed > 0
+                ? `${props.cutValidationSummary.failed} 异常`
+                : "通过"}
+            </span>
+          )}
         </button>
         <button
           onClick={props.onRecognizeVisible}

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Read};
@@ -29,9 +31,9 @@ const DEFAULT_LLM_PROMPT: &str = include_str!("default_llm_prompt.txt");
 /// (0x08000000) tells CreateProcess to suppress the console.
 ///
 /// On macOS / Linux this is a transparent passthrough.
-fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+fn silent_command<S: AsRef<OsStr>>(program: S) -> Command {
     #[allow(unused_mut)]
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(resolve_command_program(program.as_ref()));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -39,6 +41,91 @@ fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
+}
+
+fn resolve_command_program(program: &OsStr) -> OsString {
+    let Some(name) = program.to_str() else {
+        return program.to_os_string();
+    };
+    if name.contains('/') || name.contains('\\') || !matches!(name, "ffmpeg" | "ffprobe") {
+        return program.to_os_string();
+    }
+    find_executable(name)
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| program.to_os_string())
+}
+
+fn find_executable(name: &str) -> Option<PathBuf> {
+    if let Some(paths) = env::var_os("PATH") {
+        for dir in env::split_paths(&paths) {
+            if let Some(path) = executable_in_dir(&dir, name) {
+                return Some(path);
+            }
+        }
+    }
+    for dir in common_binary_dirs() {
+        if let Some(path) = executable_in_dir(Path::new(dir), name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn executable_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    executable_names(name)
+        .into_iter()
+        .map(|candidate| dir.join(candidate))
+        .find(|path| path.is_file())
+}
+
+#[cfg(windows)]
+fn executable_names(name: &str) -> Vec<OsString> {
+    let base = OsString::from(name);
+    if Path::new(name).extension().is_some() {
+        return vec![base];
+    }
+    let mut names = vec![base.clone()];
+    let pathext = env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+    for ext in pathext.to_string_lossy().split(';') {
+        if ext.is_empty() {
+            continue;
+        }
+        names.push(OsString::from(format!(
+            "{}{}",
+            name,
+            ext.to_ascii_lowercase()
+        )));
+        names.push(OsString::from(format!(
+            "{}{}",
+            name,
+            ext.to_ascii_uppercase()
+        )));
+    }
+    names
+}
+
+#[cfg(not(windows))]
+fn executable_names(name: &str) -> Vec<OsString> {
+    vec![OsString::from(name)]
+}
+
+#[cfg(target_os = "macos")]
+fn common_binary_dirs() -> &'static [&'static str] {
+    &["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn common_binary_dirs() -> &'static [&'static str] {
+    &["/usr/local/bin", "/usr/bin", "/bin"]
+}
+
+#[cfg(windows)]
+fn common_binary_dirs() -> &'static [&'static str] {
+    &[
+        r"C:\ffmpeg\bin",
+        r"C:\Program Files\ffmpeg\bin",
+        r"C:\Program Files (x86)\ffmpeg\bin",
+    ]
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +202,45 @@ pub(crate) struct SegmentRecord {
     pub(crate) emotion: Vec<String>,
     pub(crate) tags: Vec<String>,
     pub(crate) notes: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CutValidationResult {
+    segment_id: String,
+    segment_path: String,
+    segment_file_name: String,
+    ok: bool,
+    leading_silence_ms: u64,
+    trailing_silence_ms: u64,
+    max_leading_silence_ms: u64,
+    max_trailing_silence_ms: u64,
+    threshold_db: f32,
+    all_silence: bool,
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanCutNoiseResult {
+    processed_count: usize,
+    validation: Vec<CutValidationResult>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairCutSilenceResult {
+    processed_count: usize,
+    updated_segments: Vec<SegmentRecord>,
+    validation: Vec<CutValidationResult>,
+}
+
+#[derive(Clone, Debug)]
+struct SegmentEdgeSilence {
+    leading_ms: u64,
+    trailing_ms: u64,
+    duration_ms: u64,
+    all_silence: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1000,6 +1126,147 @@ async fn cut_audio_file(
 }
 
 #[tauri::command]
+async fn validate_cut_segments(
+    segments: Vec<SegmentRecord>,
+    config: CutConfig,
+) -> Result<Vec<CutValidationResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || validate_cut_segments_impl(segments, config))
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn clean_cut_segment_noise(
+    segments: Vec<SegmentRecord>,
+    config: CutConfig,
+) -> Result<CleanCutNoiseResult, String> {
+    tauri::async_runtime::spawn_blocking(move || clean_cut_segment_noise_impl(segments, config))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+async fn repair_cut_segment_silence(
+    segments: Vec<SegmentRecord>,
+    config: CutConfig,
+) -> Result<RepairCutSilenceResult, String> {
+    tauri::async_runtime::spawn_blocking(move || repair_cut_segment_silence_impl(segments, config))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn validate_cut_segments_impl(
+    segments: Vec<SegmentRecord>,
+    config: CutConfig,
+) -> Vec<CutValidationResult> {
+    segments
+        .iter()
+        .map(|segment| validate_cut_segment(segment, &config))
+        .collect()
+}
+
+fn clean_cut_segment_noise_impl(
+    segments: Vec<SegmentRecord>,
+    config: CutConfig,
+) -> Result<CleanCutNoiseResult, String> {
+    for segment in &segments {
+        gate_segment_head_tail(Path::new(&segment.segment_path), config.silence_db)?;
+    }
+    let validation = validate_cut_segments_impl(segments, config);
+    Ok(CleanCutNoiseResult {
+        processed_count: validation.len(),
+        validation,
+    })
+}
+
+fn repair_cut_segment_silence_impl(
+    segments: Vec<SegmentRecord>,
+    config: CutConfig,
+) -> Result<RepairCutSilenceResult, String> {
+    let mut updated_segments = Vec::with_capacity(segments.len());
+    for mut segment in segments {
+        let path = Path::new(&segment.segment_path);
+        let (head_trim_ms, new_duration_ms) = trim_segment_head_tail(
+            path,
+            config.silence_db,
+            config.pre_roll_ms,
+            config.post_roll_ms,
+        )?;
+        gate_segment_head_tail(path, config.silence_db)?;
+        if new_duration_ms > 0 {
+            segment.start_ms = segment.start_ms.saturating_add(head_trim_ms);
+            segment.duration_ms = new_duration_ms;
+            segment.end_ms = segment.start_ms.saturating_add(new_duration_ms);
+        }
+        updated_segments.push(segment);
+    }
+    let validation = validate_cut_segments_impl(updated_segments.clone(), config);
+    Ok(RepairCutSilenceResult {
+        processed_count: validation.len(),
+        updated_segments,
+        validation,
+    })
+}
+
+fn validate_cut_segment(segment: &SegmentRecord, config: &CutConfig) -> CutValidationResult {
+    const EDGE_TOLERANCE_MS: u64 = 1;
+    let mut result = CutValidationResult {
+        segment_id: segment.id.clone(),
+        segment_path: segment.segment_path.clone(),
+        segment_file_name: segment.segment_file_name.clone(),
+        ok: false,
+        leading_silence_ms: 0,
+        trailing_silence_ms: 0,
+        max_leading_silence_ms: config.pre_roll_ms,
+        max_trailing_silence_ms: config.post_roll_ms,
+        threshold_db: config.silence_db,
+        all_silence: false,
+        message: None,
+    };
+
+    match analyze_segment_edge_silence(Path::new(&segment.segment_path), config.silence_db) {
+        Ok(edges) => {
+            result.leading_silence_ms = edges.leading_ms;
+            result.trailing_silence_ms = edges.trailing_ms;
+            result.all_silence = edges.all_silence;
+            let leading_ok = edges.leading_ms <= config.pre_roll_ms + EDGE_TOLERANCE_MS;
+            let trailing_ok = edges.trailing_ms <= config.post_roll_ms + EDGE_TOLERANCE_MS;
+            let duration_ok = edges.duration_ms >= config.min_segment_ms;
+            result.ok = !edges.all_silence && leading_ok && trailing_ok && duration_ok;
+            if !result.ok {
+                let mut parts = Vec::new();
+                if edges.all_silence {
+                    parts.push("整段低于静音阈值".to_string());
+                }
+                if !leading_ok {
+                    parts.push(format!(
+                        "前留空 {}ms > {}ms",
+                        edges.leading_ms, config.pre_roll_ms
+                    ));
+                }
+                if !trailing_ok {
+                    parts.push(format!(
+                        "后留空 {}ms > {}ms",
+                        edges.trailing_ms, config.post_roll_ms
+                    ));
+                }
+                if !duration_ok {
+                    parts.push(format!(
+                        "时长 {}ms < 最短语音 {}ms",
+                        edges.duration_ms, config.min_segment_ms
+                    ));
+                }
+                result.message = Some(parts.join("；"));
+            }
+        }
+        Err(err) => {
+            result.message = Some(err);
+        }
+    }
+    result
+}
+
+#[tauri::command]
 fn rename_segments_by_dialogue_sequence(
     segments: Vec<SegmentRecord>,
 ) -> Result<Vec<SegmentRecord>, String> {
@@ -1209,6 +1476,10 @@ pub(crate) fn cut_audio_file_impl(
             effective_config.post_roll_ms,
         )
         .unwrap_or((0, raw_end_ms.saturating_sub(raw_start_ms)));
+        // After trimming down to the allowed breathing room, make the
+        // remaining non-speech head/tail bit-true silence. This keeps the
+        // 100/200ms padding budget without leaving room tone in it.
+        let _ = gate_segment_head_tail(&output, effective_config.silence_db as f32);
 
         // Shift segment metadata to match the trimmed file. start_ms /
         // end_ms are positions in the SOURCE audio; trimming X ms off
@@ -1773,9 +2044,7 @@ fn render_messages_payload(messages: &[Value]) -> String {
     out.push_str("{\n  \"messages\":[\n");
     for (i, msg) in messages.iter().enumerate() {
         out.push_str("    {\n");
-        let obj = msg
-            .as_object()
-            .expect("each message must be a JSON object");
+        let obj = msg.as_object().expect("each message must be a JSON object");
         let entries: Vec<String> = obj
             .iter()
             .map(|(k, v)| format!("      {}:{}", json_quote(k), inline_value(v)))
@@ -2361,8 +2630,9 @@ fn parse_segment_output_name(value: &str) -> Option<SegmentOutputName> {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or(file_name.as_str());
-    let re = Regex::new(r"^(文案演绎|自由演绎)_(\d+)_(\d+)(?:_(\d+))?_(陪聊|发音人)$")
-        .expect("valid output file name regex");
+    let re =
+        Regex::new(r"^(文案演绎|文本演绎|自由演绎|自由对话)_(\d+)_(\d+)(?:_(\d+))?_(陪聊|发音人)$")
+            .expect("valid output file name regex");
     let caps = re.captures(stem)?;
     let mode = caps.get(1)?.as_str().to_string();
     let topic_id = caps.get(2)?.as_str().parse::<u32>().ok()?;
@@ -2522,7 +2792,7 @@ fn segment_name_seed(segment: &SegmentRecord) -> Option<SegmentNameSeed> {
 }
 
 fn dataset_mode(value: &str) -> Option<String> {
-    ["文案演绎", "自由演绎"]
+    ["文案演绎", "文本演绎", "自由演绎", "自由对话"]
         .iter()
         .find(|mode| value.contains(**mode))
         .map(|mode| (*mode).to_string())
@@ -2605,8 +2875,8 @@ fn normalize_target_file_name(value: &str) -> String {
 
 fn strip_role_token_from_stem(stem: &str) -> String {
     // (left_sep) (role) (right_sep | end)
-    let re =
-        Regex::new(r"([_\-])(?:发音人|assistant|陪聊|user)(?:([_\-])|$)").expect("valid regex");
+    let re = Regex::new(r"([_\-])(?:发音人|陪聊人|assistant|陪聊|user)(?:([_\-])|$)")
+        .expect("valid regex");
     let cleaned = re
         .replace(stem, |caps: &regex::Captures| match caps.get(2) {
             Some(right) => right.as_str().to_string(),
@@ -2714,7 +2984,8 @@ fn extract_turn_from_base(base: &str) -> (String, u32) {
 #[cfg(test)]
 fn split_role_suffix(stem: &str) -> (String, Option<String>) {
     // (left_sep) (role) (right_sep | end_of_string)
-    let re = Regex::new(r"([_\-])(发音人|assistant|陪聊|user)(?:([_\-])|$)").expect("valid regex");
+    let re = Regex::new(r"([_\-])(发音人|陪聊人|assistant|陪聊|user)(?:([_\-])|$)")
+        .expect("valid regex");
     if let Some(caps) = re.captures(stem) {
         let role = caps.get(2).unwrap().as_str().to_string();
         let whole = caps.get(0).unwrap();
@@ -2976,12 +3247,7 @@ pub(crate) fn recognize_segments_impl(
                     }
                 };
                 let started = Instant::now();
-                let res = transcribe_remote(
-                    &url,
-                    Path::new(&segment.segment_path),
-                    "zh",
-                    &prompt,
-                );
+                let res = transcribe_remote(&url, Path::new(&segment.segment_path), "zh", &prompt);
                 let elapsed_ms = started.elapsed().as_millis();
                 eprintln!(
                     "[whisper-http {}] {} · {} · {:.1}s · {}",
@@ -3603,13 +3869,8 @@ fn transcribe_remote(
     language: &str,
     initial_prompt: &str,
 ) -> Result<String, String> {
-    let bytes = fs::read(segment_path).map_err(|err| {
-        format!(
-            "读取切片失败 {}: {}",
-            segment_path.display(),
-            err
-        )
-    })?;
+    let bytes = fs::read(segment_path)
+        .map_err(|err| format!("读取切片失败 {}: {}", segment_path.display(), err))?;
     let filename = segment_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -4692,30 +4953,20 @@ fn trim_segment_head_tail(
     let mut i = 12usize;
     while i + 8 <= bytes.len() {
         let chunk_id = [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]];
-        let chunk_size = u32::from_le_bytes([
-            bytes[i + 4],
-            bytes[i + 5],
-            bytes[i + 6],
-            bytes[i + 7],
-        ]) as usize;
+        let chunk_size =
+            u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
         let chunk_data = i + 8;
         match &chunk_id {
             b"fmt " => {
                 if chunk_data + 16 <= bytes.len() {
-                    channels = u16::from_le_bytes([
-                        bytes[chunk_data + 2],
-                        bytes[chunk_data + 3],
-                    ]);
+                    channels = u16::from_le_bytes([bytes[chunk_data + 2], bytes[chunk_data + 3]]);
                     sample_rate = u32::from_le_bytes([
                         bytes[chunk_data + 4],
                         bytes[chunk_data + 5],
                         bytes[chunk_data + 6],
                         bytes[chunk_data + 7],
                     ]);
-                    bps = u16::from_le_bytes([
-                        bytes[chunk_data + 14],
-                        bytes[chunk_data + 15],
-                    ]);
+                    bps = u16::from_le_bytes([bytes[chunk_data + 14], bytes[chunk_data + 15]]);
                 }
             }
             b"data" => {
@@ -4747,8 +4998,7 @@ fn trim_segment_head_tail(
         return Ok((0, 0));
     }
     let frame_count = usable / frame_size;
-    let total_duration_ms =
-        ((frame_count as u64).saturating_mul(1000)) / sample_rate as u64;
+    let total_duration_ms = ((frame_count as u64).saturating_mul(1000)) / sample_rate as u64;
 
     let max_amp: f64 = match bps {
         16 => i16::MAX as f64,
@@ -4860,9 +5110,7 @@ fn trim_segment_head_tail(
         let size_pos = data_start - 4;
         out[size_pos..size_pos + 4].copy_from_slice(&(new_data_len as u32).to_le_bytes());
     }
-    out.extend_from_slice(
-        &bytes[data_start + head_bytes..data_start + head_bytes + new_data_len],
-    );
+    out.extend_from_slice(&bytes[data_start + head_bytes..data_start + head_bytes + new_data_len]);
     let riff_size = (out.len() - 8) as u32;
     out[4..8].copy_from_slice(&riff_size.to_le_bytes());
 
@@ -4872,6 +5120,287 @@ fn trim_segment_head_tail(
     let new_duration_ms =
         ((tail_frame - head_frame) as u64).saturating_mul(1000) / sample_rate as u64;
     Ok((head_trim_ms, new_duration_ms))
+}
+
+/// Hard noise gate on the head and tail of a PCM WAV file.
+///
+/// The cutter first trims the segment down to the configured pre/post
+/// roll. This pass keeps that duration intact, but rewrites any remaining
+/// below-threshold boundary samples to bit-true silence.
+fn gate_segment_head_tail(path: &Path, threshold_db: f32) -> Result<(), String> {
+    let mut bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return Ok(()),
+    };
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Ok(());
+    }
+
+    let mut bps = 0u16;
+    let mut channels = 0u16;
+    let mut data_start = 0usize;
+    let mut data_len = 0usize;
+    let mut i = 12usize;
+    while i + 8 <= bytes.len() {
+        let chunk_id = [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]];
+        let chunk_size =
+            u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
+        let chunk_data = i + 8;
+        match &chunk_id {
+            b"fmt " => {
+                if chunk_data + 16 <= bytes.len() {
+                    channels = u16::from_le_bytes([bytes[chunk_data + 2], bytes[chunk_data + 3]]);
+                    bps = u16::from_le_bytes([bytes[chunk_data + 14], bytes[chunk_data + 15]]);
+                }
+            }
+            b"data" => {
+                data_start = chunk_data;
+                data_len = chunk_size;
+                break;
+            }
+            _ => {}
+        }
+        i = chunk_data + chunk_size + (chunk_size & 1);
+    }
+
+    if data_start == 0 || data_len == 0 || channels == 0 || !matches!(bps, 16 | 24) {
+        return Ok(());
+    }
+    let bytes_per_channel_sample = bps as usize / 8;
+    let frame_size = bytes_per_channel_sample * channels as usize;
+    if frame_size == 0 {
+        return Ok(());
+    }
+    let data_end = (data_start + data_len).min(bytes.len());
+    let usable = (data_end - data_start) / frame_size * frame_size;
+    if usable == 0 {
+        return Ok(());
+    }
+    let frame_count = usable / frame_size;
+
+    let max_amp: i32 = match bps {
+        16 => i16::MAX as i32,
+        24 => 0x7F_FFFF,
+        _ => return Ok(()),
+    };
+    let amp_threshold = (10.0_f32.powf(threshold_db / 20.0) * max_amp as f32) as i32;
+
+    let read_peak = |bytes: &[u8], frame_off: usize| -> i32 {
+        let mut peak = 0i32;
+        for ch in 0..channels as usize {
+            let p = frame_off + ch * bytes_per_channel_sample;
+            let val = match bps {
+                16 => i16::from_le_bytes([bytes[p], bytes[p + 1]]) as i32,
+                24 => {
+                    let raw = (bytes[p] as i32)
+                        | ((bytes[p + 1] as i32) << 8)
+                        | ((bytes[p + 2] as i32) << 16);
+                    if raw & 0x80_0000 != 0 {
+                        raw | !0xFF_FFFF
+                    } else {
+                        raw
+                    }
+                }
+                _ => 0,
+            };
+            peak = peak.max(val.abs());
+        }
+        peak
+    };
+
+    let mut head = 0usize;
+    while head < frame_count {
+        let off = data_start + head * frame_size;
+        if read_peak(&bytes, off) > amp_threshold {
+            break;
+        }
+        head += 1;
+    }
+
+    let mut tail = frame_count;
+    while tail > head {
+        let off = data_start + (tail - 1) * frame_size;
+        if read_peak(&bytes, off) > amp_threshold {
+            break;
+        }
+        tail -= 1;
+    }
+
+    if head == 0 && tail == frame_count {
+        return Ok(());
+    }
+
+    let head_bytes = head * frame_size;
+    if head_bytes > 0 {
+        for b in &mut bytes[data_start..data_start + head_bytes] {
+            *b = 0;
+        }
+    }
+
+    let tail_start = data_start + tail * frame_size;
+    let tail_end = data_start + frame_count * frame_size;
+    if tail_end > tail_start {
+        for b in &mut bytes[tail_start..tail_end] {
+            *b = 0;
+        }
+    }
+
+    fs::write(path, bytes).map_err(|err| err.to_string())
+}
+
+fn analyze_segment_edge_silence(
+    path: &Path,
+    threshold_db: f32,
+) -> Result<SegmentEdgeSilence, String> {
+    let bytes = fs::read(path).map_err(|err| format!("读取音频失败：{err}"))?;
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("不是可检测的 WAV 文件".to_string());
+    }
+
+    let mut bps = 0u16;
+    let mut channels = 0u16;
+    let mut sample_rate = 0u32;
+    let mut data_start = 0usize;
+    let mut data_len = 0usize;
+    let mut i = 12usize;
+    while i + 8 <= bytes.len() {
+        let chunk_id = [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]];
+        let chunk_size =
+            u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
+        let chunk_data = i + 8;
+        match &chunk_id {
+            b"fmt " => {
+                if chunk_data + 16 <= bytes.len() {
+                    channels = u16::from_le_bytes([bytes[chunk_data + 2], bytes[chunk_data + 3]]);
+                    sample_rate = u32::from_le_bytes([
+                        bytes[chunk_data + 4],
+                        bytes[chunk_data + 5],
+                        bytes[chunk_data + 6],
+                        bytes[chunk_data + 7],
+                    ]);
+                    bps = u16::from_le_bytes([bytes[chunk_data + 14], bytes[chunk_data + 15]]);
+                }
+            }
+            b"data" => {
+                data_start = chunk_data;
+                data_len = chunk_size;
+                break;
+            }
+            _ => {}
+        }
+        i = chunk_data + chunk_size + (chunk_size & 1);
+    }
+
+    if data_start == 0 || data_len == 0 || channels == 0 || sample_rate == 0 {
+        return Err("WAV 缺少可检测的 PCM 数据".to_string());
+    }
+    if !matches!(bps, 16 | 24) {
+        return Err(format!("暂不支持 {}-bit WAV 检测", bps));
+    }
+
+    let bytes_per_channel_sample = bps as usize / 8;
+    let frame_size = bytes_per_channel_sample * channels as usize;
+    if frame_size == 0 {
+        return Err("WAV 帧大小异常".to_string());
+    }
+    let data_end = (data_start + data_len).min(bytes.len());
+    let usable = (data_end - data_start) / frame_size * frame_size;
+    if usable == 0 {
+        return Err("WAV 数据为空".to_string());
+    }
+
+    let frame_count = usable / frame_size;
+    let total_ms = ((frame_count as f64 * 1000.0) / sample_rate as f64).round() as u64;
+    let max_amp = match bps {
+        16 => i16::MAX as f64,
+        24 => 0x7F_FFFF as f64,
+        _ => unreachable!(),
+    };
+    let amp_threshold = 10.0_f64.powf(threshold_db as f64 / 20.0) * max_amp;
+
+    let frame_peak = |frame_idx: usize| -> f64 {
+        let mut peak = 0.0_f64;
+        let off = data_start + frame_idx * frame_size;
+        for ch in 0..channels as usize {
+            let p = off + ch * bytes_per_channel_sample;
+            let val: f64 = match bps {
+                16 => i16::from_le_bytes([bytes[p], bytes[p + 1]]) as f64,
+                24 => {
+                    let raw = (bytes[p] as i32)
+                        | ((bytes[p + 1] as i32) << 8)
+                        | ((bytes[p + 2] as i32) << 16);
+                    let signed = if raw & 0x80_0000 != 0 {
+                        raw | !0xFF_FFFF
+                    } else {
+                        raw
+                    };
+                    signed as f64
+                }
+                _ => 0.0,
+            };
+            peak = peak.max(val.abs());
+        }
+        peak
+    };
+
+    let window_frames = ((sample_rate as u64 * 20) / 1000).max(1) as usize;
+    let window_rms = |start_frame: usize| -> f64 {
+        let end = (start_frame + window_frames).min(frame_count);
+        if end <= start_frame {
+            return 0.0;
+        }
+        let mut sum_sq = 0.0_f64;
+        let mut n = 0u64;
+        for f in start_frame..end {
+            let p = frame_peak(f);
+            sum_sq += p * p;
+            n += 1;
+        }
+        if n == 0 {
+            0.0
+        } else {
+            (sum_sq / n as f64).sqrt()
+        }
+    };
+
+    let mut head_frame = 0usize;
+    while head_frame < frame_count {
+        if window_rms(head_frame) > amp_threshold {
+            break;
+        }
+        head_frame += window_frames;
+    }
+
+    let mut tail_frame = frame_count;
+    while tail_frame > head_frame {
+        let start = tail_frame.saturating_sub(window_frames);
+        if window_rms(start) > amp_threshold {
+            break;
+        }
+        tail_frame = start;
+        if tail_frame == 0 {
+            break;
+        }
+    }
+
+    if tail_frame <= head_frame {
+        return Ok(SegmentEdgeSilence {
+            leading_ms: total_ms,
+            trailing_ms: total_ms,
+            duration_ms: total_ms,
+            all_silence: true,
+        });
+    }
+
+    let leading_ms = ((head_frame as f64 * 1000.0) / sample_rate as f64).round() as u64;
+    let trailing_frames = frame_count.saturating_sub(tail_frame);
+    let trailing_ms = ((trailing_frames as f64 * 1000.0) / sample_rate as f64).round() as u64;
+    Ok(SegmentEdgeSilence {
+        leading_ms,
+        trailing_ms,
+        duration_ms: total_ms,
+        all_silence: false,
+    })
 }
 
 fn write_pcm_wav_segment(
@@ -5008,6 +5537,49 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
+        let data_len = (samples.len() * 2) as u32;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        fs::write(path, bytes).expect("write wav");
+    }
+
+    fn read_pcm16_mono_samples(path: &Path) -> Vec<i16> {
+        let bytes = fs::read(path).expect("read wav");
+        let mut i = 12usize;
+        while i + 8 <= bytes.len() {
+            let chunk_id = [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]];
+            let chunk_size =
+                u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]])
+                    as usize;
+            let chunk_data = i + 8;
+            if &chunk_id == b"data" {
+                let end = (chunk_data + chunk_size).min(bytes.len());
+                return bytes[chunk_data..end]
+                    .chunks_exact(2)
+                    .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
+            }
+            i = chunk_data + chunk_size + (chunk_size & 1);
+        }
+        Vec::new()
+    }
+
     #[test]
     fn parses_loose_manifest_records() {
         let data = r#"
@@ -5061,6 +5633,18 @@ mod tests {
         assert_eq!(
             build_segment_file_name(free_topic, Some("assistant"), Some(2), &[], 0, 0, 1000),
             "自由演绎_0002_01_01_发音人.wav"
+        );
+
+        let text_acting = Path::new("/tmp/台湾话-发音人-文本演绎-话题56.wav");
+        assert_eq!(
+            build_segment_file_name(text_acting, Some("assistant"), None, &[], 0, 5718, 32726),
+            "文本演绎_0056_01_01_发音人.wav"
+        );
+
+        let free_dialogue = Path::new("/tmp/长沙方言-0413-自由对话-陪聊-话题1.wav");
+        assert_eq!(
+            build_segment_file_name(free_dialogue, Some("user"), None, &[], 0, 0, 1000),
+            "自由对话_0001_01_01_陪聊.wav"
         );
     }
 
@@ -5235,6 +5819,13 @@ mod tests {
             (
                 "长沙方言-0413-文案演绎-话题2".to_string(),
                 Some("陪聊".to_string()),
+            ),
+        );
+        assert_eq!(
+            split_role_suffix("台湾话-陪聊人-文本演绎-话题56"),
+            (
+                "台湾话-文本演绎-话题56".to_string(),
+                Some("陪聊人".to_string()),
             ),
         );
 
@@ -5807,8 +6398,15 @@ mod tests {
             .expect("ffmpeg should produce test fixture");
         assert!(status.success());
 
-        let before = probe_audio(&segment).expect("probe").duration_ms.unwrap_or(0);
-        assert!(before >= 4_900 && before <= 5_100, "fixture len: {}", before);
+        let before = probe_audio(&segment)
+            .expect("probe")
+            .duration_ms
+            .unwrap_or(0);
+        assert!(
+            before >= 4_900 && before <= 5_100,
+            "fixture len: {}",
+            before
+        );
 
         let (head_trim_ms, new_duration_ms) =
             trim_segment_head_tail(&segment, -30.0, 100, 200).expect("trim");
@@ -5828,12 +6426,184 @@ mod tests {
             new_duration_ms
         );
 
-        let after = probe_audio(&segment).expect("probe").duration_ms.unwrap_or(0);
+        let after = probe_audio(&segment)
+            .expect("probe")
+            .duration_ms
+            .unwrap_or(0);
         assert!(
             after >= 1_100 && after <= 1_500,
             "file length after trim: {}",
             after
         );
+
+        let check_config = CutConfig {
+            silence_db: -30.0,
+            min_silence_ms: 300,
+            min_segment_ms: 100,
+            pre_roll_ms: 100,
+            post_roll_ms: 200,
+            max_segment_ms: 0,
+        };
+        let check_segment = SegmentRecord {
+            id: "seg".to_string(),
+            source_path: path_to_string(&segment),
+            source_file_name: "source.wav".to_string(),
+            segment_path: path_to_string(&segment),
+            segment_file_name: "seg.wav".to_string(),
+            role: None,
+            start_ms: 0,
+            end_ms: after,
+            duration_ms: after,
+            original_text: String::new(),
+            phonetic_text: String::new(),
+            emotion: Vec::new(),
+            tags: Vec::new(),
+            notes: String::new(),
+        };
+        let quality = validate_cut_segment(&check_segment, &check_config);
+        assert!(quality.ok, "quality check failed: {:?}", quality);
+        assert!(quality.leading_silence_ms <= 100);
+        assert!(quality.trailing_silence_ms <= 200);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn gate_segment_head_tail_zeroes_only_boundary_noise() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dialect_labeler_gate_{}", stamp));
+        fs::create_dir_all(&root).expect("temp dir");
+        let segment = root.join("gate.wav");
+
+        let mut samples = Vec::new();
+        samples.extend(std::iter::repeat(500i16).take(1_600));
+        samples.extend(std::iter::repeat(5_000i16).take(3_200));
+        samples.extend(std::iter::repeat(-500i16).take(1_600));
+        write_pcm16_mono_wav(&segment, 16_000, &samples);
+
+        gate_segment_head_tail(&segment, -30.0).expect("gate");
+
+        let gated = read_pcm16_mono_samples(&segment);
+        assert_eq!(gated.len(), samples.len());
+        assert!(gated[..1_600].iter().all(|sample| *sample == 0));
+        assert!(gated[1_600..4_800].iter().all(|sample| *sample == 5_000));
+        assert!(gated[4_800..].iter().all(|sample| *sample == 0));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn clean_cut_segment_noise_impl_gates_then_validates() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dialect_labeler_clean_{}", stamp));
+        fs::create_dir_all(&root).expect("temp dir");
+        let segment_path = root.join("clean.wav");
+
+        let mut samples = Vec::new();
+        samples.extend(std::iter::repeat(500i16).take(1_600));
+        samples.extend(std::iter::repeat(5_000i16).take(3_200));
+        samples.extend(std::iter::repeat(-500i16).take(3_200));
+        write_pcm16_mono_wav(&segment_path, 16_000, &samples);
+
+        let segment = SegmentRecord {
+            id: "clean".to_string(),
+            source_path: path_to_string(&segment_path),
+            source_file_name: "source.wav".to_string(),
+            segment_path: path_to_string(&segment_path),
+            segment_file_name: "clean.wav".to_string(),
+            role: None,
+            start_ms: 0,
+            end_ms: 500,
+            duration_ms: 500,
+            original_text: String::new(),
+            phonetic_text: String::new(),
+            emotion: Vec::new(),
+            tags: Vec::new(),
+            notes: String::new(),
+        };
+        let config = CutConfig {
+            silence_db: -30.0,
+            min_silence_ms: 300,
+            min_segment_ms: 100,
+            pre_roll_ms: 100,
+            post_roll_ms: 200,
+            max_segment_ms: 0,
+        };
+
+        let result = clean_cut_segment_noise_impl(vec![segment], config).expect("clean");
+        assert_eq!(result.processed_count, 1);
+        assert_eq!(result.validation.len(), 1);
+        assert!(result.validation[0].ok, "{:?}", result.validation[0]);
+
+        let gated = read_pcm16_mono_samples(&segment_path);
+        assert!(gated[..1_600].iter().all(|sample| *sample == 0));
+        assert!(gated[4_800..].iter().all(|sample| *sample == 0));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn repair_cut_segment_silence_impl_trims_padding_and_updates_metadata() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dialect_labeler_repair_{}", stamp));
+        fs::create_dir_all(&root).expect("temp dir");
+        let segment_path = root.join("repair.wav");
+
+        let mut samples = Vec::new();
+        samples.extend(std::iter::repeat(0i16).take(3_200));
+        samples.extend(std::iter::repeat(5_000i16).take(3_200));
+        samples.extend(std::iter::repeat(0i16).take(4_800));
+        write_pcm16_mono_wav(&segment_path, 16_000, &samples);
+
+        let segment = SegmentRecord {
+            id: "repair".to_string(),
+            source_path: path_to_string(&segment_path),
+            source_file_name: "source.wav".to_string(),
+            segment_path: path_to_string(&segment_path),
+            segment_file_name: "repair.wav".to_string(),
+            role: None,
+            start_ms: 1_000,
+            end_ms: 1_700,
+            duration_ms: 700,
+            original_text: String::new(),
+            phonetic_text: String::new(),
+            emotion: Vec::new(),
+            tags: Vec::new(),
+            notes: String::new(),
+        };
+        let config = CutConfig {
+            silence_db: -30.0,
+            min_silence_ms: 300,
+            min_segment_ms: 100,
+            pre_roll_ms: 100,
+            post_roll_ms: 200,
+            max_segment_ms: 0,
+        };
+
+        let result = repair_cut_segment_silence_impl(vec![segment], config).expect("repair");
+        assert_eq!(result.processed_count, 1);
+        assert_eq!(result.updated_segments.len(), 1);
+        assert!(result.validation[0].ok, "{:?}", result.validation[0]);
+
+        let updated = &result.updated_segments[0];
+        assert_eq!(updated.start_ms, 1_100);
+        assert_eq!(updated.duration_ms, 500);
+        assert_eq!(updated.end_ms, 1_600);
+
+        let repaired = read_pcm16_mono_samples(&segment_path);
+        assert_eq!(repaired.len(), 8_000);
+        assert!(repaired[..1_600].iter().all(|sample| *sample == 0));
+        assert!(repaired[1_600..4_800].iter().all(|sample| *sample == 5_000));
+        assert!(repaired[4_800..].iter().all(|sample| *sample == 0));
 
         fs::remove_dir_all(root).ok();
     }
@@ -5866,12 +6636,18 @@ mod tests {
             .status()
             .expect("ffmpeg should run");
         assert!(status.success());
-        let before = probe_audio(&segment).expect("probe").duration_ms.unwrap_or(0);
+        let before = probe_audio(&segment)
+            .expect("probe")
+            .duration_ms
+            .unwrap_or(0);
 
         let (head_trim_ms, new_duration_ms) =
             trim_segment_head_tail(&segment, -30.0, 100, 200).expect("trim");
         assert_eq!(head_trim_ms, 0);
-        let after = probe_audio(&segment).expect("probe").duration_ms.unwrap_or(0);
+        let after = probe_audio(&segment)
+            .expect("probe")
+            .duration_ms
+            .unwrap_or(0);
         // All-silence segment should not be deleted; duration unchanged.
         assert_eq!(after, before, "all-silence file should not be shortened");
         assert!(new_duration_ms >= before.saturating_sub(50));
@@ -6119,6 +6895,9 @@ pub fn run() {
             set_playback_speed,
             scan_project_folder,
             cut_audio_file,
+            validate_cut_segments,
+            clean_cut_segment_noise,
+            repair_cut_segment_silence,
             recognize_segments,
             cancel_recognize,
             polish_text_with_llm,
