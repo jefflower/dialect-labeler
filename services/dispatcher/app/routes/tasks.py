@@ -33,20 +33,33 @@ from sqlalchemy.orm import Session
 
 from ..auth import CurrentUser
 from ..db import get_db
-from ..models import TASK_PENDING, TASK_SUCCEEDED, Task, utcnow
+from ..models import (
+    TASK_EXPIRED,
+    TASK_FAILED,
+    TASK_PENDING,
+    TASK_SUCCEEDED,
+    Task,
+    User,
+    utcnow,
+)
 from ..schemas import TaskOut
 from ..storage import Storage, get_storage, input_key, output_key
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
 
-def _task_to_out(task: Task) -> TaskOut:
+def _task_to_out(task: Task, db: Session | None = None) -> TaskOut:
     summary = None
     if task.summary_json:
         try:
             summary = json.loads(task.summary_json)
         except json.JSONDecodeError:
             summary = None
+    claimer_email: str | None = None
+    if task.claimed_by is not None and db is not None:
+        claimer = db.get(User, task.claimed_by)
+        if claimer:
+            claimer_email = claimer.email
     data = {
         "id": task.id,
         "owner_id": task.owner_id,
@@ -63,6 +76,8 @@ def _task_to_out(task: Task) -> TaskOut:
         "created_at": task.created_at,
         "updated_at": task.updated_at,
         "completed_at": task.completed_at,
+        "claimer_email": claimer_email,
+        "claim_expires_at": task.claim_expires_at,
     }
     return TaskOut(**data)
 
@@ -99,7 +114,7 @@ async def create_task(
     db.add(task)
     db.commit()
     db.refresh(task)
-    return _task_to_out(task)
+    return _task_to_out(task, db)
 
 
 @router.get("", response_model=list[TaskOut])
@@ -113,7 +128,7 @@ def list_tasks(
     if not user.is_admin:
         stmt = stmt.where(Task.owner_id == user.id)
     rows = db.execute(stmt).scalars().all()
-    return [_task_to_out(t) for t in rows]
+    return [_task_to_out(t, db) for t in rows]
 
 
 def _load_owned(db: Session, task_id: str, user) -> Task:
@@ -131,7 +146,7 @@ def get_task(
     user: CurrentUser,
     db: Annotated[Session, Depends(get_db)],
 ) -> TaskOut:
-    return _task_to_out(_load_owned(db, task_id, user))
+    return _task_to_out(_load_owned(db, task_id, user), db)
 
 
 @router.get("/{task_id}/output")
@@ -164,6 +179,48 @@ def download_output(
         filename=f"{task.name or task.id}.zip",
         media_type="application/zip",
     )
+
+
+@router.post("/{task_id}/retry", response_model=TaskOut)
+def retry_task(
+    task_id: str,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+    storage: Annotated[Storage, Depends(get_storage)],
+) -> TaskOut:
+    """Move a failed (or expired) task back to `pending`.
+
+    Refuses when the input zip is gone — the cleaner already collected
+    it, so there's nothing for a Worker to chew on. The caller can
+    still soft-delete the row with DELETE if they want it off the list.
+    """
+    task = _load_owned(db, task_id, user)
+    if task.status not in (TASK_FAILED, TASK_EXPIRED):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot retry task in state {task.status}",
+        )
+    if not task.input_path or not storage.exists(task.input_path):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Input file has been cleaned up; cannot retry",
+        )
+    task.status = TASK_PENDING
+    task.error = None
+    task.claimed_by = None
+    task.claim_expires_at = None
+    task.completed_at = None
+    task.updated_at = utcnow()
+    # Clear any half-uploaded output from a previous attempt.
+    if task.output_path:
+        storage.unlink(task.output_path)
+    task.output_path = None
+    task.output_size = None
+    task.output_ready_at = None
+    task.output_downloaded_at = None
+    db.commit()
+    db.refresh(task)
+    return _task_to_out(task, db)
 
 
 @router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)

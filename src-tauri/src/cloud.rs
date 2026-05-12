@@ -497,10 +497,17 @@ fn worker_loop(app: AppHandle, cancel: Arc<AtomicBool>) {
 
         match client.claim() {
             Ok(None) => {
+                // Empty queue is the steady state. Clear any error
+                // banner from a previous transient failure so the UI
+                // doesn't keep showing stale text indefinitely.
                 state.set_last_error(None);
+                let _ = app.emit("cloud://status-changed", ());
                 sleep_with_cancel(&cancel, POLL_INTERVAL_SECONDS);
             }
             Ok(Some(claim)) => {
+                // Reaching this point means the dispatcher is healthy
+                // and the token is valid — clear any prior error.
+                state.set_last_error(None);
                 let task_id = claim.id.clone();
                 let task_name = claim.name.clone();
                 state.set_current_task(Some(CurrentTask {
@@ -528,6 +535,7 @@ fn worker_loop(app: AppHandle, cancel: Arc<AtomicBool>) {
             }
             Err(err) => {
                 state.set_last_error(Some(err.to_string()));
+                let _ = app.emit("cloud://status-changed", ());
                 sleep_with_cancel(&cancel, POLL_INTERVAL_SECONDS * 2);
             }
         }

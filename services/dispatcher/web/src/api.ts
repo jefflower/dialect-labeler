@@ -48,6 +48,8 @@ export interface Task {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  claimer_email: string | null;
+  claim_expires_at: string | null;
 }
 
 export interface TokenResponse {
@@ -153,6 +155,10 @@ export function createTask(name: string, file: File) {
 
 export function deleteTask(id: string) {
   return request<void>(`/api/tasks/${id}`, { method: "DELETE" });
+}
+
+export function retryTask(id: string) {
+  return request<Task>(`/api/tasks/${id}/retry`, { method: "POST" });
 }
 
 /** Returns the download URL — we let the browser handle the actual GET

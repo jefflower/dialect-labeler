@@ -252,3 +252,38 @@ npx tauri signer generate -w ~/.tauri/dialect-labeler.key
 ### 仪表盘
 
 管理员登录后 `/admin` 是仪表盘：当前队列深度、处理中任务数、24 小时成功/失败、磁盘按 inputs/outputs/releases 分类的占用。每 5 秒自动刷新。
+
+### 运维：备份与日志
+
+整套服务的状态都在两个地方：
+
+- **`services/dispatcher/data/dispatcher.db`** — SQLite，所有账号、任务元数据、`summary_json`、发布记录都在这。
+- **`services/dispatcher/data/storage/`** — 待处理的输入 zip、未下载的产物 zip、客户端安装包。
+
+#### 日常备份
+
+```bash
+# 在调度服务器上每日定时跑（cron / launchd 都行）
+tar -czf "backups/dispatcher-$(date +%F).tgz" services/dispatcher/data
+# 保留最近 14 天
+find backups -name 'dispatcher-*.tgz' -mtime +14 -delete
+```
+
+SQLite 在 WAL 模式下读写并发友好；备份过程中应用照常服务。
+
+#### 日志查看
+
+Dispatcher 默认把结构化访问日志写到 stdout，Docker Compose 部署直接：
+
+```bash
+docker compose logs -f --tail=100 api | grep req=
+```
+
+每行形如：
+```
+2026-05-12 14:36:46,478 INFO dispatcher req=ef8192ed GET /api/admin/stats status=200 elapsed=4.1ms
+```
+
+`req=<id>` 出现在响应的 `X-Request-ID` 头里，前端报错时把这串 ID 贴回来就能精准定位。
+
+要换 JSON 一行格式接 ELK / Loki，调一下 `app/main.py` 顶部的 `logging.basicConfig`（一行 format 字符串）即可。

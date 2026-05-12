@@ -53,6 +53,11 @@ class TaskOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
+    # Worker visibility — populated while a Worker holds the lease.
+    # `claimer_email` resolves the FK on the way out so the UI can
+    # show "being processed by X" without an extra fetch.
+    claimer_email: str | None = None
+    claim_expires_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 

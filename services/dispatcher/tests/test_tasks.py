@@ -106,6 +106,106 @@ def test_download_pending_task_output_is_409(client: TestClient) -> None:
     assert resp.status_code == 409
 
 
+def test_retry_failed_task_resets_to_pending(client: TestClient) -> None:
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+
+    # Create + claim + fail.
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "doomed"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = resp.json()["id"]
+    client.post("/api/worker/claim", headers=auth_headers(worker))
+    client.post(
+        f"/api/worker/tasks/{task_id}/fail",
+        json={"error": "ffmpeg crashed"},
+        headers=auth_headers(worker),
+    )
+
+    # Owner retries.
+    resp = client.post(f"/api/tasks/{task_id}/retry", headers=auth_headers(owner))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["error"] is None
+
+    # A worker can claim it again.
+    claim = client.post("/api/worker/claim", headers=auth_headers(worker))
+    assert claim.status_code == 200
+    assert claim.json()["id"] == task_id
+
+
+def test_retry_refuses_when_input_cleaned(client: TestClient, tmp_state) -> None:
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "doomed"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = resp.json()["id"]
+    client.post("/api/worker/claim", headers=auth_headers(worker))
+    client.post(
+        f"/api/worker/tasks/{task_id}/fail",
+        json={"error": "boom"},
+        headers=auth_headers(worker),
+    )
+
+    # Simulate the cleaner having unlinked the input zip.
+    from app.db import session_scope
+    from app.models import Task
+
+    with session_scope() as db:
+        t = db.get(Task, task_id)
+        if t.input_path:
+            (tmp_state / "storage" / t.input_path).unlink(missing_ok=True)
+
+    resp = client.post(f"/api/tasks/{task_id}/retry", headers=auth_headers(owner))
+    assert resp.status_code == 410
+
+
+def test_retry_refuses_when_task_still_pending(client: TestClient) -> None:
+    register(client, "o@example.com")
+    owner = login(client, "o@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "still-going"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = resp.json()["id"]
+    resp = client.post(f"/api/tasks/{task_id}/retry", headers=auth_headers(owner))
+    assert resp.status_code == 409
+
+
+def test_task_detail_exposes_claimer_email_during_lease(client: TestClient) -> None:
+    register(client, "o@example.com")
+    register(client, "robot@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "robot@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "watch-me"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = resp.json()["id"]
+    client.post("/api/worker/claim", headers=auth_headers(worker))
+
+    resp = client.get(f"/api/tasks/{task_id}", headers=auth_headers(owner))
+    body = resp.json()
+    assert body["claimer_email"] == "robot@example.com"
+    assert body["claim_expires_at"] is not None
+
+
 def test_delete_removes_files_and_row(client: TestClient, tmp_state) -> None:
     register(client, "u@example.com")
     token = login(client, "u@example.com")

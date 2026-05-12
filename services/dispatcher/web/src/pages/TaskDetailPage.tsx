@@ -5,6 +5,7 @@ import {
   deleteTask,
   downloadOutput,
   getTask,
+  retryTask,
   Task,
 } from "../api";
 import {
@@ -77,6 +78,20 @@ export default function TaskDetailPage() {
     }
   }
 
+  async function onRetry() {
+    if (!task) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await retryTask(task.id);
+      setTask(next);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (!task) {
     return (
       <div className="page">
@@ -108,6 +123,16 @@ export default function TaskDetailPage() {
         </span>
         <div className="grow" />
         <button onClick={() => navigate("/tasks")}>← 返回列表</button>
+        {(task.status === "failed" || task.status === "expired") && (
+          <button
+            className="primary"
+            onClick={onRetry}
+            disabled={busy}
+            title="把任务重新放回队列等待其他 Worker 接单"
+          >
+            重试
+          </button>
+        )}
         <button
           className="danger"
           onClick={onDelete}
@@ -131,6 +156,19 @@ export default function TaskDetailPage() {
           <dd>{task.id}</dd>
           <dt>创建时间</dt>
           <dd title={task.created_at}>{formatRelative(task.created_at)}</dd>
+          {task.claimer_email && (task.status === "claimed" || task.status === "running") && (
+            <>
+              <dt>正在处理</dt>
+              <dd>
+                {task.claimer_email}
+                {task.claim_expires_at && (
+                  <span style={{ color: "var(--muted)" }}>
+                    {" "}· 租约至 {formatRelative(task.claim_expires_at)}
+                  </span>
+                )}
+              </dd>
+            </>
+          )}
           <dt>输入</dt>
           <dd>
             {formatBytes(task.input_size)}
