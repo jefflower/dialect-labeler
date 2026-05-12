@@ -66,7 +66,7 @@ export function Topbar({
         </div>
         <div className="brand-text">
           <h1>
-            长沙方言标注工作台
+            方言标注工作台
             {REVIEW_ONLY && (
               <span className="build-channel-badge" title="无 Whisper / Ollama 集成；只用于审核已处理过的标注">
                 {BUILD_CHANNEL}

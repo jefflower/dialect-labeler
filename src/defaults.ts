@@ -5,20 +5,35 @@ import type {
   InlineTagDef,
   SegmentTagDef,
 } from "./types";
+import { builtinDialectProfiles } from "./dialect_prompts";
+
+export { builtinDialectProfiles } from "./dialect_prompts";
 
 export const defaultCutConfig: CutConfig = {
-  // Spec: anything quieter than -30dB at the head/tail is treated as
-  // silence (covers ambient noise + breath sounds, both of which the
-  // spec says should be trimmed). Stricter than the previous -35.
-  silenceDb: -30,
-  // Spec: 句间静音段最长不超过 0.4s — anything longer is a cut point.
-  minSilenceMs: 400,
-  minSegmentMs: 300,
+  // -26dB tightens detection enough to catch trailing breaths / lip-smack
+  // (typically -22 to -28dB) as silence, so segment tails no longer carry
+  // ~1s of "quiet-but-audible" content past the actual speech end. The
+  // older -30 was lenient enough that soft trailing sounds counted as
+  // voice, pulling voice_end too far past the real word. If your
+  // recordings have audible room tone, drop further to -22 or so.
+  silenceDb: -26,
+  // 600ms is a typical "real sentence boundary" pause in natural Chinese
+  // speech (research literature). The earlier 400ms was so aggressive
+  // that mid-clause breaths split sentences in half. Combined with
+  // minSegmentMs below, brief mid-sentence pauses now merge into the
+  // surrounding phrase instead of producing 4–5s fragments.
+  minSilenceMs: 600,
+  // The silence above is only treated as a real boundary if the
+  // accumulated voice is already at least this long. Short pre-segments
+  // get merged forward; nothing is dropped.
+  minSegmentMs: 800,
   // Spec: 句首静音不超过 100ms（preRoll), 句尾静音不超过 200ms（postRoll).
   preRollMs: 100,
   postRollMs: 200,
-  // 0 = no forced split. Dialogue rounds are kept by silence/timeline only.
-  maxSegmentMs: 0,
+  // 30s hard cap. If no qualifying silence is found, the cutter
+  // force-splits the over-long range into N equal pieces so Whisper
+  // never has to chew on more than ~30s of audio in one call.
+  maxSegmentMs: 30000,
 };
 
 /**
@@ -31,33 +46,33 @@ export const defaultCutPresets: CutPresetDef[] = [
   {
     name: "闲聊（标准）",
     builtin: true,
-    hint: "对话场景默认；按规范 0.4s 停顿切分",
+    hint: "对话默认；自然停顿 ≥0.6s + 段 ≥0.8s 才切；30s 强制拆",
     config: defaultCutConfig,
   },
   {
     name: "演讲 / 朗读",
     builtin: true,
-    hint: "句间停顿明显，最短语音 1s，不按固定时长强制拆",
+    hint: "句间停顿明显，最短语音 1s；30s 强制拆",
     config: {
       silenceDb: -38,
-      minSilenceMs: 600,
+      minSilenceMs: 700,
       minSegmentMs: 1000,
       preRollMs: 80,
       postRollMs: 200,
-      maxSegmentMs: 0,
+      maxSegmentMs: 30000,
     },
   },
   {
     name: "快速对话",
     builtin: true,
-    hint: "节奏快、停顿短；适合采访、相声、快速交流",
+    hint: "节奏快、停顿短；20s 强制拆（采访、相声）",
     config: {
       silenceDb: -32,
-      minSilenceMs: 280,
-      minSegmentMs: 200,
+      minSilenceMs: 350,
+      minSegmentMs: 400,
       preRollMs: 60,
       postRollMs: 140,
-      maxSegmentMs: 0,
+      maxSegmentMs: 20000,
     },
   },
 ];
@@ -156,6 +171,8 @@ export const defaultAppSettings: AppSettings = {
     { url: "http://100.64.0.11:9090" },
     { url: "http://100.64.0.2:9090" },
   ],
+  dialectProfiles: builtinDialectProfiles,
+  activeDialectProfileId: "changsha",
 };
 
 export const roleLabels: Record<string, string> = {

@@ -2110,7 +2110,12 @@ fn build_flat_jsonl(
         };
         let mut message = json!({ "role": role });
         message[content_key] = content_value;
-        message["audio_file"] = json!(audio_path);
+        // Assistant: always array (parallel to content_refine). User: scalar.
+        message["audio_file"] = if role == "assistant" {
+            json!([audio_path])
+        } else {
+            json!(audio_path)
+        };
         if !segment.emotion.is_empty() {
             // Spec rename: `emotion` → `emotion_refine` (mirrors content_refine).
             message["emotion_refine"] = json!(segment.emotion);
@@ -2149,8 +2154,10 @@ fn build_flat_jsonl(
 /// ]}
 /// ```
 ///
-/// Single-segment turns collapse `audio_file` and `emotion` from arrays
-/// to scalars to match the demo's "single string when only one" pattern.
+/// Assistant fields (`content_refine`, `audio_file`, `emotion_refine`)
+/// are ALWAYS arrays — even for a single sub-segment — so downstream
+/// trainers don't need to handle two value shapes. User side stays
+/// scalar when there's only one cut (or `user_use_source` is on).
 fn build_paired_jsonl(
     segments: &[SegmentRecord],
     system_prompt: &str,
@@ -2311,29 +2318,25 @@ fn build_paired_jsonl(
             })
             .collect();
 
-        let single = assistant_segs.len() == 1;
-        let audio_value: Value = if single {
-            audios[0].clone()
-        } else {
-            Value::Array(audios)
-        };
-        // Spec: assistant uses `content_refine` + `emotion_refine`
-        // (mirroring user). Insert in the order the spec demands so
-        // serde_json's preserve_order keeps `role / content_refine /
-        // audio_file / emotion_refine` lined up.
+        // Spec: assistant fields are ALWAYS arrays — single sub-segment
+        // included. Earlier code collapsed length-1 to scalars to mirror
+        // the demo file, but the downstream trainer wants a uniform
+        // shape; mixed scalar/array breaks the array-indexing assumption
+        // (content[i] ↔ audio_file[i] ↔ emotion_refine[i]).
+        //
+        // Order matters: insert keys in `role / content_refine /
+        // audio_file / emotion_refine` so serde_json's preserve_order
+        // (via render_messages_payload's hand-rolled writer) emits them
+        // in the spec's required order.
         let mut a_msg = json!({
             "role": "assistant",
             "content_refine": Value::Array(texts),
-            "audio_file": audio_value,
+            "audio_file": Value::Array(audios),
         });
         // Emit `emotion_refine` only when the labelers actually picked
         // one — an all-empty group means the polish step never ran.
         if assistant_segs.iter().any(|s| !s.emotion.is_empty()) {
-            a_msg["emotion_refine"] = if single {
-                emotions[0].clone()
-            } else {
-                Value::Array(emotions)
-            };
+            a_msg["emotion_refine"] = Value::Array(emotions);
         }
         // No `tags` field — paralinguistic events are carried inline in
         // the content text (e.g. `[breath]`, `<laugh>...</laugh>`).
@@ -2395,7 +2398,13 @@ fn build_single_message_line(
     };
     let mut msg = json!({ "role": role });
     msg[content_key] = content_value;
-    msg["audio_file"] = json!(with_prefix(prefix, &segment.segment_path, input_root));
+    // Assistant: always array (mirrors content_refine). User: scalar.
+    let audio_path = with_prefix(prefix, &segment.segment_path, input_root);
+    msg["audio_file"] = if role == "assistant" {
+        json!([audio_path])
+    } else {
+        json!(audio_path)
+    };
     if !segment.emotion.is_empty() {
         msg["emotion_refine"] = json!(segment.emotion);
     }
@@ -2630,9 +2639,13 @@ fn parse_segment_output_name(value: &str) -> Option<SegmentOutputName> {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or(file_name.as_str());
-    let re =
-        Regex::new(r"^(文案演绎|文本演绎|自由演绎|自由对话)_(\d+)_(\d+)(?:_(\d+))?_(陪聊|发音人)$")
-            .expect("valid output file name regex");
+    // Whitelist must stay in sync with `dataset_mode` below. Order
+    // doesn't matter (regex alternation tries each), but keep it
+    // grouped: 演绎/对话/闲聊/语料 follow the corpus naming convention.
+    let re = Regex::new(
+        r"^(文案演绎|文本演绎|自由演绎|自由对话|自由闲聊|长尾语料)_(\d+)_(\d+)(?:_(\d+))?_(陪聊|发音人)$",
+    )
+    .expect("valid output file name regex");
     let caps = re.captures(stem)?;
     let mode = caps.get(1)?.as_str().to_string();
     let topic_id = caps.get(2)?.as_str().parse::<u32>().ok()?;
@@ -2791,11 +2804,26 @@ fn segment_name_seed(segment: &SegmentRecord) -> Option<SegmentNameSeed> {
     })
 }
 
+/// Dataset "mode" whitelist — substring match into the source filename
+/// stem. Returns the exact token if found; otherwise None.
+///
+/// **Edit policy**: add a new entry when a new corpus bundle introduces
+/// a new descriptor (e.g. 0429-台湾 added `文本演绎`). Do NOT generalise
+/// to regex or auto-derivation — earlier attempts polluted output names
+/// with dialect prefixes like `台湾话-文本演绎`, breaking the canonical
+/// `<mode>_NNNN_NN_NN_<role>.wav` shape.
 fn dataset_mode(value: &str) -> Option<String> {
-    ["文案演绎", "文本演绎", "自由演绎", "自由对话"]
-        .iter()
-        .find(|mode| value.contains(**mode))
-        .map(|mode| (*mode).to_string())
+    [
+        "文案演绎",
+        "文本演绎",
+        "自由演绎",
+        "自由对话",
+        "自由闲聊",
+        "长尾语料",
+    ]
+    .iter()
+    .find(|mode| value.contains(**mode))
+    .map(|mode| (*mode).to_string())
 }
 
 fn last_number(value: &str) -> Option<u32> {
@@ -2875,6 +2903,10 @@ fn normalize_target_file_name(value: &str) -> String {
 
 fn strip_role_token_from_stem(stem: &str) -> String {
     // (left_sep) (role) (right_sep | end)
+    // `陪聊人` MUST come before `陪聊` in the alternation — regex tries
+    // branches left-to-right and `陪聊人` is a longer match. Without the
+    // longer-first ordering, the 0429 台湾 batch's `陪聊人` would only
+    // get its `陪聊` prefix stripped, leaving a dangling `人` in the key.
     let re = Regex::new(r"([_\-])(?:发音人|陪聊人|assistant|陪聊|user)(?:([_\-])|$)")
         .expect("valid regex");
     let cleaned = re
@@ -2920,13 +2952,30 @@ fn strip_role_token_from_stem(stem: &str) -> String {
 /// role token (and one of the surrounding separators) is removed so the
 /// remaining text stays coherent.
 fn pair_key(segment: &SegmentRecord) -> String {
-    if let Some(parts) = parse_segment_output_name(&segment.segment_file_name) {
-        return format!(
-            "{}_{:04}_{:02}",
-            parts.key.mode, parts.key.topic_id, parts.key.round_index
-        );
+    // Try the canonical-naming parser on two candidate sources, in
+    // order of trust: the DB field, then the on-disk filename. They
+    // CAN diverge — `segment_file_name` may still hold an old fallback
+    // form from a binary built before the current dataset_mode
+    // whitelist (e.g. 文本演绎 batches cut by an older build), while
+    // the file on disk has since been renamed to the canonical form
+    // by `plan_dialogue_sequence_file_names`. Without this second try,
+    // user (`陪聊`) and assistant (`发音人`) segments fall into
+    // different fallback keys and never pair → JSONL loses 一来一回.
+    let path_basename = Path::new(&segment.segment_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    for candidate in [segment.segment_file_name.as_str(), path_basename] {
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Some(parts) = parse_segment_output_name(candidate) {
+            return format!(
+                "{}_{:04}_{:02}",
+                parts.key.mode, parts.key.topic_id, parts.key.round_index
+            );
+        }
     }
-
     strip_role_token_from_stem(&path_file_stem(Path::new(&segment.source_path)))
 }
 
@@ -4796,43 +4845,197 @@ fn build_segment_ranges(
     let mut ranges = Vec::new();
     let mut cursor = 0.0;
     let min_segment = config.min_segment_ms as f64 / 1000.0;
+    let max_segment = if config.max_segment_ms > 0 {
+        config.max_segment_ms as f64 / 1000.0
+    } else {
+        f64::INFINITY
+    };
     let pre_roll = config.pre_roll_ms as f64 / 1000.0;
     let post_roll = config.post_roll_ms as f64 / 1000.0;
+
+    // Three booleans / one buffer drive the merge semantics:
+    //
+    //   `skipping_silence` — last Start was rejected (would produce a
+    //     sub-min piece), so the matching End must NOT advance the cursor;
+    //     the silence "vanishes" and audio continues into the next phrase.
+    //
+    //   `in_trailing_silence` — last Start was accepted (range pushed),
+    //     so cursor logically sits at the silence boundary. If the audio
+    //     ends before an End arrives (file ends in silence), the final-
+    //     tail block below must NOT re-push the same range.
+    //
+    //   `skipped_silences` — positions of silence Starts that were too
+    //     short to honour. Used by the force-split path: when the
+    //     accumulated voice exceeds `max_segment`, we prefer cutting at
+    //     one of these "real (but short) pauses" over an arbitrary equal
+    //     split, so the cut feels more natural to the listener.
+    let mut in_trailing_silence = false;
+    // `skipped_silences` stores (silence_start, silence_end) pairs for
+    // every silence that was too short to act as a stand-alone split
+    // point. The force-split logic prefers cutting at one of these natural
+    // pauses (using silence_end as the next sub-segment's start, so the
+    // silence itself stays out of both segments) over equal-split.
+    let mut skipped_silences: Vec<(f64, f64)> = Vec::new();
+    let mut pending_skip_start: Option<f64> = None;
 
     for event in events {
         match event {
             SilenceEvent::Start(start) => {
-                push_padded_range(
+                let seg_duration = *start - cursor;
+                // Head silence (or back-to-back silence events at the same
+                // boundary): no voice between cursor and this silence_start.
+                // The "skip and merge forward" path is wrong here — there's
+                // nothing to merge. Instead let the matching End advance the
+                // cursor through this silence so leading silence gets trimmed.
+                if seg_duration <= 0.0 {
+                    pending_skip_start = None;
+                    in_trailing_silence = true;
+                    skipped_silences.clear();
+                    continue;
+                }
+                if seg_duration < min_segment {
+                    pending_skip_start = Some(*start);
+                    continue;
+                }
+                push_with_smart_split(
                     &mut ranges,
                     cursor,
                     *start,
                     duration_sec,
-                    min_segment,
+                    max_segment,
+                    &skipped_silences,
                     pre_roll,
                     post_roll,
                 );
+                in_trailing_silence = true;
+                skipped_silences.clear();
             }
             SilenceEvent::End(end) => {
+                if let Some(s) = pending_skip_start.take() {
+                    skipped_silences.push((s, *end));
+                    continue;
+                }
                 cursor = (*end).min(duration_sec).max(0.0);
+                in_trailing_silence = false;
             }
         }
     }
 
-    push_padded_range(
-        &mut ranges,
-        cursor,
-        duration_sec,
-        duration_sec,
-        min_segment,
-        pre_roll,
-        post_roll,
-    );
+    if !in_trailing_silence {
+        let tail = duration_sec - cursor;
+        if tail > 0.0 {
+            // Always push the tail as its own segment — even when shorter
+            // than min_segment. Gluing onto the previous segment would
+            // re-introduce the long mid-segment silence (the user reported
+            // a 1s interior silence from exactly that bug). A short
+            // trailing segment is cleaner; user can drop it manually.
+            push_with_smart_split(
+                &mut ranges,
+                cursor,
+                duration_sec,
+                duration_sec,
+                max_segment,
+                &skipped_silences,
+                pre_roll,
+                post_roll,
+            );
+        }
+    }
 
+    // "整段都小于最短时长" escape hatch: if nothing was pushed (audio so
+    // short that even the always-push branch produced zero ranges, e.g.
+    // empty duration), emit the whole file as one range.
     if ranges.is_empty() && duration_sec > 0.0 {
         ranges.push((0.0, duration_sec));
     }
 
     ranges
+}
+
+/// Push a voice range, enforcing `max_segment` as a soft cap.
+///
+/// Within an over-long range we prefer cutting at a *real* (but too-short
+/// for stand-alone splitting) pause carried in `skipped_silences` — that
+/// gives the listener a natural break rather than an arbitrary 30s mark.
+/// Selection rule: latest silence whose start sits within
+/// `[range_start, range_start + max_segment]`. That maximises the first
+/// half while still respecting the cap. Only when no candidate exists in
+/// that window does the equal-N fallback run.
+///
+/// Each silence stays out of BOTH halves: first half ends at silence_start
+/// (last spoken word), second half starts at silence_end (next word). All
+/// pieces get the configured pre/post roll on their outer edges.
+fn push_with_smart_split(
+    ranges: &mut Vec<(f64, f64)>,
+    start: f64,
+    end: f64,
+    duration_sec: f64,
+    max_segment: f64,
+    skipped_silences: &[(f64, f64)],
+    pre_roll: f64,
+    post_roll: f64,
+) {
+    let dur = end - start;
+    if dur <= 0.0 {
+        return;
+    }
+    if !max_segment.is_finite() || dur <= max_segment {
+        push_padded_range(ranges, start, end, duration_sec, 0.0, pre_roll, post_roll);
+        return;
+    }
+
+    // Walk candidates latest → earliest. Pick the first one whose
+    // silence_start fits in [start, start + max_segment]. Each silence is
+    // also constrained to fall inside the current voice range (start, end).
+    let smart = skipped_silences
+        .iter()
+        .rev()
+        .copied()
+        .find(|&(s_silence, _)| {
+            s_silence > start && s_silence < end && (s_silence - start) <= max_segment
+        });
+
+    if let Some((s_silence, e_silence)) = smart {
+        // First half: voice up to the pause start. Already ≤ max by the
+        // window check, so this recursive call won't split again.
+        push_with_smart_split(
+            ranges,
+            start,
+            s_silence,
+            duration_sec,
+            max_segment,
+            skipped_silences,
+            pre_roll,
+            post_roll,
+        );
+        // Second half: voice from where the pause ends, to the original
+        // end. May still exceed max if the original voice was very long
+        // with one early pause; recursion handles that.
+        push_with_smart_split(
+            ranges,
+            e_silence,
+            end,
+            duration_sec,
+            max_segment,
+            skipped_silences,
+            pre_roll,
+            post_roll,
+        );
+        return;
+    }
+
+    // No usable skipped silence → equal-N split (existing behaviour).
+    let parts = (dur / max_segment).ceil() as usize;
+    let part_duration = dur / parts as f64;
+    for i in 0..parts {
+        let s = start + i as f64 * part_duration;
+        let e = if i + 1 == parts {
+            end
+        } else {
+            start + (i + 1) as f64 * part_duration
+        };
+        push_padded_range(ranges, s, e, duration_sec, 0.0, pre_roll, post_roll);
+    }
 }
 
 fn split_text_by_ranges(text: &str, ranges: &[(f64, f64)]) -> Vec<String> {
@@ -5729,13 +5932,15 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let value: Value = serde_json::from_str(&lines[0]).expect("valid json");
         let messages = value["messages"].as_array().expect("messages");
+        // User keeps scalar audio_file on a single cut.
         assert_eq!(
             messages[1]["audio_file"],
             "/out/segments/自由演绎_0001_01_01_陪聊.wav"
         );
+        // Assistant audio_file is ALWAYS an array — even for a single cut.
         assert_eq!(
             messages[2]["audio_file"],
-            "/out/segments/自由演绎_0001_01_01_发音人.wav"
+            json!(["/out/segments/自由演绎_0001_01_01_发音人.wav"])
         );
     }
 
@@ -5949,6 +6154,47 @@ mod tests {
         assert_ne!(pair_key(&assistant), pair_key(&assistant_turn2));
     }
 
+    /// Regression: a stale `segment_file_name` field (still in the old
+    /// fallback `<source>_NNNN_xxx-yyy.wav` form because the cutter ran
+    /// before the current dataset_mode whitelist landed) must NOT
+    /// prevent pair_key from grouping user/assistant segments. As long
+    /// as the on-disk filename (`segment_path` basename) has been
+    /// renamed to the canonical form, pair_key falls through to it.
+    ///
+    /// Without this fallback, a 文本演绎 batch where assistant segments
+    /// retained stale field values would collapse N rounds into one
+    /// pair_key (all sharing the same source_path strip), while user
+    /// segments would parse cleanly into N distinct keys → zero pairing
+    /// across the entire export.
+    #[test]
+    fn pair_key_falls_back_to_path_basename_when_field_is_stale() {
+        let seg = SegmentRecord {
+            id: "x".into(),
+            // Pretend the cutter ran on an older binary whose
+            // dataset_mode whitelist didn't include 文本演绎, so the
+            // field below holds the safe-source fallback form.
+            source_path: "/input/台湾话-发音人-文本演绎-话题56.wav".into(),
+            source_file_name: "台湾话-发音人-文本演绎-话题56.wav".into(),
+            // …but the file on disk has since been renamed to the
+            // canonical layout (e.g. via plan_dialogue_sequence_file_names
+            // running under the newer binary).
+            segment_path: "/out/segments/文本演绎_0056_03_02_发音人.wav".into(),
+            segment_file_name: "台湾话-发音人-文本演绎-话题56_0001_2000-3500.wav".into(),
+            role: Some("assistant".into()),
+            start_ms: 2000,
+            end_ms: 3500,
+            duration_ms: 1500,
+            original_text: String::new(),
+            phonetic_text: String::new(),
+            emotion: Vec::new(),
+            tags: Vec::new(),
+            notes: String::new(),
+        };
+        // The stale field doesn't parse, but the canonical basename
+        // does → pair_key reflects the on-disk truth.
+        assert_eq!(pair_key(&seg), "文本演绎_0056_03");
+    }
+
     /// 长沙方言 dataset puts the role token in the MIDDLE of the filename
     /// with `-` separators, not at the end with `_`. Both conventions
     /// must collapse to the same pair_key for paired-conversation export
@@ -6047,11 +6293,15 @@ mod tests {
         // Spec: assistant uses `content_refine`, not `content`.
         assert!(messages[2]["content_refine"].is_array());
         assert!(messages[2].get("content").is_none());
-        // Single assistant sub-segment → audio_file collapses to a string
-        // and `emotion_refine` is a single string (matching demo's
-        // pattern for length-1 turns).
-        assert!(messages[2]["audio_file"].is_string());
-        assert_eq!(messages[2]["emotion_refine"], "中立");
+        // Single assistant sub-segment → audio_file and emotion_refine
+        // are STILL arrays. Earlier code collapsed length-1 to scalars
+        // to mirror the demo file, but the downstream trainer needs a
+        // uniform shape across all sample sizes.
+        assert_eq!(
+            messages[2]["audio_file"].as_array().map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(messages[2]["emotion_refine"], json!(["中立"]));
     }
 
     /// Regression: paths under `/Users/<name>/` (every macOS project)
@@ -6298,9 +6548,10 @@ mod tests {
     }
 
     #[test]
-    fn max_segment_setting_does_not_force_split_ranges() {
-        // 50s of audio, no silence detected → one big range. max_segment_ms is
-        // retained for old project files but no longer forces uniform splitting.
+    fn max_segment_force_splits_overlong_ranges() {
+        // 50s of audio, no silence detected. max_segment_ms=20000 should
+        // force the range into ceil(50/20) = 3 equal pieces of ~16.67s
+        // (with pre/post roll added on outer edges).
         let config = CutConfig {
             silence_db: -35.0,
             min_silence_ms: 450,
@@ -6310,7 +6561,270 @@ mod tests {
             max_segment_ms: 20_000,
         };
         let ranges = build_segment_ranges(50.0, &[], &config);
+        assert_eq!(ranges.len(), 3);
+        for (start, end) in &ranges {
+            // Each piece is ~16.67s plus pre/post roll → never exceeds
+            // max+rolls ≈ 20s.
+            assert!(
+                end - start <= 20.0,
+                "force-split piece longer than max: {:.2}s",
+                end - start
+            );
+        }
+    }
+
+    #[test]
+    fn max_segment_zero_means_no_force_split() {
+        let config = CutConfig {
+            silence_db: -35.0,
+            min_silence_ms: 450,
+            min_segment_ms: 300,
+            pre_roll_ms: 100,
+            post_roll_ms: 200,
+            max_segment_ms: 0,
+        };
+        let ranges = build_segment_ranges(50.0, &[], &config);
+        assert_eq!(ranges.len(), 1, "max=0 disables force-split");
+    }
+
+    #[test]
+    fn short_silence_inside_long_phrase_does_not_split() {
+        // 2s voice, 0.5s pause, 3s voice. min_segment=5000 (5s) — the
+        // pause-driven split would produce a 2s piece, below the floor.
+        // Expected: the cutter merges through the pause and emits ONE
+        // segment covering [0, 5.5).
+        let events = vec![
+            SilenceEvent::Start(2.0),
+            SilenceEvent::End(2.5),
+        ];
+        let config = CutConfig {
+            silence_db: -35.0,
+            min_silence_ms: 400,
+            min_segment_ms: 5_000,
+            pre_roll_ms: 0,
+            post_roll_ms: 0,
+            max_segment_ms: 0,
+        };
+        let ranges = build_segment_ranges(5.5, &events, &config);
+        assert_eq!(ranges.len(), 1, "ranges={:?}", ranges);
+        assert!((ranges[0].0 - 0.0).abs() < 1e-6);
+        assert!((ranges[0].1 - 5.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn short_tail_pushed_as_standalone_no_audio_loss() {
+        // Voice 0-25, silence 25-25.5, voice 25.5-30. min_segment=5.
+        // Old behaviour glued the 4.5s tail onto the previous segment,
+        // re-introducing 500ms of interior silence. The fix: push the
+        // tail as its own range. No audio loss, no interior silence.
+        let events = vec![SilenceEvent::Start(25.0), SilenceEvent::End(25.5)];
+        let config = CutConfig {
+            silence_db: -35.0,
+            min_silence_ms: 400,
+            min_segment_ms: 5_000,
+            pre_roll_ms: 0,
+            post_roll_ms: 0,
+            max_segment_ms: 0,
+        };
+        let ranges = build_segment_ranges(30.0, &events, &config);
+        assert_eq!(ranges.len(), 2, "ranges={:?}", ranges);
+        assert!((ranges[0].0 - 0.0).abs() < 1e-6);
+        assert!((ranges[0].1 - 25.0).abs() < 1e-6);
+        assert!((ranges[1].0 - 25.5).abs() < 1e-6);
+        assert!((ranges[1].1 - 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn force_split_prefers_skipped_silence_over_equal_split() {
+        // 50s monologue. Pauses at 5, 10, 20s are all too short (300ms)
+        // for stand-alone splitting under min_segment=15s, so they become
+        // "skipped silences". A real pause at 35s+ is long enough.
+        //
+        // When build_segment_ranges accepts the 35s pause and pushes the
+        // (0, 35) range, that range exceeds max=25, triggering smart-split:
+        // the latest skipped pause whose start is ≤ start+max = 25 is
+        // (20, 20.5). First half = (0, 20), second half starts at 20.5.
+        // Both halves now fit under max → no equal-split, no arbitrary cut.
+        let events = vec![
+            SilenceEvent::Start(5.0),  SilenceEvent::End(5.3),
+            SilenceEvent::Start(10.0), SilenceEvent::End(10.3),
+            SilenceEvent::Start(20.0), SilenceEvent::End(20.5),
+            SilenceEvent::Start(35.0), SilenceEvent::End(35.5),
+        ];
+        let config = CutConfig {
+            silence_db: -30.0,
+            min_silence_ms: 600,
+            min_segment_ms: 15_000,
+            pre_roll_ms: 0,
+            post_roll_ms: 0,
+            max_segment_ms: 25_000,
+        };
+        let ranges = build_segment_ranges(50.0, &events, &config);
+        // Expected:
+        //   (0, 20)     ← smart-cut at the 20s skipped silence
+        //   (20.5, 35)  ← voice after pause; ends at the real (long) silence at 35
+        //   (35.5, 50)  ← trailing voice after the long silence
+        assert_eq!(ranges.len(), 3, "ranges={:?}", ranges);
+        assert!((ranges[0].0 - 0.0).abs() < 1e-6);
+        assert!((ranges[0].1 - 20.0).abs() < 1e-6, "smart cut at 20s pause");
+        assert!((ranges[1].0 - 20.5).abs() < 1e-6, "second half starts after pause");
+        assert!((ranges[1].1 - 35.0).abs() < 1e-6);
+        assert!((ranges[2].0 - 35.5).abs() < 1e-6);
+        assert!((ranges[2].1 - 50.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn force_split_falls_back_to_equal_when_no_skipped_silence_helps() {
+        // 50s of audio, no events at all. Smart split has no candidates,
+        // so equal-N split takes over. max=20 → 3 pieces of ~16.67s.
+        let config = CutConfig {
+            silence_db: -30.0,
+            min_silence_ms: 600,
+            min_segment_ms: 5_000,
+            pre_roll_ms: 0,
+            post_roll_ms: 0,
+            max_segment_ms: 20_000,
+        };
+        let ranges = build_segment_ranges(50.0, &[], &config);
+        assert_eq!(ranges.len(), 3);
+        for (s, e) in &ranges {
+            assert!(e - s <= 20.0, "piece exceeds max: {:.2}", e - s);
+        }
+    }
+
+    #[test]
+    fn whole_audio_below_min_emits_one_range() {
+        // No events; 3s of audio; min_segment=5s. Should still emit
+        // (0,3) instead of producing zero segments.
+        let config = CutConfig {
+            silence_db: -35.0,
+            min_silence_ms: 400,
+            min_segment_ms: 5_000,
+            pre_roll_ms: 0,
+            post_roll_ms: 0,
+            max_segment_ms: 0,
+        };
+        let ranges = build_segment_ranges(3.0, &[], &config);
         assert_eq!(ranges.len(), 1);
+        assert!((ranges[0].0 - 0.0).abs() < 1e-6);
+        assert!((ranges[0].1 - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn audio_ending_in_silence_does_not_duplicate_segment() {
+        // Voice 0-8, then silence 8-10 with no End event emitted (audio
+        // file ends inside silence). Expect single (0,8) — no duplicate
+        // push from final-tail block.
+        let events = vec![SilenceEvent::Start(8.0)];
+        let config = CutConfig {
+            silence_db: -35.0,
+            min_silence_ms: 400,
+            min_segment_ms: 3_000,
+            pre_roll_ms: 0,
+            post_roll_ms: 0,
+            max_segment_ms: 0,
+        };
+        let ranges = build_segment_ranges(10.0, &events, &config);
+        assert_eq!(ranges.len(), 1, "ranges={:?}", ranges);
+        assert!((ranges[0].0 - 0.0).abs() < 1e-6);
+        assert!((ranges[0].1 - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn taiwan_dialect_source_produces_clean_文本演绎_segment_name() {
+        // Source filename uses the 0429-台湾 batch shape:
+        //   台湾话-{发音人|陪聊人}-文本演绎-话题NN.wav
+        // Expected segment output names must NOT carry the `台湾话-` prefix
+        // — they should be the canonical `文本演绎_NNNN_NN_NN_<role>.wav`.
+        let assistant = Path::new("/tmp/台湾话-发音人-文本演绎-话题56.wav");
+        assert_eq!(
+            build_segment_file_name(assistant, Some("assistant"), None, &[], 0, 0, 1000),
+            "文本演绎_0056_01_01_发音人.wav"
+        );
+        let user = Path::new("/tmp/台湾话-陪聊人-文本演绎-话题56.wav");
+        assert_eq!(
+            build_segment_file_name(user, Some("user"), None, &[], 2, 0, 1000),
+            "文本演绎_0056_01_03_陪聊.wav"
+        );
+        // 0512 自由对话 batch — same shape, different mode token.
+        let assistant_dialog = Path::new("/tmp/台湾话-发音人-自由对话-话题72.wav");
+        assert_eq!(
+            build_segment_file_name(assistant_dialog, Some("assistant"), None, &[], 0, 0, 1000),
+            "自由对话_0072_01_01_发音人.wav"
+        );
+    }
+
+    #[test]
+    fn leading_silence_is_trimmed_off_first_segment() {
+        // File starts with 9s of silence, then voice 9-16. ffmpeg emits
+        // silence_start: 0 + silence_end: 9. Old behaviour: the head silence
+        // was classified "skipped" (seg_duration before it was 0 < min_segment)
+        // and stayed glued onto the first emitted range, producing one segment
+        // (0, 16) — exactly the 9s leading-silence bug from the screenshot.
+        // Fix: head silence (seg_duration <= 0) must advance the cursor on End.
+        let events = vec![SilenceEvent::Start(0.0), SilenceEvent::End(9.0)];
+        let config = CutConfig {
+            silence_db: -30.0,
+            min_silence_ms: 600,
+            min_segment_ms: 800,
+            pre_roll_ms: 0,
+            post_roll_ms: 0,
+            max_segment_ms: 0,
+        };
+        let ranges = build_segment_ranges(16.0, &events, &config);
+        assert_eq!(ranges.len(), 1, "ranges={:?}", ranges);
+        assert!((ranges[0].0 - 9.0).abs() < 1e-6, "first segment must start AT voice onset, not 0");
+        assert!((ranges[0].1 - 16.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn leading_silence_then_normal_split() {
+        // 7s head silence, voice 7-12, real pause 12-13, voice 13-20.
+        // Expect TWO segments, both with head silence trimmed.
+        let events = vec![
+            SilenceEvent::Start(0.0),
+            SilenceEvent::End(7.0),
+            SilenceEvent::Start(12.0),
+            SilenceEvent::End(13.0),
+        ];
+        let config = CutConfig {
+            silence_db: -30.0,
+            min_silence_ms: 600,
+            min_segment_ms: 800,
+            pre_roll_ms: 0,
+            post_roll_ms: 0,
+            max_segment_ms: 0,
+        };
+        let ranges = build_segment_ranges(20.0, &events, &config);
+        assert_eq!(ranges.len(), 2, "ranges={:?}", ranges);
+        assert!((ranges[0].0 - 7.0).abs() < 1e-6);
+        assert!((ranges[0].1 - 12.0).abs() < 1e-6);
+        assert!((ranges[1].0 - 13.0).abs() < 1e-6);
+        assert!((ranges[1].1 - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn long_silence_after_long_phrase_does_split() {
+        // 6s voice, 1s pause, 4s voice. Both pieces ≥ 3s min_segment,
+        // pause > min_silence → two segments.
+        let events = vec![
+            SilenceEvent::Start(6.0),
+            SilenceEvent::End(7.0),
+        ];
+        let config = CutConfig {
+            silence_db: -35.0,
+            min_silence_ms: 400,
+            min_segment_ms: 3_000,
+            pre_roll_ms: 0,
+            post_roll_ms: 0,
+            max_segment_ms: 0,
+        };
+        let ranges = build_segment_ranges(11.0, &events, &config);
+        assert_eq!(ranges.len(), 2, "ranges={:?}", ranges);
+        assert!((ranges[0].0 - 0.0).abs() < 1e-6);
+        assert!((ranges[0].1 - 6.0).abs() < 1e-6);
+        assert!((ranges[1].0 - 7.0).abs() < 1e-6);
+        assert!((ranges[1].1 - 11.0).abs() < 1e-6);
     }
 
     #[test]

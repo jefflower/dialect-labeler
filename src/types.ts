@@ -257,6 +257,24 @@ export type SegmentTagDef = {
   key: string;
 };
 
+/**
+ * Bundled set of dialect-specific prompts. One quick-fill for the three
+ * fields below: `whisperInitialPrompt` (ASR hint), `llmPrompt` (Ollama
+ * polish system text — empty falls back to backend built-in Changsha
+ * prompt), `systemPrompt` (JSONL export header).
+ *
+ * Built-ins (`builtin: true`) can't be edited or deleted via UI; users
+ * can clone via "另存为预设…" to make a custom variant.
+ */
+export type DialectProfile = {
+  id: string;
+  name: string;
+  whisperInitialPrompt: string;
+  llmPrompt: string;
+  systemPrompt: string;
+  builtin?: boolean;
+};
+
 export type AppSettings = {
   theme: Theme;
   whisperModel: string;
@@ -291,4 +309,9 @@ export type AppSettings = {
    *  controlling pool size (default 2 × endpoint count). Empty list keeps
    *  the legacy local `whisper` CLI path. */
   whisperEndpoints: WhisperEndpointDef[];
+  /** Built-in + user-saved dialect profiles. */
+  dialectProfiles: DialectProfile[];
+  /** Last-selected profile id (informational — actual prompts live in
+   *  the three raw fields above, profile select just quick-fills them). */
+  activeDialectProfileId?: string;
 };

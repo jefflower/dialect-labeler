@@ -5,6 +5,8 @@ import { defaultAppSettings, SETTINGS_KEY } from "./defaults";
 const ENDPOINTS_MIGRATION_KEY = "dialect-labeler/migrations/v3-tailnet-endpoints";
 const WHISPER_ENDPOINTS_MIGRATION_KEY =
   "dialect-labeler/migrations/v4-whisper-endpoints";
+const DIALECT_PROFILES_MIGRATION_KEY =
+  "dialect-labeler/migrations/v5-dialect-profiles";
 
 export function useTheme(theme: Theme) {
   useEffect(() => {
@@ -58,6 +60,22 @@ export function useSettings() {
         }
         try {
           localStorage.setItem(WHISPER_ENDPOINTS_MIGRATION_KEY, "1");
+        } catch {
+          // ignore
+        }
+      }
+      // v5: 引入 dialectProfiles。旧版本没有 → 用内置（长沙 + 台湾）填充。
+      // 用户的 whisperInitialPrompt / llmPrompt / systemPrompt 三个原字段
+      // 保留不动 —— 预设只是个 quick-fill。
+      if (!localStorage.getItem(DIALECT_PROFILES_MIGRATION_KEY)) {
+        if (!Array.isArray(merged.dialectProfiles) || merged.dialectProfiles.length === 0) {
+          merged.dialectProfiles = defaultAppSettings.dialectProfiles;
+        }
+        if (!merged.activeDialectProfileId) {
+          merged.activeDialectProfileId = defaultAppSettings.activeDialectProfileId;
+        }
+        try {
+          localStorage.setItem(DIALECT_PROFILES_MIGRATION_KEY, "1");
         } catch {
           // ignore
         }

@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "长沙方言标注工作台",
+        "title": "方言标注工作台",
         "width": 1440,
         "height": 920,
         "minWidth": 1100,

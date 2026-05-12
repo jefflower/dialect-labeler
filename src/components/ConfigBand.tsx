@@ -93,6 +93,16 @@ const fields: ParamField[] = [
     max: 800,
     step: 20,
   },
+  {
+    key: "maxSegmentMs",
+    label: "最长段长",
+    unit: "ms",
+    hint:
+      "硬上限：单段超过这个时长，cutter 把它等分成 N 块。0 = 不限。Whisper 在 ~30s 以上质量明显下降，建议 30000。",
+    min: 0,
+    max: 120000,
+    step: 1000,
+  },
 ];
 
 /** Two CutConfig objects equal? Used to detect "current = preset". */

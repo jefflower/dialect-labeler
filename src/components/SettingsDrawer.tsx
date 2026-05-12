@@ -4,9 +4,11 @@ import {
   Bot,
   Cpu,
   HardDrive,
+  Languages,
   Mic,
   Plus,
   RefreshCcw,
+  Save,
   Sparkles,
   Tags as TagsIcon,
   Trash2,
@@ -245,6 +247,105 @@ export function SettingsDrawer({
               </select>
             </div>
           </section>
+
+          {!REVIEW_ONLY && <section className="drawer-section">
+            <h3>
+              <Languages size={14} />
+              方言预设
+            </h3>
+            <p className="section-hint">
+              一个预设 = 一套 Whisper initial prompt + Ollama 改写 prompt +
+              JSONL System prompt。换预设会把下面三个字段一次性填好；填完后还能"另存为"做新预设。
+            </p>
+            <div className="drawer-row">
+              <label>当前预设</label>
+              <div style={{ display: "flex", gap: 6, flex: 1 }}>
+                <select
+                  value={settings.activeDialectProfileId ?? ""}
+                  onChange={(event) => {
+                    const id = event.target.value;
+                    const profile = (settings.dialectProfiles ?? []).find(
+                      (p) => p.id === id,
+                    );
+                    if (!profile) return;
+                    onChange({
+                      activeDialectProfileId: id,
+                      whisperInitialPrompt: profile.whisperInitialPrompt,
+                      llmPrompt: profile.llmPrompt,
+                      systemPrompt: profile.systemPrompt,
+                    });
+                  }}
+                  style={{ flex: 1 }}
+                >
+                  {(settings.dialectProfiles ?? []).map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                      {p.builtin ? "" : "（自定义）"}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn-ghost"
+                  title="把当前三个 prompt 字段保存为一个新预设"
+                  onClick={() => {
+                    const name = window
+                      .prompt("新预设名称：", "我的预设")
+                      ?.trim();
+                    if (!name) return;
+                    const id = `custom-${Date.now()}`;
+                    const newProfile = {
+                      id,
+                      name,
+                      whisperInitialPrompt: settings.whisperInitialPrompt,
+                      llmPrompt: settings.llmPrompt,
+                      systemPrompt: settings.systemPrompt,
+                    };
+                    onChange({
+                      dialectProfiles: [
+                        ...(settings.dialectProfiles ?? []),
+                        newProfile,
+                      ],
+                      activeDialectProfileId: id,
+                    });
+                  }}
+                >
+                  <Save size={14} />
+                  另存为…
+                </button>
+                {(() => {
+                  const active = (settings.dialectProfiles ?? []).find(
+                    (p) => p.id === settings.activeDialectProfileId,
+                  );
+                  if (!active || active.builtin) return null;
+                  return (
+                    <button
+                      className="btn-ghost btn-icon"
+                      title="删除此自定义预设"
+                      onClick={() => {
+                        if (!window.confirm(`删除预设「${active.name}」？`))
+                          return;
+                        const remaining = (settings.dialectProfiles ?? []).filter(
+                          (p) => p.id !== active.id,
+                        );
+                        onChange({
+                          dialectProfiles: remaining,
+                          activeDialectProfileId:
+                            remaining.find((p) => p.builtin)?.id ?? remaining[0]?.id,
+                        });
+                      }}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  );
+                })()}
+              </div>
+            </div>
+            <p className="help-tip">
+              内置「长沙话」和「台湾话」两个预设。长沙话的 LLM
+              prompt 留空 → 后端用打进二进制的默认长 prompt；台湾话内嵌完整 prompt。
+              新方言可直接选个相近预设 → 改三个字段 → "另存为"。
+            </p>
+          </section>}
 
           {!REVIEW_ONLY && <section className="drawer-section">
             <h3>
