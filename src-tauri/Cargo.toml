@@ -29,6 +29,10 @@ tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-store = "2"
 tauri-plugin-autostart = "2"
+# Auto-update support. The plugin is initialized only when `updater.active`
+# is set in tauri.conf.json AND a `pubkey` is configured — both default
+# off so a fresh checkout builds without needing a Tauri signing key.
+tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` makes serde_json::Map preserve insertion order so the
 # `json!` macro emits keys in the order they're written. Required for

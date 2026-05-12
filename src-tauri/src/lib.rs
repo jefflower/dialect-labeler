@@ -5981,6 +5981,22 @@ fn cloud_set_worker_enabled(
 }
 
 // ============================================================
+// Updater
+// ============================================================
+//
+// The actual update check is driven from the frontend via
+// `@tauri-apps/plugin-updater` — it has cancellation, progress events,
+// and install handling built in. Wiring it from Rust here would just
+// duplicate that. The reason this Rust-side command exists is to expose
+// the current app version so the CloudPane can show "you're on v0.1.0,
+// latest is v0.1.1" before the user clicks the install button.
+
+#[tauri::command]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+// ============================================================
 // Tray + window-to-tray
 // ============================================================
 
@@ -6062,6 +6078,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AudioPlayerState::new())
         .manage(cloud::CloudState::new())
         .setup(|app| {
@@ -6113,7 +6130,8 @@ pub fn run() {
             cloud_logout,
             cloud_status,
             cloud_set_worker_config,
-            cloud_set_worker_enabled
+            cloud_set_worker_enabled,
+            app_version
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

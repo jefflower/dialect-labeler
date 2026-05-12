@@ -22,7 +22,9 @@ from .config import get_settings
 from .db import get_session_factory, init_db
 from .models import ROLE_ADMIN, User
 from .routes import auth as auth_routes
+from .routes import releases as releases_routes
 from .routes import tasks as tasks_routes
+from .routes import users as users_routes
 from .routes import worker as worker_routes
 
 logging.basicConfig(
@@ -70,6 +72,8 @@ def create_app() -> FastAPI:
     app.include_router(auth_routes.router)
     app.include_router(tasks_routes.router)
     app.include_router(worker_routes.router)
+    app.include_router(users_routes.router)
+    app.include_router(releases_routes.router)
 
     @app.get("/healthz")
     def healthz() -> dict:

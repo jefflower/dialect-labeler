@@ -83,6 +83,22 @@ input:focus, textarea:focus, select:focus {
   font-weight: 600;
   font-size: 15px;
 }
+.topbar-nav {
+  display: flex;
+  gap: 18px;
+  margin-left: 24px;
+}
+.topbar-nav a {
+  color: var(--muted);
+  font-weight: 500;
+  padding: 6px 0;
+  border-bottom: 2px solid transparent;
+}
+.topbar-nav a:hover { color: var(--text); text-decoration: none; }
+.topbar-nav a.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
 .topbar .grow { flex: 1; }
 .topbar .user { color: var(--muted); }
 .topbar .user .role-chip {

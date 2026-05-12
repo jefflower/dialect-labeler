@@ -1,4 +1,4 @@
-import { useNavigate } from "react-router-dom";
+import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "./auth";
 
 export default function Topbar() {
@@ -8,6 +8,16 @@ export default function Topbar() {
   return (
     <header className="topbar">
       <span className="title">方言标注调度</span>
+      <nav className="topbar-nav">
+        <NavLink to="/tasks">任务</NavLink>
+        <NavLink to="/downloads">下载</NavLink>
+        {user.role === "admin" && (
+          <>
+            <NavLink to="/admin/users">用户</NavLink>
+            <NavLink to="/admin/releases">版本</NavLink>
+          </>
+        )}
+      </nav>
       <div className="grow" />
       <span className="user">
         {user.email}

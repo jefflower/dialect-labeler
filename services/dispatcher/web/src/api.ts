@@ -175,3 +175,82 @@ export async function downloadOutput(task: Task): Promise<void> {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+
+// ---- Admin: users -----------------------------------------------------
+export function listUsers() {
+  return request<User[]>("/api/users");
+}
+export function createUser(email: string, password: string, role: "admin" | "user") {
+  return request<User>("/api/users", {
+    method: "POST",
+    body: JSON.stringify({ email, password, role }),
+  });
+}
+export function updateUserRole(userId: number, role: "admin" | "user") {
+  return request<User>(`/api/users/${userId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ role }),
+  });
+}
+export function deleteUser(userId: number) {
+  return request<void>(`/api/users/${userId}`, { method: "DELETE" });
+}
+
+// ---- Admin: releases --------------------------------------------------
+export interface ReleaseRow {
+  id: number;
+  version: string;
+  channel: "stable" | "beta";
+  target: string;
+  notes: string | null;
+  installer_size: number | null;
+  has_signature: boolean;
+  created_at: string;
+}
+
+export function listReleases() {
+  return request<ReleaseRow[]>("/api/releases");
+}
+
+export function uploadRelease(args: {
+  version: string;
+  target: string;
+  channel: string;
+  file: File;
+  signature?: string;
+  notes?: string;
+}) {
+  const fd = new FormData();
+  fd.append("version", args.version);
+  fd.append("target", args.target);
+  fd.append("channel", args.channel);
+  fd.append("file", args.file);
+  if (args.signature) fd.append("signature", args.signature);
+  if (args.notes) fd.append("notes", args.notes);
+  return request<ReleaseRow>("/api/releases", { method: "POST", body: fd });
+}
+
+export function deleteRelease(id: number) {
+  return request<void>(`/api/releases/${id}`, { method: "DELETE" });
+}
+
+// ---- Public: latest download -----------------------------------------
+export interface LatestRelease {
+  version: string;
+  target: string;
+  channel: string;
+  notes: string | null;
+  download_url: string;
+  installer_size: number | null;
+  pub_date: string;
+}
+
+export function getLatestRelease(target = "windows-x86_64") {
+  // Public endpoint — no auth required
+  return fetch(
+    `/api/releases/latest?target=${encodeURIComponent(target)}`
+  ).then(async (r) => {
+    if (!r.ok) throw new ApiError(r.status, await r.text().catch(() => null));
+    return (await r.json()) as LatestRelease;
+  });
+}
