@@ -2164,3 +2164,122 @@ kbd {
       max-content;
   }
 }
+
+/* ============================================================
+   CloudPane — modal that drives the cloud Worker.
+   ============================================================ */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.cloud-pane {
+  background: var(--surface, #fff);
+  border-radius: 12px;
+  width: 440px;
+  max-width: calc(100vw - 32px);
+  padding: 0;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  overflow: hidden;
+  color: var(--text-primary, #1f2328);
+}
+.cloud-pane header {
+  display: flex;
+  align-items: center;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border, #e3e6ea);
+}
+.cloud-pane header h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+}
+.cloud-login,
+.cloud-session {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px;
+}
+.cloud-hint {
+  margin: 0;
+  color: var(--text-secondary, #888);
+  font-size: 12px;
+}
+.cloud-login label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cloud-login label span {
+  font-size: 12px;
+  color: var(--text-secondary, #888);
+}
+.cloud-login input {
+  padding: 8px 10px;
+  border: 1px solid var(--border, #d0d7de);
+  border-radius: 6px;
+  background: var(--surface, #fff);
+  color: inherit;
+  font: inherit;
+}
+.cloud-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.cloud-role {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--bg-muted, #f0f2f5);
+  font-size: 11px;
+  color: var(--text-secondary, #666);
+}
+.cloud-worker-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px;
+  background: var(--bg-muted, #fafbfc);
+  border: 1px solid var(--border, #e3e6ea);
+  border-radius: 8px;
+}
+.cloud-worker-row strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cloud-current-task {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border, #e3e6ea);
+  border-radius: 8px;
+}
+.cloud-error {
+  background: rgba(209, 52, 56, 0.08);
+  border: 1px solid rgba(209, 52, 56, 0.3);
+  color: #d13438;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+.spin {
+  animation: cloud-spin 1s linear infinite;
+}
+@keyframes cloud-spin {
+  to { transform: rotate(360deg); }
+}

@@ -1,4 +1,5 @@
 import {
+  Cloud,
   Download,
   Keyboard,
   Moon,
@@ -22,6 +23,7 @@ type TopbarProps = {
   onCycleTheme: () => void;
   onOpenSettings: () => void;
   onOpenShortcuts: () => void;
+  onOpenCloud: () => void;
   onSave: () => void;
   onLoad: () => void;
   onExport: () => void;
@@ -47,6 +49,7 @@ export function Topbar({
   onCycleTheme,
   onOpenSettings,
   onOpenShortcuts,
+  onOpenCloud,
   onSave,
   onLoad,
   onExport,
@@ -92,6 +95,14 @@ export function Topbar({
           aria-label="键盘快捷键"
         >
           <Keyboard size={16} />
+        </button>
+        <button
+          className="btn-ghost btn-icon"
+          onClick={onOpenCloud}
+          title="云端 Worker — 登录调度，自动接单"
+          aria-label="云端 Worker"
+        >
+          <Cloud size={16} />
         </button>
         <button
           className="btn-ghost btn-icon"

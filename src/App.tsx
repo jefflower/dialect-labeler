@@ -14,6 +14,8 @@ import { ProgressPanel } from "./components/ProgressPanel";
 import { SettingsDrawer } from "./components/SettingsDrawer";
 import { ShortcutOverlay } from "./components/ShortcutOverlay";
 import { ToastStack } from "./components/ToastStack";
+import { CloudPane } from "./components/CloudPane";
+import type { CloudWorkerConfig } from "./lib";
 import { defaultCutConfig } from "./defaults";
 import { HIDE_PROCESSING_UI } from "./env";
 import { ipc, normalizeRecognizedText, waitForPaint, clamp } from "./lib";
@@ -52,6 +54,7 @@ function App() {
   const { toasts, push: pushToast, dismiss: dismissToast } = useToasts();
   const { open: shortcutOpen, setOpen: setShortcutOpen } = useShortcutOverlay();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [cloudOpen, setCloudOpen] = useState(false);
 
   const [folderPath, setFolderPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
@@ -104,6 +107,41 @@ function App() {
   const selectedAudio = useMemo(
     () => scan?.audioFiles.find((audio) => audio.id === selectedAudioId) ?? null,
     [scan, selectedAudioId],
+  );
+
+  // Forwarded into the Rust worker_loop so cloud-claimed tasks use the
+  // same ASR/LLM pool the user already configured for the windowed flow.
+  const cloudWorkerConfig: CloudWorkerConfig = useMemo(
+    () => ({
+      whisperModel: settings.whisperModel,
+      whisperInitialPrompt: settings.whisperInitialPrompt,
+      useLlm: settings.useLlm,
+      ollamaUrl: settings.ollamaUrl,
+      ollamaModel: settings.ollamaModel,
+      llmPrompt: settings.llmPrompt,
+      llmConcurrency: settings.llmConcurrency,
+      whisperConcurrency: settings.whisperConcurrency,
+      whisperEndpoints: (settings.whisperEndpoints ?? [])
+        .filter((endpoint) => endpoint.url && endpoint.enabled !== false)
+        .map((endpoint) => endpoint.url),
+      ollamaExtraEndpoints: (settings.ollamaExtraEndpoints ?? [])
+        .filter((endpoint) => endpoint.url && endpoint.enabled !== false)
+        .map((endpoint) => endpoint.url),
+      cut: config,
+    }),
+    [
+      settings.whisperModel,
+      settings.whisperInitialPrompt,
+      settings.useLlm,
+      settings.ollamaUrl,
+      settings.ollamaModel,
+      settings.llmPrompt,
+      settings.llmConcurrency,
+      settings.whisperConcurrency,
+      settings.whisperEndpoints,
+      settings.ollamaExtraEndpoints,
+      config,
+    ],
   );
 
   const annotationSegment = useMemo(
@@ -1858,6 +1896,11 @@ function App() {
           onMigrateSegmentFilenames={migrateSegmentFilenames}
           onClose={() => setSettingsOpen(false)}
         />
+        <CloudPane
+          open={cloudOpen}
+          onClose={() => setCloudOpen(false)}
+          workerConfig={cloudWorkerConfig}
+        />
         <ShortcutOverlay
           open={shortcutOpen}
           onClose={() => setShortcutOpen(false)}
@@ -1879,6 +1922,7 @@ function App() {
           theme={settings.theme}
           onCycleTheme={cycleTheme}
           onOpenSettings={() => setSettingsOpen(true)}
+          onOpenCloud={() => setCloudOpen(true)}
           onOpenShortcuts={() => setShortcutOpen(true)}
           onSave={saveProject}
           onLoad={loadProject}
@@ -1977,6 +2021,11 @@ function App() {
           onPurgeOrphanTags={purgeOrphanInlineTags}
           onMigrateSegmentFilenames={migrateSegmentFilenames}
         onClose={() => setSettingsOpen(false)}
+      />
+      <CloudPane
+        open={cloudOpen}
+        onClose={() => setCloudOpen(false)}
+        workerConfig={cloudWorkerConfig}
       />
       <ShortcutOverlay
         open={shortcutOpen}

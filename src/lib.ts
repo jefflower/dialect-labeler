@@ -128,6 +128,64 @@ export const ipc = {
   }) {
     return invoke<BundleResult>("export_dataset_bundle", args);
   },
+
+  // --- Cloud dispatcher --------------------------------------------------
+  cloudLogin(args: { baseUrl: string; email: string; password: string }) {
+    return invoke<CloudUser>("cloud_login", args);
+  },
+  cloudSetSession(args: { baseUrl: string; token: string; user: CloudUser }) {
+    return invoke<void>("cloud_set_session", args);
+  },
+  cloudLogout() {
+    return invoke<void>("cloud_logout");
+  },
+  cloudStatus() {
+    return invoke<CloudStatus>("cloud_status");
+  },
+  cloudSetWorkerConfig(args: { config: CloudWorkerConfig }) {
+    return invoke<void>("cloud_set_worker_config", args);
+  },
+  cloudSetWorkerEnabled(args: { enabled: boolean }) {
+    return invoke<void>("cloud_set_worker_enabled", args);
+  },
+};
+
+// --- Cloud types --------------------------------------------------------
+export type CloudUser = {
+  id: number;
+  email: string;
+  role: string;
+};
+
+export type CloudCurrentTask = {
+  id: string;
+  name: string;
+  stage: string;
+  started_at_unix_ms: number;
+};
+
+export type CloudStatus = {
+  base_url: string | null;
+  logged_in: boolean;
+  user: CloudUser | null;
+  worker_enabled: boolean;
+  worker_running: boolean;
+  current_task: CloudCurrentTask | null;
+  last_error: string | null;
+};
+
+export type CloudWorkerConfig = {
+  whisperModel?: string;
+  whisperInitialPrompt?: string;
+  useLlm?: boolean;
+  ollamaUrl?: string;
+  ollamaModel?: string;
+  llmPrompt?: string;
+  llmConcurrency?: number;
+  whisperConcurrency?: number;
+  whisperEndpoints?: string[];
+  ollamaExtraEndpoints?: string[];
+  cut?: CutConfig;
 };
 
 export function formatClock(value?: number): string {

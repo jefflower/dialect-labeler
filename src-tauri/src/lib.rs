@@ -1,3 +1,5 @@
+mod cloud;
+
 use regex::Regex;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::{Deserialize, Serialize};
@@ -84,35 +86,35 @@ struct ProjectScan {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CutConfig {
-    silence_db: f32,
-    min_silence_ms: u64,
-    min_segment_ms: u64,
-    pre_roll_ms: u64,
-    post_roll_ms: u64,
+pub(crate) struct CutConfig {
+    pub(crate) silence_db: f32,
+    pub(crate) min_silence_ms: u64,
+    pub(crate) min_segment_ms: u64,
+    pub(crate) pre_roll_ms: u64,
+    pub(crate) post_roll_ms: u64,
     /// Kept for compatibility with existing project.json files. The cutter no
     /// longer force-splits by length; dialogue timing is driven by silence.
     #[serde(default)]
-    max_segment_ms: u64,
+    pub(crate) max_segment_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SegmentRecord {
-    id: String,
-    source_path: String,
-    source_file_name: String,
-    segment_path: String,
-    segment_file_name: String,
-    role: Option<String>,
-    start_ms: u64,
-    end_ms: u64,
-    duration_ms: u64,
-    original_text: String,
-    phonetic_text: String,
-    emotion: Vec<String>,
-    tags: Vec<String>,
-    notes: String,
+pub(crate) struct SegmentRecord {
+    pub(crate) id: String,
+    pub(crate) source_path: String,
+    pub(crate) source_file_name: String,
+    pub(crate) segment_path: String,
+    pub(crate) segment_file_name: String,
+    pub(crate) role: Option<String>,
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+    pub(crate) duration_ms: u64,
+    pub(crate) original_text: String,
+    pub(crate) phonetic_text: String,
+    pub(crate) emotion: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) notes: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -138,91 +140,91 @@ fn default_enabled() -> bool {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct OllamaEndpointDef {
-    url: String,
+pub(crate) struct OllamaEndpointDef {
+    pub(crate) url: String,
     #[serde(default)]
-    model: Option<String>,
+    pub(crate) model: Option<String>,
     /// Default true. Lets the user stage an endpoint in config while its
     /// model is still pulling, then flip it on without re-editing URLs.
     #[serde(default = "default_enabled")]
-    enabled: bool,
+    pub(crate) enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct WhisperEndpointDef {
+pub(crate) struct WhisperEndpointDef {
     /// Base URL of a `services/whisper-server` instance. The Rust client
     /// POSTs the segment WAV to `<url>/transcribe`.
-    url: String,
+    pub(crate) url: String,
     /// See `OllamaEndpointDef::enabled`.
     #[serde(default = "default_enabled")]
-    enabled: bool,
+    pub(crate) enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct RecognitionOptions {
+pub(crate) struct RecognitionOptions {
     #[serde(default)]
-    whisper_model: Option<String>,
+    pub(crate) whisper_model: Option<String>,
     #[serde(default)]
-    use_llm: Option<bool>,
+    pub(crate) use_llm: Option<bool>,
     /// Primary Ollama endpoint (backwards-compat).
     #[serde(default)]
-    ollama_url: Option<String>,
+    pub(crate) ollama_url: Option<String>,
     /// Optional pool of *additional* Ollama endpoints (URL only — uses the
     /// primary `ollama_model`). Kept for backwards-compat; prefer
     /// `ollama_extra_endpoints` when each endpoint needs its own model.
     #[serde(default)]
-    ollama_extra_urls: Option<Vec<String>>,
+    pub(crate) ollama_extra_urls: Option<Vec<String>>,
     /// Per-endpoint URL + model. If `model` is None for an entry, the
     /// primary `ollama_model` is used. Lets you mix e.g. local qwen2.5:32b
     /// with a remote qwen3.5:122b in the same pool.
     #[serde(default)]
-    ollama_extra_endpoints: Option<Vec<OllamaEndpointDef>>,
+    pub(crate) ollama_extra_endpoints: Option<Vec<OllamaEndpointDef>>,
     #[serde(default)]
-    ollama_model: Option<String>,
+    pub(crate) ollama_model: Option<String>,
     #[serde(default)]
-    llm_prompt: Option<String>,
+    pub(crate) llm_prompt: Option<String>,
     #[serde(default)]
-    initial_prompt: Option<String>,
+    pub(crate) initial_prompt: Option<String>,
     #[serde(default)]
-    use_cache: Option<bool>,
+    pub(crate) use_cache: Option<bool>,
     #[serde(default)]
-    overwrite_cache: Option<bool>,
+    pub(crate) overwrite_cache: Option<bool>,
     /// Maximum number of Ollama HTTP requests fired in parallel within a
     /// batch. Default 2. With multiple endpoints set this to N × endpoints
     /// to fully saturate the pool.
     #[serde(default)]
-    llm_concurrency: Option<u32>,
+    pub(crate) llm_concurrency: Option<u32>,
     /// Number of concurrent Whisper processes. Default 1 — most setups
     /// can only afford one model copy in GPU/RAM. With a beefy box, 2-3
     /// can keep the LLM pool fed faster. Each process loads its own
     /// model (so RAM cost scales linearly).
     #[serde(default)]
-    whisper_concurrency: Option<u32>,
+    pub(crate) whisper_concurrency: Option<u32>,
     /// Optional pool of remote whisper-server endpoints (each runs
     /// `services/whisper-server`). When non-empty, the ASR phase switches
     /// from spawning a local `whisper` CLI to POSTing each segment WAV to
     /// the pool, work-stealing across nodes — same scheduler shape as the
     /// Ollama polish pool. Empty → fall back to local CLI.
     #[serde(default)]
-    whisper_endpoints: Option<Vec<WhisperEndpointDef>>,
+    pub(crate) whisper_endpoints: Option<Vec<WhisperEndpointDef>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RecognitionResult {
-    segment_id: String,
-    text: String,
-    raw_text: String,
-    polished: bool,
-    cached: bool,
-    emotion: Option<String>,
-    tags: Vec<String>,
+pub(crate) struct RecognitionResult {
+    pub(crate) segment_id: String,
+    pub(crate) text: String,
+    pub(crate) raw_text: String,
+    pub(crate) polished: bool,
+    pub(crate) cached: bool,
+    pub(crate) emotion: Option<String>,
+    pub(crate) tags: Vec<String>,
     /// Which Ollama endpoint actually polished this segment, for UI badges.
     /// `None` for cached results or when LLM polish was skipped/failed.
-    polish_endpoint: Option<String>,
-    polish_model: Option<String>,
+    pub(crate) polish_endpoint: Option<String>,
+    pub(crate) polish_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -249,19 +251,19 @@ struct DependencyStatus {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ExportOptions {
+pub(crate) struct ExportOptions {
     #[serde(default)]
-    system_prompt: Option<String>,
+    pub(crate) system_prompt: Option<String>,
     #[serde(default)]
-    pair_user_assistant: Option<bool>,
+    pub(crate) pair_user_assistant: Option<bool>,
     #[serde(default)]
-    use_source_audio_for_user: Option<bool>,
+    pub(crate) use_source_audio_for_user: Option<bool>,
     #[serde(default)]
-    audio_file_prefix: Option<String>,
+    pub(crate) audio_file_prefix: Option<String>,
     /// Local input root used to compute the path relative to the
     /// configured OSS prefix. Without it, only the file name is appended.
     #[serde(default)]
-    input_root: Option<String>,
+    pub(crate) input_root: Option<String>,
 }
 
 struct AudioPlayerState {
@@ -820,7 +822,7 @@ async fn scan_project_folder(
     .map_err(|err| err.to_string())?
 }
 
-fn scan_project_folder_impl(
+pub(crate) fn scan_project_folder_impl(
     folder_path: String,
     manifest_path: Option<String>,
     output_path: Option<String>,
@@ -1122,7 +1124,7 @@ fn rename_segments_by_dialogue_sequence_impl(
     Ok(updated)
 }
 
-fn cut_audio_file_impl(
+pub(crate) fn cut_audio_file_impl(
     input_path: String,
     segments_dir: String,
     config: CutConfig,
@@ -1491,7 +1493,7 @@ async fn export_dataset_bundle(
     .map_err(|err| err.to_string())?
 }
 
-fn export_dataset_bundle_impl(
+pub(crate) fn export_dataset_bundle_impl(
     bundle_dir: String,
     segments: Vec<SegmentRecord>,
     options: ExportOptions,
@@ -2805,7 +2807,7 @@ async fn recognize_segments(
 /// Cancellation: `cancel_recognize` flips a global flag. Workers check it
 /// at the top of each loop iteration. In-flight Whisper subprocesses /
 /// LLM HTTP calls finish naturally (5–10s typical) before the worker exits.
-fn recognize_segments_impl(
+pub(crate) fn recognize_segments_impl(
     app: tauri::AppHandle,
     project_dir: String,
     segments: Vec<SegmentRecord>,
@@ -5912,12 +5914,177 @@ mod tests {
     }
 }
 
+// ============================================================
+// Cloud commands
+// ============================================================
+//
+// Token + base URL persistence is driven from the frontend via
+// tauri-plugin-store. The Rust side keeps an in-memory copy so the
+// background worker thread doesn't have to round-trip through JS for
+// every HTTP call. On startup the frontend re-injects via
+// `cloud_set_session`.
+
+#[tauri::command]
+async fn cloud_login(
+    state: tauri::State<'_, cloud::CloudState>,
+    base_url: String,
+    email: String,
+    password: String,
+) -> Result<cloud::UserInfo, String> {
+    let url = base_url.trim().to_string();
+    let (token, user) =
+        cloud::login_request(&url, &email, &password).map_err(|err| err.to_string())?;
+    state.set_credentials(url, token.clone(), user.clone());
+    Ok(user)
+}
+
+#[tauri::command]
+fn cloud_set_session(
+    state: tauri::State<'_, cloud::CloudState>,
+    base_url: String,
+    token: String,
+    user: cloud::UserInfo,
+) -> Result<(), String> {
+    state.set_credentials(base_url, token, user);
+    Ok(())
+}
+
+#[tauri::command]
+fn cloud_logout(state: tauri::State<'_, cloud::CloudState>) -> Result<(), String> {
+    state.clear_credentials();
+    Ok(())
+}
+
+#[tauri::command]
+fn cloud_status(state: tauri::State<'_, cloud::CloudState>) -> cloud::CloudStatus {
+    state.status()
+}
+
+#[tauri::command]
+fn cloud_set_worker_config(
+    state: tauri::State<'_, cloud::CloudState>,
+    config: cloud::WorkerConfig,
+) -> Result<(), String> {
+    state.set_worker_config(config);
+    Ok(())
+}
+
+#[tauri::command]
+fn cloud_set_worker_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, cloud::CloudState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .set_worker_enabled(app, enabled)
+        .map_err(|err| err.to_string())
+}
+
+// ============================================================
+// Tray + window-to-tray
+// ============================================================
+
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::{
+        image::Image,
+        menu::{Menu, MenuItem},
+        tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+        Manager as _,
+    };
+
+    let open_item = MenuItem::with_id(app, "open", "打开窗口", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "彻底退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
+
+    // Use the bundled 32x32 PNG; it ships with every platform build.
+    let icon_bytes = include_bytes!("../icons/32x32.png");
+    let icon = Image::from_bytes(icon_bytes)?;
+
+    let _ = TrayIconBuilder::with_id("main")
+        .icon(icon)
+        .tooltip("方言标注 — 云端 Worker")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            // Left-click the tray icon → toggle window visibility.
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app: &tauri::AppHandle = tray.app_handle();
+                if let Some(window) = app.get_webview_window("main") {
+                    let visible = window.is_visible().unwrap_or(false);
+                    if visible {
+                        let _ = window.hide();
+                    } else {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use tauri::Manager as _;
+
     tauri::Builder::default()
+        // Single-instance must be registered FIRST per Tauri 2 docs.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(AudioPlayerState::new())
+        .manage(cloud::CloudState::new())
+        .setup(|app| {
+            // Build the tray icon eagerly so the user sees the cloud-worker
+            // entry point before they even sign in.
+            if let Err(err) = build_tray(app.handle()) {
+                eprintln!("[run] tray build failed: {err}");
+            }
+            // Intercept close so closing the main window hides it to the
+            // tray instead of tearing down the worker. The tray "quit"
+            // item is the only real exit.
+            let main_window = app.get_webview_window("main");
+            if let Some(window) = main_window {
+                let window_clone = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = window_clone.hide();
+                    }
+                });
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             prepare_playback_audio,
             read_waveform_peaks,
@@ -5940,7 +6107,13 @@ pub fn run() {
             rename_segments_by_dialogue_sequence,
             load_project_file,
             export_segments_jsonl,
-            export_dataset_bundle
+            export_dataset_bundle,
+            cloud_login,
+            cloud_set_session,
+            cloud_logout,
+            cloud_status,
+            cloud_set_worker_config,
+            cloud_set_worker_enabled
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
