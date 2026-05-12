@@ -1,0 +1,11 @@
+.venv/
+.env
+data/
+storage/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+.pytest_cache/
+.smoke*

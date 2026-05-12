@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    container_name: dialect-labeler-dispatcher
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      # SQLite DB + STORAGE_DIR both live under /data inside the container.
+      # On the host they show up as ./data and ./data/storage so backups
+      # are just `tar czf backup.tgz ./data`.
+      - ./data:/data
