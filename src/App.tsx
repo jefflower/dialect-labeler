@@ -17,7 +17,7 @@ import { ToastStack } from "./components/ToastStack";
 import { CloudPane } from "./components/CloudPane";
 import type { CloudWorkerConfig } from "./lib";
 import { defaultCutConfig } from "./defaults";
-import { HIDE_PROCESSING_UI } from "./env";
+import { HIDE_PROCESSING_UI, REVIEW_ONLY } from "./env";
 import { ipc, normalizeRecognizedText, waitForPaint, clamp } from "./lib";
 import { isTyping, useSettings, useShortcutOverlay, useTheme, useToasts } from "./hooks";
 import type {
@@ -2090,11 +2090,13 @@ function App() {
           onMigrateSegmentFilenames={migrateSegmentFilenames}
           onClose={() => setSettingsOpen(false)}
         />
-        <CloudPane
-          open={cloudOpen}
-          onClose={() => setCloudOpen(false)}
-          workerConfig={cloudWorkerConfig}
-        />
+        {!REVIEW_ONLY && (
+          <CloudPane
+            open={cloudOpen}
+            onClose={() => setCloudOpen(false)}
+            workerConfig={cloudWorkerConfig}
+          />
+        )}
         <ShortcutOverlay
           open={shortcutOpen}
           onClose={() => setShortcutOpen(false)}
@@ -2221,11 +2223,13 @@ function App() {
           onMigrateSegmentFilenames={migrateSegmentFilenames}
         onClose={() => setSettingsOpen(false)}
       />
-      <CloudPane
-        open={cloudOpen}
-        onClose={() => setCloudOpen(false)}
-        workerConfig={cloudWorkerConfig}
-      />
+      {!REVIEW_ONLY && (
+        <CloudPane
+          open={cloudOpen}
+          onClose={() => setCloudOpen(false)}
+          workerConfig={cloudWorkerConfig}
+        />
+      )}
       <ShortcutOverlay
         open={shortcutOpen}
         onClose={() => setShortcutOpen(false)}

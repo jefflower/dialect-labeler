@@ -1,3 +1,10 @@
+// Cloud Dispatcher integration is macOS-only. The Windows build is the
+// "审核版" reviewer image (VITE_REVIEW_ONLY=1 in the GH workflow): no
+// Whisper/Ollama, no cloud task queue, no auto-updater, no tray Worker
+// mode. Gating at the module boundary keeps the Windows binary minimal
+// and avoids loading plugins (updater, autostart, store, single_instance)
+// that the reviewer has no use for.
+#[cfg(not(target_os = "windows"))]
 mod cloud;
 
 use regex::Regex;
@@ -7214,6 +7221,8 @@ mod tests {
 // every HTTP call. On startup the frontend re-injects via
 // `cloud_set_session`.
 
+// Cloud commands are macOS-only — see the `mod cloud;` cfg note above.
+#[cfg(not(target_os = "windows"))]
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CloudLoginResult {
@@ -7221,6 +7230,7 @@ struct CloudLoginResult {
     user: cloud::UserInfo,
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 async fn cloud_login(
     state: tauri::State<'_, cloud::CloudState>,
@@ -7235,6 +7245,7 @@ async fn cloud_login(
     Ok(CloudLoginResult { token, user })
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 fn cloud_set_session(
     state: tauri::State<'_, cloud::CloudState>,
@@ -7246,17 +7257,20 @@ fn cloud_set_session(
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 fn cloud_logout(state: tauri::State<'_, cloud::CloudState>) -> Result<(), String> {
     state.clear_credentials();
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 fn cloud_status(state: tauri::State<'_, cloud::CloudState>) -> cloud::CloudStatus {
     state.status()
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 fn cloud_set_worker_config(
     state: tauri::State<'_, cloud::CloudState>,
@@ -7266,6 +7280,7 @@ fn cloud_set_worker_config(
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tauri::command]
 fn cloud_set_worker_enabled(
     app: tauri::AppHandle,
@@ -7294,9 +7309,15 @@ fn app_version() -> &'static str {
 }
 
 // ============================================================
-// Tray + window-to-tray
+// Tray + window-to-tray  (macOS Cloud Worker mode only)
 // ============================================================
+//
+// The tray icon is purely a Cloud Worker affordance — left-click toggles
+// the main window, menu offers 打开窗口/彻底退出. The Windows reviewer
+// build has no Worker mode, no background tasks, and no need to live in
+// the tray, so the whole thing compiles out.
 
+#[cfg(not(target_os = "windows"))]
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::{
         image::Image,
@@ -7357,9 +7378,16 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(not(target_os = "windows"))]
     use tauri::Manager as _;
 
-    tauri::Builder::default()
+    // The builder is shaped differently per-platform: the Windows reviewer
+    // build skips all cloud-worker plugins (single_instance / store /
+    // autostart / updater) and the tray. macOS keeps the full stack.
+    let builder = tauri::Builder::default();
+
+    #[cfg(not(target_os = "windows"))]
+    let builder = builder
         // Single-instance must be registered FIRST per Tauri 2 docs.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -7367,35 +7395,45 @@ pub fn run() {
                 let _ = window.unminimize();
                 let _ = window.set_focus();
             }
-        }))
+        }));
+
+    let builder = builder
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_dialog::init());
+
+    #[cfg(not(target_os = "windows"))]
+    let builder = builder
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(cloud::CloudState::new());
+
+    builder
         .manage(AudioPlayerState::new())
-        .manage(cloud::CloudState::new())
-        .setup(|app| {
-            // Build the tray icon eagerly so the user sees the cloud-worker
-            // entry point before they even sign in.
-            if let Err(err) = build_tray(app.handle()) {
-                eprintln!("[run] tray build failed: {err}");
-            }
-            // Intercept close so closing the main window hides it to the
-            // tray instead of tearing down the worker. The tray "quit"
-            // item is the only real exit.
-            let main_window = app.get_webview_window("main");
-            if let Some(window) = main_window {
-                let window_clone = window.clone();
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = window_clone.hide();
-                    }
-                });
+        .setup(|_app| {
+            #[cfg(not(target_os = "windows"))]
+            {
+                // Build the tray icon eagerly so the user sees the
+                // cloud-worker entry point before they even sign in.
+                if let Err(err) = build_tray(_app.handle()) {
+                    eprintln!("[run] tray build failed: {err}");
+                }
+                // Intercept close so closing the main window hides it to
+                // the tray instead of tearing down the worker. The tray
+                // "quit" item is the only real exit.
+                let main_window = _app.get_webview_window("main");
+                if let Some(window) = main_window {
+                    let window_clone = window.clone();
+                    window.on_window_event(move |event| {
+                        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                            api.prevent_close();
+                            let _ = window_clone.hide();
+                        }
+                    });
+                }
             }
             Ok(())
         })
@@ -7425,11 +7463,17 @@ pub fn run() {
             load_project_file,
             export_segments_jsonl,
             export_dataset_bundle,
+            #[cfg(not(target_os = "windows"))]
             cloud_login,
+            #[cfg(not(target_os = "windows"))]
             cloud_set_session,
+            #[cfg(not(target_os = "windows"))]
             cloud_logout,
+            #[cfg(not(target_os = "windows"))]
             cloud_status,
+            #[cfg(not(target_os = "windows"))]
             cloud_set_worker_config,
+            #[cfg(not(target_os = "windows"))]
             cloud_set_worker_enabled,
             app_version
         ])
