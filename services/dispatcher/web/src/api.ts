@@ -254,3 +254,26 @@ export function getLatestRelease(target = "windows-x86_64") {
     return (await r.json()) as LatestRelease;
   });
 }
+
+// ---- Admin: stats -----------------------------------------------------
+export interface AdminStats {
+  task_counts: Record<string, number>;
+  queue_depth: number;
+  in_flight: number;
+  succeeded_24h: number;
+  failed_24h: number;
+  total_user_count: number;
+  total_admin_count: number;
+  storage: {
+    inputs_bytes: number;
+    inputs_files: number;
+    outputs_bytes: number;
+    outputs_files: number;
+    releases_bytes: number;
+    releases_files: number;
+  };
+}
+
+export function getAdminStats() {
+  return request<AdminStats>("/api/admin/stats");
+}

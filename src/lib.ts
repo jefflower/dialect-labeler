@@ -131,7 +131,7 @@ export const ipc = {
 
   // --- Cloud dispatcher --------------------------------------------------
   cloudLogin(args: { baseUrl: string; email: string; password: string }) {
-    return invoke<CloudUser>("cloud_login", args);
+    return invoke<CloudLoginResult>("cloud_login", args);
   },
   cloudSetSession(args: { baseUrl: string; token: string; user: CloudUser }) {
     return invoke<void>("cloud_set_session", args);
@@ -155,6 +155,11 @@ export type CloudUser = {
   id: number;
   email: string;
   role: string;
+};
+
+export type CloudLoginResult = {
+  token: string;
+  user: CloudUser;
 };
 
 export type CloudCurrentTask = {

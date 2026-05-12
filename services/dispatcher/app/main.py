@@ -9,10 +9,12 @@ a single port.
 from __future__ import annotations
 
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -21,6 +23,7 @@ from .cleaner import schedule_cleaner
 from .config import get_settings
 from .db import get_session_factory, init_db
 from .models import ROLE_ADMIN, User
+from .routes import admin as admin_routes
 from .routes import auth as auth_routes
 from .routes import releases as releases_routes
 from .routes import tasks as tasks_routes
@@ -69,11 +72,41 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    # Structured one-line access log per request. Adds a stable
+    # `req_id` you can grep for across handler logs to follow a single
+    # request through its full path. Slots in BEFORE the routers so it
+    # wraps everything, including 4xx error responses.
+    @app.middleware("http")
+    async def access_log(request: Request, call_next):
+        req_id = uuid.uuid4().hex[:8]
+        request.state.req_id = req_id
+        started = time.perf_counter()
+        method = request.method
+        path = request.url.path
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            log.exception(
+                "req=%s %s %s status=500 elapsed=%.1fms",
+                req_id, method, path, elapsed_ms,
+            )
+            raise
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        log.info(
+            "req=%s %s %s status=%d elapsed=%.1fms",
+            req_id, method, path, response.status_code, elapsed_ms,
+        )
+        response.headers["X-Request-ID"] = req_id
+        return response
+
     app.include_router(auth_routes.router)
     app.include_router(tasks_routes.router)
     app.include_router(worker_routes.router)
     app.include_router(users_routes.router)
     app.include_router(releases_routes.router)
+    app.include_router(admin_routes.router)
 
     @app.get("/healthz")
     def healthz() -> dict:

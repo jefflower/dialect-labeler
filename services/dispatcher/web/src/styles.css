@@ -305,3 +305,29 @@ table.tasks tr.row-link:hover { background: #f7f8fa; }
 }
 
 .loader { color: var(--muted); padding: 24px; text-align: center; }
+
+/* ----- Dashboard KPIs ----- */
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+}
+.kpi-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 20px;
+  box-shadow: var(--shadow);
+}
+.kpi-label {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+.kpi-value {
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.2;
+}

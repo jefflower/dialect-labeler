@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AuthProvider, useAuth } from "./auth";
+import AdminDashboardPage from "./pages/AdminDashboardPage";
 import AdminReleasesPage from "./pages/AdminReleasesPage";
 import AdminUsersPage from "./pages/AdminUsersPage";
 import DownloadsPage from "./pages/DownloadsPage";
@@ -37,6 +38,14 @@ function AppShell() {
         <Route path="tasks" element={<TasksPage />} />
         <Route path="tasks/:id" element={<TaskDetailPage />} />
         <Route path="downloads" element={<DownloadsPage />} />
+        <Route
+          path="admin"
+          element={
+            <RequireAdmin>
+              <AdminDashboardPage />
+            </RequireAdmin>
+          }
+        />
         <Route
           path="admin/users"
           element={

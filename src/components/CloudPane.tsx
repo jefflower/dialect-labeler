@@ -93,13 +93,16 @@ export function CloudPane({ open, onClose, workerConfig }: Props) {
   }, [baseUrl]);
 
   // Hydrate from local store on first mount, push back to Rust if found.
+  // We treat an empty / missing token as "session forgotten" rather than
+  // trying to silently re-login — better to ask the user than to fail
+  // a worker_loop claim with a stale 401.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const store = await Store.load(STORE_FILE);
         const saved = await store.get<SessionStored>(SESSION_KEY);
-        if (saved && !cancelled) {
+        if (saved && saved.token && !cancelled) {
           setBaseUrl(saved.baseUrl);
           await ipc.cloudSetSession({
             baseUrl: saved.baseUrl,
@@ -141,27 +144,19 @@ export function CloudPane({ open, onClose, workerConfig }: Props) {
     setError(null);
     try {
       const url = baseUrl.trim().replace(/\/+$/, "");
-      const user = await ipc.cloudLogin({
+      const result = await ipc.cloudLogin({
         baseUrl: url,
         email: email.trim(),
         password,
       });
-      // Persist for next launch.
-      // The token isn't returned by cloud_login (Rust holds it), so we
-      // re-fetch from the dispatcher with a /me when we need it. For
-      // now save the URL + user; the actual auth token isn't strictly
-      // needed for re-hydration because the Rust state already has it.
-      // But we want to survive an app restart — re-login required if we
-      // don't preserve the token.
-      // Workaround: re-issue a token via login on the next boot if we
-      // saved nothing, OR have cloud_login return the token too.
-      // Pragmatic call: persist baseUrl + user; on next boot, just show
-      // the login form pre-filled with the last email.
+      // Persist for next launch. Both pieces matter: the URL so we don't
+      // ask the user to retype it, the token so a relaunch picks up the
+      // worker loop without a fresh login.
       const store = await Store.load(STORE_FILE);
       await store.set(SESSION_KEY, {
         baseUrl: url,
-        token: "", // intentionally empty — see comment above
-        user,
+        token: result.token,
+        user: result.user,
       } satisfies SessionStored);
       await store.save();
       setPassword("");

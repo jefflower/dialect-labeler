@@ -198,3 +198,57 @@ cargo fmt --check
 约束：
 - 情感标签不涉及演绎身份（性格词不算情感）
 - 一个单句的情感保持稳定
+
+## 云端工作流（Cloud Mode）
+
+除单机标注外，整套也能跑成「云端任务队列 + 桌面 Worker」形态。一台服务器跑调度，多台桌面客户端开「自动接单」消费任务，产物自动回传。
+
+### 角色
+
+| 角色 | 干什么 |
+|---|---|
+| **业主（user）** | Web 上传输入 zip → 别处的 Worker 跑完后回 Web 下载产物 |
+| **Worker** | 桌面 App 勾「自动接单」，托盘后台从云端拉任务、本地跑 ASR/LLM、回传 |
+| **管理员（admin）** | 管账号、上传新版客户端、看仪表盘 |
+
+### 部署调度服务
+
+```bash
+cd services/dispatcher
+cp .env.example .env
+# 编辑 .env，至少设置 JWT_SECRET 和 ADMIN_EMAIL/ADMIN_PASSWORD
+docker compose up --build -d
+```
+
+服务包含 FastAPI + SQLite + 本地盘 + 静态托管 React SPA，单端口 `:8080`。第一位注册的用户自动成为管理员；如果填了 `ADMIN_EMAIL/ADMIN_PASSWORD`，启动时自动创建。
+
+文件不进对象存储——直接落 `./data/storage/`。任务成功且业主下载后**立即删源/产物文件**，DB 仅留 `summary_json`（段数 + 按角色总时长 + 引擎信息）。失败任务的输入默认保留 3 天供排查；产物默认保留 7 天或下载后即删（取早者）。这两个 TTL 都在 `.env` 调。
+
+### 客户端「云端 Worker」模式
+
+桌面 App 顶栏点云图标 → 输入服务器地址 / 邮箱 / 密码登录 → 勾「自动接单」→ 关窗到托盘。后台轮询 `/api/worker/claim`，抢到任务后用本机算力（包括已配的 LAN whisper-server / Ollama 池）跑完整管线、打包回传。
+
+### 客户端自动升级
+
+第一次需要在部署机生成一对签名密钥：
+
+```bash
+npx tauri signer generate -w ~/.tauri/dialect-labeler.key
+```
+
+把公钥粘到 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`，私钥（含密码）配进 GitHub Actions 的两个 secret：
+
+| Secret | 用途 |
+|---|---|
+| `TAURI_SIGNING_PRIVATE_KEY` | `.key` 文件原文 |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 生成密钥时设的口令 |
+| `DISPATCHER_URL` | 调度服务的公网地址 |
+| `DISPATCHER_TOKEN` | 管理员账号的 JWT（定期轮换） |
+
+之后 `git tag vX.Y.Z && git push --tags` 触发 `release-dispatcher.yml`：构建 Windows 安装包、签名、调用 `/api/releases` 上传。现网客户端下次启动通过 `tauri-plugin-updater` 自动获取并提示安装。
+
+无密钥签名也能用——`/api/releases` 接受 `signature` 为空的版本，下载页可下载，但不会通过自动升级通道下发（Tauri 拒绝安装未签名更新，这是设计如此）。
+
+### 仪表盘
+
+管理员登录后 `/admin` 是仪表盘：当前队列深度、处理中任务数、24 小时成功/失败、磁盘按 inputs/outputs/releases 分类的占用。每 5 秒自动刷新。

@@ -5924,18 +5924,25 @@ mod tests {
 // every HTTP call. On startup the frontend re-injects via
 // `cloud_set_session`.
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudLoginResult {
+    token: String,
+    user: cloud::UserInfo,
+}
+
 #[tauri::command]
 async fn cloud_login(
     state: tauri::State<'_, cloud::CloudState>,
     base_url: String,
     email: String,
     password: String,
-) -> Result<cloud::UserInfo, String> {
+) -> Result<CloudLoginResult, String> {
     let url = base_url.trim().to_string();
     let (token, user) =
         cloud::login_request(&url, &email, &password).map_err(|err| err.to_string())?;
     state.set_credentials(url, token.clone(), user.clone());
-    Ok(user)
+    Ok(CloudLoginResult { token, user })
 }
 
 #[tauri::command]

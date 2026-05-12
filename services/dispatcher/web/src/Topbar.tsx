@@ -13,6 +13,7 @@ export default function Topbar() {
         <NavLink to="/downloads">下载</NavLink>
         {user.role === "admin" && (
           <>
+            <NavLink to="/admin" end>仪表盘</NavLink>
             <NavLink to="/admin/users">用户</NavLink>
             <NavLink to="/admin/releases">版本</NavLink>
           </>
