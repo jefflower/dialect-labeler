@@ -2298,6 +2298,15 @@ function App() {
               hasSegments={segments.length > 0}
               llmEnabled={settings.useLlm}
               cutValidationSummary={cutValidationSummary}
+              whisperEndpoints={settings.whisperEndpoints ?? []}
+              onWhisperEndpointsChange={(next) =>
+                updateSettings({ whisperEndpoints: next })
+              }
+              ollamaExtraEndpoints={settings.ollamaExtraEndpoints ?? []}
+              onOllamaExtraEndpointsChange={(next) =>
+                updateSettings({ ollamaExtraEndpoints: next })
+              }
+              ollamaModelDefault={settings.ollamaModel}
               pendingCount={
                 segments.filter((s) => {
                   const asrDone = s.phoneticText.trim().length > 0;

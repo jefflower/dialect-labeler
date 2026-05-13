@@ -254,6 +254,26 @@ pub(crate) struct CutConfig {
     /// scaffolding and JSON output). Default 32768.
     #[serde(default = "default_semantic_num_ctx")]
     pub(crate) semantic_num_ctx: u32,
+
+    // ---- Mode 2 endpoint pools (independent from AppSettings global pools) -
+    // Reason: AppSettings.ollamaExtraEndpoints + whisperEndpoints are
+    // semantically owned by Mode 1 (dialect polish + ASR). Mode 2 needs
+    // its OWN pool because:
+    //   - Different model: Mode 1 polishes with a dialect-specific
+    //     prompt + 32B; Mode 2 needs a 32B with num_ctx=32K (only
+    //     huayu has the RAM for it).
+    //   - Different Whisper: Mode 2 wants普通话 transcription; Mode 1
+    //     might be running a dialect Whisper checkpoint.
+    //   - Routing: a worker can be configured "dialect only" or
+    //     "semantic only" by editing one mode's pool without touching
+    //     the other.
+    // The lists fall back to the singular semantic_endpoint /
+    // semantic_model when empty — keeps old project.json loading
+    // cleanly.
+    #[serde(default)]
+    pub(crate) semantic_ollama_endpoints: Vec<OllamaEndpointDef>,
+    #[serde(default)]
+    pub(crate) semantic_whisper_endpoints: Vec<WhisperEndpointDef>,
 }
 
 fn default_target_loudness_lufs() -> f32 { -18.0 }
@@ -283,7 +303,51 @@ impl Default for CutConfig {
             semantic_endpoint: String::new(),
             semantic_model: default_semantic_model(),
             semantic_num_ctx: default_semantic_num_ctx(),
+            semantic_ollama_endpoints: Vec::new(),
+            semantic_whisper_endpoints: Vec::new(),
         }
+    }
+}
+
+impl CutConfig {
+    /// Resolve the effective Mode 2 LLM endpoint list. Always returns
+    /// at least one entry (or empty if NOTHING is configured anywhere).
+    ///
+    /// Precedence:
+    ///   1. `semantic_ollama_endpoints` (the new list-form config) —
+    ///      only `enabled = true` entries are kept.
+    ///   2. Singular `semantic_endpoint` + `semantic_model` (old form,
+    ///      pre-pool) — synthesised into a one-entry list.
+    pub(crate) fn effective_semantic_ollama_endpoints(&self) -> Vec<OllamaEndpointDef> {
+        let from_pool: Vec<OllamaEndpointDef> = self
+            .semantic_ollama_endpoints
+            .iter()
+            .filter(|e| e.enabled && !e.url.trim().is_empty())
+            .cloned()
+            .collect();
+        if !from_pool.is_empty() {
+            return from_pool;
+        }
+        if !self.semantic_endpoint.trim().is_empty() {
+            return vec![OllamaEndpointDef {
+                url: self.semantic_endpoint.clone(),
+                model: Some(self.semantic_model.clone()),
+                enabled: true,
+            }];
+        }
+        Vec::new()
+    }
+
+    /// Resolve the effective Mode 2 Whisper endpoint list. Returns
+    /// empty when nothing is configured — callers can then fall back
+    /// to the AppSettings-global pool (carried by RecognitionOptions)
+    /// or to a local CLI as a last resort.
+    pub(crate) fn effective_semantic_whisper_endpoints(&self) -> Vec<WhisperEndpointDef> {
+        self.semantic_whisper_endpoints
+            .iter()
+            .filter(|e| e.enabled && !e.url.trim().is_empty())
+            .cloned()
+            .collect()
     }
 }
 
@@ -1870,37 +1934,81 @@ pub(crate) fn llm_decide_semantic_cuts(
     candidates_ms: &[u64],
     config: &CutConfig,
 ) -> Result<Vec<SemanticCutDecision>, String> {
-    if config.semantic_endpoint.trim().is_empty() {
+    let pool = config.effective_semantic_ollama_endpoints();
+    if pool.is_empty() {
         return Err(
-            "semantic_endpoint is empty — Mode 2 cannot use the default Ollama \
-             pool because the pool's default num_ctx (2048) silently truncates the \
-             long ASR prompt. Configure semanticEndpoint to a box with ≥40GB RAM, \
-             e.g. http://100.64.0.4:11434."
+            "Mode 2 LLM 端点未配置 — semantic_ollama_endpoints / semantic_endpoint 都为空。\
+             默认 Ollama 池的 num_ctx=2048 会静默截断长 ASR prompt，因此必须手动配一个 \
+             num_ctx ≥ 32K 的节点（推荐 http://100.64.0.4:11434 / qwen2.5:32b）。"
                 .to_string(),
         );
     }
     let (system, user) = build_semantic_cut_prompt(pieces, candidates_ms, config);
+
+    // Iterate the pool in declared order. First endpoint to return a
+    // valid + spec-compliant response wins. Failover on:
+    //   - network error
+    //   - non-JSON envelope
+    //   - empty message.content
+    //   - JSON schema mismatch
+    //   - cut decisions that fail validation against candidate pool
+    // Aggregate errors so the final message is actionable when all fail.
+    let mut errors: Vec<String> = Vec::new();
+    for (i, endpoint) in pool.iter().enumerate() {
+        let model = endpoint
+            .model
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&config.semantic_model);
+        eprintln!(
+            "[semantic cut] trying endpoint {}/{}: {} · model={model}",
+            i + 1,
+            pool.len(),
+            endpoint.url
+        );
+        match llm_decide_semantic_cuts_one_endpoint(
+            &endpoint.url,
+            model,
+            config.semantic_num_ctx,
+            &system,
+            &user,
+            candidates_ms,
+            config,
+        ) {
+            Ok(decisions) => return Ok(decisions),
+            Err(err) => {
+                eprintln!("[semantic cut] endpoint {} failed: {err}", endpoint.url);
+                errors.push(format!("[{}] {err}", endpoint.url));
+            }
+        }
+    }
+    Err(format!("Mode 2 LLM 池全部失败：{}", errors.join(" ; ")))
+}
+
+fn llm_decide_semantic_cuts_one_endpoint(
+    endpoint_url: &str,
+    model: &str,
+    num_ctx: u32,
+    system: &str,
+    user: &str,
+    candidates_ms: &[u64],
+    config: &CutConfig,
+) -> Result<Vec<SemanticCutDecision>, String> {
     let body = json!({
-        "model": config.semantic_model,
+        "model": model,
         "stream": false,
         "format": "json",
         "options": {
             "temperature": 0.2,
             "top_p": 0.9,
-            "num_ctx": config.semantic_num_ctx,
+            "num_ctx": num_ctx,
         },
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user}
         ]
     });
-    let url = format!(
-        "{}/api/chat",
-        config.semantic_endpoint.trim_end_matches('/')
-    );
-    // Generous timeout: a 32B model warming up cold + processing 32K
-    // context can run 90-180s on the first call. Subsequent calls
-    // (when the model is hot) are 20-60s.
+    let url = format!("{}/api/chat", endpoint_url.trim_end_matches('/'));
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(900))
         .build();
@@ -1912,7 +2020,6 @@ pub(crate) fn llm_decide_semantic_cuts(
     let raw_body = response
         .into_string()
         .map_err(|err| format!("Ollama 响应读取失败：{err}"))?;
-    // Ollama wraps the model's actual JSON in `message.content`.
     let envelope: Value = serde_json::from_str(&raw_body).map_err(|err| {
         format!("Ollama 信封非 JSON：{err}\nraw: {}", truncate_for_log(&raw_body, 300))
     })?;
@@ -1982,11 +2089,35 @@ pub(crate) fn llm_normalize_segment_text(
     raw_asr: &str,
     config: &CutConfig,
 ) -> Result<String, String> {
-    if config.semantic_endpoint.trim().is_empty() {
-        return Err("semantic_endpoint required for Mode 2 normalisation".into());
+    let pool = config.effective_semantic_ollama_endpoints();
+    if pool.is_empty() {
+        return Err("Mode 2 LLM 端点未配置（normalize 阶段）".into());
     }
+    // Per-segment normalisation tolerates per-endpoint failure: try
+    // each in order, return on first success. Loud error only when
+    // every endpoint fails — caller falls back to raw ASR.
+    let mut errors: Vec<String> = Vec::new();
+    for endpoint in &pool {
+        let model = endpoint
+            .model
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&config.semantic_model);
+        match llm_normalize_segment_text_one_endpoint(&endpoint.url, model, raw_asr) {
+            Ok(text) => return Ok(text),
+            Err(err) => errors.push(format!("[{}] {err}", endpoint.url)),
+        }
+    }
+    Err(format!("Mode 2 normalize 池全部失败：{}", errors.join(" ; ")))
+}
+
+fn llm_normalize_segment_text_one_endpoint(
+    endpoint_url: &str,
+    model: &str,
+    raw_asr: &str,
+) -> Result<String, String> {
     let body = json!({
-        "model": config.semantic_model,
+        "model": model,
         "stream": false,
         "format": "json",
         "options": {
@@ -2001,10 +2132,7 @@ pub(crate) fn llm_normalize_segment_text(
             {"role": "user", "content": raw_asr},
         ]
     });
-    let url = format!(
-        "{}/api/chat",
-        config.semantic_endpoint.trim_end_matches('/')
-    );
+    let url = format!("{}/api/chat", endpoint_url.trim_end_matches('/'));
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(120))
         .build();
@@ -2230,6 +2358,18 @@ pub(crate) fn run_semantic_pipeline_impl(
     // not run on these short pieces.
     let mut asr_options = recognition_options.clone();
     asr_options.use_llm = Some(false);
+    // Mode 2's own Whisper pool takes precedence over whatever the
+    // caller passed in `recognition_options.whisper_endpoints` (which
+    // is semantically the Mode 1 / global pool). Empty list = fall back
+    // to whatever was passed.
+    let semantic_whisper_pool = config.effective_semantic_whisper_endpoints();
+    if !semantic_whisper_pool.is_empty() {
+        eprintln!(
+            "[semantic] using Mode 2's own Whisper pool: {} endpoint(s)",
+            semantic_whisper_pool.len()
+        );
+        asr_options.whisper_endpoints = Some(semantic_whisper_pool);
+    }
 
     let mut reports: Vec<SemanticPipelineFileReport> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -7598,6 +7738,94 @@ mod tests {
             "expected redirect message, got: {err}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ====================================================================
+    // CutConfig: Mode 2 endpoint pool resolution
+    // ====================================================================
+
+    #[test]
+    fn effective_semantic_ollama_endpoints_uses_pool_when_present() {
+        let cfg = CutConfig {
+            mode: CutMode::Semantic,
+            semantic_endpoint: "http://legacy:11434".to_string(),
+            semantic_model: "qwen2.5:32b".to_string(),
+            semantic_ollama_endpoints: vec![
+                OllamaEndpointDef {
+                    url: "http://a:11434".to_string(),
+                    model: Some("qwen2.5:32b".to_string()),
+                    enabled: true,
+                },
+                OllamaEndpointDef {
+                    url: "http://b:11434".to_string(),
+                    model: None,
+                    enabled: false, // disabled — should be filtered
+                },
+                OllamaEndpointDef {
+                    url: "http://c:11434".to_string(),
+                    model: Some("qwen3.5:122b".to_string()),
+                    enabled: true,
+                },
+            ],
+            ..CutConfig::default()
+        };
+        let pool = cfg.effective_semantic_ollama_endpoints();
+        assert_eq!(pool.len(), 2, "disabled entry filtered, legacy ignored");
+        assert_eq!(pool[0].url, "http://a:11434");
+        assert_eq!(pool[1].url, "http://c:11434");
+        // Legacy `semantic_endpoint` is ignored when pool has entries.
+        assert!(pool.iter().all(|e| e.url != "http://legacy:11434"));
+    }
+
+    #[test]
+    fn effective_semantic_ollama_endpoints_falls_back_to_singular_when_pool_empty() {
+        let cfg = CutConfig {
+            mode: CutMode::Semantic,
+            semantic_endpoint: "http://legacy:11434".to_string(),
+            semantic_model: "qwen2.5:32b".to_string(),
+            semantic_ollama_endpoints: Vec::new(),
+            ..CutConfig::default()
+        };
+        let pool = cfg.effective_semantic_ollama_endpoints();
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].url, "http://legacy:11434");
+        assert_eq!(pool[0].model.as_deref(), Some("qwen2.5:32b"));
+    }
+
+    #[test]
+    fn effective_semantic_ollama_endpoints_returns_empty_when_nothing_configured() {
+        let cfg = CutConfig {
+            mode: CutMode::Semantic,
+            semantic_endpoint: String::new(),
+            semantic_ollama_endpoints: Vec::new(),
+            ..CutConfig::default()
+        };
+        assert!(cfg.effective_semantic_ollama_endpoints().is_empty());
+    }
+
+    #[test]
+    fn effective_semantic_whisper_endpoints_filters_disabled_and_empty_urls() {
+        let cfg = CutConfig {
+            mode: CutMode::Semantic,
+            semantic_whisper_endpoints: vec![
+                WhisperEndpointDef {
+                    url: "http://a:9090".to_string(),
+                    enabled: true,
+                },
+                WhisperEndpointDef {
+                    url: "  ".to_string(), // blank
+                    enabled: true,
+                },
+                WhisperEndpointDef {
+                    url: "http://b:9090".to_string(),
+                    enabled: false, // off
+                },
+            ],
+            ..CutConfig::default()
+        };
+        let pool = cfg.effective_semantic_whisper_endpoints();
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].url, "http://a:9090");
     }
 
     // ====================================================================

@@ -6,6 +6,7 @@ import {
   ShieldCheck,
   Languages,
   ListChecks,
+  Plus,
   RefreshCcw,
   Ruler,
   Save,
@@ -15,7 +16,182 @@ import {
   Trash2,
   Wand2,
 } from "lucide-react";
-import type { CutConfig, CutMode, CutPresetDef } from "../types";
+import type {
+  CutConfig,
+  CutMode,
+  CutPresetDef,
+  OllamaEndpointDef,
+  WhisperEndpointDef,
+} from "../types";
+
+// ---------------------------------------------------------------------------
+// Inline editors for endpoint pools. Used by BOTH mode panels so the user
+// configures Whisper / Ollama lists alongside the cut strategy that owns
+// them, instead of hunting through Settings. Each row: checkbox (enabled
+// switch) → url input → [optional model input for Ollama] → trash icon.
+// ---------------------------------------------------------------------------
+
+function WhisperEndpointEditor(props: {
+  endpoints: WhisperEndpointDef[];
+  onChange: (next: WhisperEndpointDef[]) => void;
+  label: string;
+  /** Short hint shown under the list. */
+  hint?: string;
+}) {
+  const list = props.endpoints ?? [];
+  return (
+    <div className="endpoint-editor" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <span className="config-param-label" style={{ marginBottom: 2 }}>{props.label}</span>
+      {list.map((ep, idx) => {
+        const enabled = ep.enabled !== false;
+        return (
+          <div
+            key={idx}
+            style={{
+              display: "grid",
+              gridTemplateColumns: "auto 1fr auto",
+              gap: 6,
+              alignItems: "center",
+              opacity: enabled ? 1 : 0.55,
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(e) =>
+                props.onChange(
+                  list.map((x, i) =>
+                    i === idx ? { ...x, enabled: e.target.checked } : x,
+                  ),
+                )
+              }
+              title={enabled ? "启用中（点击禁用）" : "已禁用（点击启用）"}
+            />
+            <input
+              value={ep.url}
+              placeholder="http://100.64.0.x:9090"
+              onChange={(e) =>
+                props.onChange(
+                  list.map((x, i) =>
+                    i === idx ? { ...x, url: e.target.value } : x,
+                  ),
+                )
+              }
+            />
+            <button
+              className="btn-ghost btn-icon"
+              onClick={() => props.onChange(list.filter((_, i) => i !== idx))}
+              title="删除此端点"
+            >
+              <Trash2 size={14} />
+            </button>
+          </div>
+        );
+      })}
+      <button
+        className="btn-ghost"
+        style={{ alignSelf: "flex-start" }}
+        onClick={() => props.onChange([...list, { url: "" }])}
+      >
+        <Plus size={12} /> 添加 Whisper 端点
+      </button>
+      {props.hint && (
+        <p className="help-tip" style={{ marginTop: 2, opacity: 0.7 }}>
+          {props.hint}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function OllamaEndpointEditor(props: {
+  endpoints: OllamaEndpointDef[];
+  onChange: (next: OllamaEndpointDef[]) => void;
+  label: string;
+  modelPlaceholder: string;
+  hint?: string;
+}) {
+  const list = props.endpoints ?? [];
+  return (
+    <div className="endpoint-editor" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <span className="config-param-label" style={{ marginBottom: 2 }}>{props.label}</span>
+      {list.map((ep, idx) => {
+        const enabled = ep.enabled !== false;
+        return (
+          <div
+            key={idx}
+            style={{
+              display: "grid",
+              gridTemplateColumns: "auto 1.6fr 1fr auto",
+              gap: 6,
+              alignItems: "center",
+              opacity: enabled ? 1 : 0.55,
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(e) =>
+                props.onChange(
+                  list.map((x, i) =>
+                    i === idx ? { ...x, enabled: e.target.checked } : x,
+                  ),
+                )
+              }
+            />
+            <input
+              value={ep.url}
+              placeholder="http://100.64.0.x:11434"
+              onChange={(e) =>
+                props.onChange(
+                  list.map((x, i) =>
+                    i === idx ? { ...x, url: e.target.value } : x,
+                  ),
+                )
+              }
+            />
+            <input
+              value={ep.model ?? ""}
+              placeholder={props.modelPlaceholder}
+              onChange={(e) =>
+                props.onChange(
+                  list.map((x, i) =>
+                    i === idx ? { ...x, model: e.target.value } : x,
+                  ),
+                )
+              }
+              title="留空则使用首个端点的模型作为默认"
+            />
+            <button
+              className="btn-ghost btn-icon"
+              onClick={() => props.onChange(list.filter((_, i) => i !== idx))}
+              title="删除此端点"
+            >
+              <Trash2 size={14} />
+            </button>
+          </div>
+        );
+      })}
+      <button
+        className="btn-ghost"
+        style={{ alignSelf: "flex-start" }}
+        onClick={() =>
+          props.onChange([
+            ...list,
+            { url: "", model: props.modelPlaceholder, enabled: true },
+          ])
+        }
+      >
+        <Plus size={12} /> 添加 LLM 端点
+      </button>
+      {props.hint && (
+        <p className="help-tip" style={{ marginTop: 2, opacity: 0.7 }}>
+          {props.hint}
+        </p>
+      )}
+    </div>
+  );
+}
 
 type ConfigBandProps = {
   config: CutConfig;
@@ -30,6 +206,15 @@ type ConfigBandProps = {
   llmEnabled: boolean;
   pendingCount: number;
   cutValidationSummary: { checked: number; failed: number } | null;
+  /** Mode 1's Whisper endpoint pool. Lives in AppSettings.whisperEndpoints
+   *  but surfaced here so it sits next to the cut strategy it powers. */
+  whisperEndpoints: WhisperEndpointDef[];
+  onWhisperEndpointsChange: (next: WhisperEndpointDef[]) => void;
+  /** Mode 1's Ollama LLM pool. Lives in AppSettings.ollamaExtraEndpoints. */
+  ollamaExtraEndpoints: OllamaEndpointDef[];
+  onOllamaExtraEndpointsChange: (next: OllamaEndpointDef[]) => void;
+  /** Primary Ollama model — used as placeholder default for new endpoints. */
+  ollamaModelDefault: string;
   onCutAll: () => void;
   onCleanCutNoise: () => void;
   onRepairCutSilence: () => void;
@@ -40,8 +225,19 @@ type ConfigBandProps = {
   onRepolishVisible: () => void;
 };
 
+/** Numeric-valued keys of CutConfig — used to narrow the ParamField map
+ *  so we can safely pass `props.config[field.key]` straight to a number
+ *  input without TS widening to include the endpoint-pool array fields. */
+type NumericCutConfigKey =
+  | "silenceDb"
+  | "minSilenceMs"
+  | "minSegmentMs"
+  | "preRollMs"
+  | "postRollMs"
+  | "maxSegmentMs";
+
 type ParamField = {
-  key: keyof CutConfig;
+  key: NumericCutConfigKey;
   label: string;
   unit: string;
   hint: string;
@@ -307,31 +503,7 @@ export function ConfigBand(props: ConfigBandProps) {
                 className="config-strategy-params"
                 style={{ gap: 10, marginTop: 8 }}
               >
-                <label className="config-param" style={{ flex: 2 }}>
-                  <span className="config-param-label">LLM 端点</span>
-                  <input
-                    type="text"
-                    placeholder="http://100.64.0.4:11434"
-                    value={props.config.semanticEndpoint ?? ""}
-                    onChange={(e) =>
-                      updateSemanticField("semanticEndpoint", e.target.value)
-                    }
-                    title="带 32K+ context 的 Ollama 节点；为空则模式 2 拒跑"
-                  />
-                </label>
-                <label className="config-param">
-                  <span className="config-param-label">模型</span>
-                  <input
-                    type="text"
-                    placeholder="qwen2.5:32b"
-                    value={props.config.semanticModel ?? "qwen2.5:32b"}
-                    onChange={(e) =>
-                      updateSemanticField("semanticModel", e.target.value)
-                    }
-                    title="huayu 上的 qwen2.5:32b（默认）或 qwen3.5:122b"
-                  />
-                </label>
-                <label className="config-param">
+                <label className="config-param" style={{ flex: 1 }}>
                   <span className="config-param-label">num_ctx</span>
                   <input
                     type="number"
@@ -349,13 +521,33 @@ export function ConfigBand(props: ConfigBandProps) {
                   />
                 </label>
               </div>
+              <div style={{ marginTop: 10 }}>
+                <OllamaEndpointEditor
+                  endpoints={props.config.semanticOllamaEndpoints ?? []}
+                  onChange={(next) =>
+                    updateSemanticField("semanticOllamaEndpoints", next)
+                  }
+                  label="Mode 2 · LLM 端点池（按顺序 failover）"
+                  modelPlaceholder="qwen2.5:32b"
+                  hint="Mode 2 专用，独立于 Mode 1 的 Ollama 池。每个端点必须支持 num_ctx ≥ 32K（建议 huayu 100.64.0.4:11434）。空 → 拒绝运行。"
+                />
+              </div>
+              <div style={{ marginTop: 10 }}>
+                <WhisperEndpointEditor
+                  endpoints={props.config.semanticWhisperEndpoints ?? []}
+                  onChange={(next) =>
+                    updateSemanticField("semanticWhisperEndpoints", next)
+                  }
+                  label="Mode 2 · Whisper 端点池"
+                  hint="Mode 2 专用，独立于 Mode 1 的 Whisper 池。空 → 退回 Mode 1 设置里的全局 Whisper 池或本机 CLI。"
+                />
+              </div>
               <p
                 className="config-strategy-hint"
                 style={{ marginTop: 8, opacity: 0.7 }}
               >
-                模式 2 不走「切」按钮——走「云端 / 一键打包」（仅 macOS Worker
-                可执行）。前端会通过 <code>run_semantic_pipeline</code> 命令
-                把 source 路径 + 输出目录 + 上述配置一起送给 Worker。
+                Mode 2 直接走「切」按钮——前端检测到 <code>mode = semantic</code>{" "}
+                时改走 <code>run_semantic_pipeline</code> 命令；出 xlsx + 切片 WAV。
               </p>
             </div>
           </details>
@@ -465,6 +657,29 @@ export function ConfigBand(props: ConfigBandProps) {
                   />
                 </label>
               ))}
+            </div>
+            {/* Endpoint pools owned by Mode 1. Moved here from
+                SettingsDrawer per user request: keeping each mode's
+                Whisper / LLM pool next to its strategy eliminates
+                ambiguity about which pool actually drives the run.
+                State still lives in AppSettings so it survives
+                across projects. */}
+            <div style={{ marginTop: 12 }}>
+              <WhisperEndpointEditor
+                endpoints={props.whisperEndpoints}
+                onChange={props.onWhisperEndpointsChange}
+                label="Mode 1 · Whisper 端点池（faster-whisper HTTP）"
+                hint="启用后 ASR 把每段 wav POST 到端点池（参考 services/whisper-server/）。空 → 退回本机 whisper CLI。"
+              />
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <OllamaEndpointEditor
+                endpoints={props.ollamaExtraEndpoints}
+                onChange={props.onOllamaExtraEndpointsChange}
+                label="Mode 1 · LLM 端点池（按顺序 failover）"
+                modelPlaceholder={props.ollamaModelDefault || "qwen2.5:32b"}
+                hint="LLM 改写阶段会跨这些端点 work-stealing 并发。模型留空则使用 Settings 里配置的主模型。"
+              />
             </div>
           </div>
         </details>

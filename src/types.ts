@@ -77,6 +77,19 @@ export type CutConfig = {
   semanticModel?: string;
   /** `num_ctx` override sent with the semantic-cut LLM call. Default 32768. */
   semanticNumCtx?: number;
+
+  /** Mode 2's own Ollama LLM pool. Independent from `AppSettings.ollamaExtraEndpoints`
+   *  which is semantically owned by Mode 1. Pool is tried in declared
+   *  order — first endpoint to return a valid + spec-compliant response
+   *  wins. Empty list → falls back to the singular `semanticEndpoint` /
+   *  `semanticModel` pair above (legacy form, pre-pool). */
+  semanticOllamaEndpoints?: OllamaEndpointDef[];
+  /** Mode 2's own Whisper HTTP pool. Independent from
+   *  `AppSettings.whisperEndpoints` (Mode 1). Empty → fall back to the
+   *  globals carried in RecognitionOptions. Each `WhisperEndpointDef`
+   *  must point at a `faster-whisper-server` instance (or compatible
+   *  `/transcribe` API). */
+  semanticWhisperEndpoints?: WhisperEndpointDef[];
 };
 
 export type CutPresetDef = {
