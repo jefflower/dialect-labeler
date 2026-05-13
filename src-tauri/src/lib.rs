@@ -2559,17 +2559,65 @@ fn process_single_semantic_file(
         return Err("Mode 2 sliding cutter 需要至少一个 Whisper HTTP 端点".into());
     }
 
-    // Same for Ollama — Mode 2 pool first, fall back to the (unioned)
-    // Mode-1 pool we already promoted in cloud.rs / App.tsx.
-    let ollama_pool = config.effective_semantic_ollama_endpoints();
+    // Same for Ollama — Mode 2 pool first, fall back to the Mode-1
+    // pool from recognition options (Mode 1 ollama_extra_endpoints +
+    // primary ollama_url). The sliding cutter's per-window prompts are
+    // small enough that even num_ctx=2048 backends work, so any
+    // reachable Ollama endpoint is acceptable.
+    let mut ollama_pool: Vec<OllamaEndpointDef> = config
+        .effective_semantic_ollama_endpoints()
+        .into_iter()
+        .filter(|e| !e.url.trim().is_empty() && e.enabled)
+        .collect();
     if ollama_pool.is_empty() {
-        return Err("Mode 2 sliding cutter 需要至少一个 Ollama 端点（num_ctx ≥ 8K）".into());
+        if let Some(extras) = asr_options.ollama_extra_endpoints.as_ref() {
+            for ep in extras {
+                if !ep.url.trim().is_empty() && ep.enabled {
+                    ollama_pool.push(OllamaEndpointDef {
+                        url: ep.url.clone(),
+                        model: ep.model.clone(),
+                        enabled: true,
+                    });
+                }
+            }
+        }
+        if ollama_pool.is_empty() {
+            if let Some(url) = asr_options.ollama_url.as_ref() {
+                if !url.trim().is_empty() {
+                    ollama_pool.push(OllamaEndpointDef {
+                        url: url.clone(),
+                        model: asr_options.ollama_model.clone(),
+                        enabled: true,
+                    });
+                }
+            }
+        }
+        if !ollama_pool.is_empty() {
+            eprintln!(
+                "[semantic-sliding] Mode 2 LLM pool empty → promoted Mode 1 endpoints ({} url(s))",
+                ollama_pool.len()
+            );
+        }
     }
+    if ollama_pool.is_empty() {
+        return Err(
+            "Mode 2 sliding cutter 没有可用 Ollama 端点。请在 Mode 2 配置里加端点池，或者在 Mode 1 配置里加（会自动复用）。".into(),
+        );
+    }
+    // Pick a default model: Mode 2 explicit > first endpoint's pinned
+    // model > AppSettings/Mode-1 primary model > built-in fallback.
     let ollama_model = ollama_pool[0]
         .model
         .clone()
         .filter(|m| !m.trim().is_empty())
-        .unwrap_or_else(|| config.semantic_model.clone());
+        .or_else(|| asr_options.ollama_model.clone().filter(|m| !m.trim().is_empty()))
+        .unwrap_or_else(|| {
+            if config.semantic_model.trim().is_empty() {
+                "qwen2.5:32b".to_string()
+            } else {
+                config.semantic_model.clone()
+            }
+        });
 
     let initial_prompt = asr_options
         .initial_prompt
@@ -2779,22 +2827,50 @@ fn process_single_semantic_file(
 /// tokens and fits easily even in num_ctx=2048 backends. That removes
 /// the original "must have 32K context" requirement.
 /// Built-in default Mode-2 cut prompt. Tuned for Mandarin + Changsha
-/// dialect (the project's primary corpus). Users override via
+/// dialect (the project's primary corpus) with the rules from the
+///录制数据剪辑转写规则（新）spec baked in. Users override via
 /// `CutConfig.semantic_cut_prompt` for other dialects / languages.
 ///
 /// Template placeholders — substituted at call time:
 ///   `{transcript}` `{window_ms}` `{min_ms}` `{max_s}` `{sweet_lo}` `{sweet_hi}`
-const DEFAULT_SEMANTIC_CUT_PROMPT: &str = "下面是一段普通话 / 方言录音开头 {max_s} 秒的 Whisper 转写，按检测到的语音段给出时间戳（毫秒）+ 文字。\
-请告诉我应该在多少毫秒处「切第一刀」。规则：\n\
+///
+/// Design notes:
+///   - We DON'T tell the LLM the strict ms ceiling in the rules
+///     section — it goes in the "硬性约束" preface so the model treats
+///     it as non-negotiable rather than a soft preference.
+///   - "Prefer句末标点" emphasised over "prefer late time" — a clean
+///     break at 45s beats a mid-clause break at 80s.
+///   - "Don't cut in the middle of an utterance" is repeated because
+///     Qwen sometimes drifts toward "split where there's punctuation
+///     inside a Whisper segment" — bad, the punctuation is in the
+///     text but the AUDIO segment boundary may be 200ms later.
+///   - JSON format hint at the bottom — Qwen with format=json
+///     respects it well.
+const DEFAULT_SEMANTIC_CUT_PROMPT: &str = "你是一个普通话 / 长沙话音频切割助手。\
+我会给你一段录音开头 {max_s} 秒的 Whisper 自动转写。每一行是一个 Whisper 自动检测的语音段，\
+格式：[序号] start_ms-end_ms ms  转写文本。\n\
 \n\
-1. 切点必须 ≤ {window_ms} ms（窗口上限）\n\
-2. 切点应 ≥ {min_ms} ms（避免过短段；如果实在不行也可以低一些）\n\
-3. 必须切在某一行的 end_ms 位置（语义边界）\n\
-4. 优先选 {sweet_lo}-{sweet_hi} ms 范围内、落在自然句末（句号 / 问号 / 完整意群结束）的位置；\n\
-   没有这种位置时再退而求其次。\n\
-5. 输出 JSON: {{\"cut_ms\": <int>, \"reason\": \"<简短说明>\"}}。只输出 JSON。\n\
+你的任务：在这些行的 end_ms 中挑出**一个**合适的「切第一刀」位置。\n\
 \n\
-转写：\n{transcript}";
+硬性约束（必须满足，否则结果作废）：\n\
+- 切点 cut_ms 必须 ≤ {window_ms}（窗口上限）。\n\
+- 切点 cut_ms 必须恰好等于某一行的 end_ms（不要凭空算时间）。\n\
+- 切点前后的音频要是一句完整的话，不要把一句话切两半。\n\
+\n\
+优选规则（按优先级）：\n\
+1. 切点应 ≥ {min_ms}（短段尽量避免，除非剩余内容确实只有这么短就一个完整意群）。\n\
+2. 落在自然句末：句号、问号、感叹号；其次是较长停顿（前后两行 end_ms / start_ms 间隙 ≥ 500ms）。\n\
+3. 在 {sweet_lo} - {sweet_hi} ms 之间寻找最靠后的合适点；这个区间内有句末就用它。\n\
+4. 避免切在以下位置：\n\
+   - 一个完整意群中间（如「我觉得这个东西」后面直接接「特别有意思」，别切在「东西」后）；\n\
+   - 语气词或拖音之前（「然后呢…」后面紧跟正题，别留个孤零零的「然后呢」）；\n\
+   - 两个并列分句的连接处（用「，」连接的两个并列子句通常算一个语义单元）。\n\
+5. 长沙话特征字（哒、咯、嘞、啵、嘎、撇 等）做句末标志时，可以视为句号等价物。\n\
+\n\
+输出格式（**只输出这一行 JSON**，不要解释、不要 markdown 包围）：\n\
+{{\"cut_ms\": <整数>, \"reason\": \"<≤30字说明，包含选了哪行的 end_ms 以及理由>\"}}\n\
+\n\
+Whisper 转写：\n{transcript}";
 
 fn llm_pick_one_cut(
     asr: &WhisperResult,
