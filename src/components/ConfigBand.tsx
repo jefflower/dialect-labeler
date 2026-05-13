@@ -4,6 +4,7 @@ import {
   ChevronRight,
   Eraser,
   ShieldCheck,
+  Languages,
   ListChecks,
   RefreshCcw,
   Ruler,
@@ -14,7 +15,7 @@ import {
   Trash2,
   Wand2,
 } from "lucide-react";
-import type { CutConfig, CutPresetDef } from "../types";
+import type { CutConfig, CutMode, CutPresetDef } from "../types";
 
 type ConfigBandProps = {
   config: CutConfig;
@@ -123,9 +124,198 @@ export function ConfigBand(props: ConfigBandProps) {
     [props.presets, props.config],
   );
 
+  const currentMode: CutMode = props.config.mode ?? "dialect";
+
+  const setMode = (next: CutMode) => {
+    props.onConfigChange({ ...props.config, mode: next });
+  };
+  const updateSemanticField = <K extends keyof CutConfig>(key: K, value: CutConfig[K]) => {
+    props.onConfigChange({ ...props.config, [key]: value });
+  };
+
   return (
     <section className="card">
-      <div className="config-row">
+      <div className="config-row" style={{ flexWrap: "wrap", rowGap: 6 }}>
+        {/* Mode toggle. `dialect` is the historical silence-only cutter
+            (长沙 / 台湾 dialect projects). `semantic` is the Mandarin
+            pipeline driven by 录制数据剪辑转写规则（新）— preprocess +
+            ASR + LLM cut decision + xlsx export. Switching modes does
+            NOT migrate other params; each mode has its own knobs. */}
+        <div
+          className="config-mode-toggle"
+          role="radiogroup"
+          aria-label="切割模式"
+          style={{ display: "flex", gap: 4 }}
+        >
+          <button
+            className={`btn-ghost ${currentMode === "dialect" ? "btn-active" : ""}`}
+            onClick={() => setMode("dialect")}
+            title="按静音切；方言录音、保留全部声学事件，速度快、可重复"
+            role="radio"
+            aria-checked={currentMode === "dialect"}
+          >
+            <Scissors size={14} />
+            模式 1 · 方言（按静音切）
+          </button>
+          <button
+            className={`btn-ghost ${currentMode === "semantic" ? "btn-active" : ""}`}
+            onClick={() => setMode("semantic")}
+            title="按语义切；普通话、ASR + Qwen 32K context 决定切点、规范化、出 xlsx"
+            role="radio"
+            aria-checked={currentMode === "semantic"}
+          >
+            <Languages size={14} />
+            模式 2 · 普通话（语义切割）
+          </button>
+        </div>
+
+        {currentMode === "semantic" ? (
+          <details className="config-strategy">
+            <summary
+              className="config-strategy-trigger"
+              title="展开模式 2 语义切割参数"
+            >
+              <span className="config-strategy-trigger-main">
+                <Sliders size={14} />
+                <span>语义参数</span>
+                <span className="config-strategy-current">
+                  {props.config.semanticEndpoint || "未配置 LLM 端点"}
+                </span>
+              </span>
+              <span className="config-strategy-chevron">
+                <ChevronDown size={14} className="config-strategy-icon-open" />
+                <ChevronRight size={14} className="config-strategy-icon-closed" />
+              </span>
+            </summary>
+            <div className="config-strategy-body">
+              <div className="config-strategy-params" style={{ gap: 10 }}>
+                <label className="config-param">
+                  <span className="config-param-label">最短段长 (秒)</span>
+                  <input
+                    type="number"
+                    min={2}
+                    max={30}
+                    step={1}
+                    value={props.config.minSegmentS ?? 6}
+                    onChange={(e) =>
+                      updateSemanticField(
+                        "minSegmentS",
+                        Math.max(2, Number(e.target.value) || 6),
+                      )
+                    }
+                    title="规范 § 二·一·1：6 秒（弹性下限）"
+                  />
+                </label>
+                <label className="config-param">
+                  <span className="config-param-label">最长段长 (秒)</span>
+                  <input
+                    type="number"
+                    min={30}
+                    max={180}
+                    step={5}
+                    value={props.config.maxSegmentS ?? 90}
+                    onChange={(e) =>
+                      updateSemanticField(
+                        "maxSegmentS",
+                        Math.max(30, Number(e.target.value) || 90),
+                      )
+                    }
+                    title="规范 § 二·一·1：90 秒上限"
+                  />
+                </label>
+                <label className="config-param">
+                  <span className="config-param-label">目标响度 (LUFS)</span>
+                  <input
+                    type="number"
+                    min={-30}
+                    max={-6}
+                    step={1}
+                    value={props.config.targetLoudnessLufs ?? -18}
+                    onChange={(e) =>
+                      updateSemanticField(
+                        "targetLoudnessLufs",
+                        Number(e.target.value) || -18,
+                      )
+                    }
+                    title="规范 § 七·1：-18 LUFS (ITU-R BS.1770)"
+                  />
+                </label>
+                <label className="config-param">
+                  <span className="config-param-label">头尾静音 (ms)</span>
+                  <input
+                    type="number"
+                    min={100}
+                    max={500}
+                    step={10}
+                    value={props.config.headTailSilenceMs ?? 150}
+                    onChange={(e) =>
+                      updateSemanticField(
+                        "headTailSilenceMs",
+                        Math.max(100, Number(e.target.value) || 150),
+                      )
+                    }
+                    title="规范 § 二·三·1：≥150ms 避免突然截断"
+                  />
+                </label>
+              </div>
+              <div
+                className="config-strategy-params"
+                style={{ gap: 10, marginTop: 8 }}
+              >
+                <label className="config-param" style={{ flex: 2 }}>
+                  <span className="config-param-label">LLM 端点</span>
+                  <input
+                    type="text"
+                    placeholder="http://100.64.0.4:11434"
+                    value={props.config.semanticEndpoint ?? ""}
+                    onChange={(e) =>
+                      updateSemanticField("semanticEndpoint", e.target.value)
+                    }
+                    title="带 32K+ context 的 Ollama 节点；为空则模式 2 拒跑"
+                  />
+                </label>
+                <label className="config-param">
+                  <span className="config-param-label">模型</span>
+                  <input
+                    type="text"
+                    placeholder="qwen2.5:32b"
+                    value={props.config.semanticModel ?? "qwen2.5:32b"}
+                    onChange={(e) =>
+                      updateSemanticField("semanticModel", e.target.value)
+                    }
+                    title="huayu 上的 qwen2.5:32b（默认）或 qwen3.5:122b"
+                  />
+                </label>
+                <label className="config-param">
+                  <span className="config-param-label">num_ctx</span>
+                  <input
+                    type="number"
+                    min={2048}
+                    max={131072}
+                    step={2048}
+                    value={props.config.semanticNumCtx ?? 32768}
+                    onChange={(e) =>
+                      updateSemanticField(
+                        "semanticNumCtx",
+                        Math.max(2048, Number(e.target.value) || 32768),
+                      )
+                    }
+                    title="≥32K 才能容纳 1 小时 ASR；默认 32768"
+                  />
+                </label>
+              </div>
+              <p
+                className="config-strategy-hint"
+                style={{ marginTop: 8, opacity: 0.7 }}
+              >
+                模式 2 不走「切」按钮——走「云端 / 一键打包」（仅 macOS Worker
+                可执行）。前端会通过 <code>run_semantic_pipeline</code> 命令
+                把 source 路径 + 输出目录 + 上述配置一起送给 Worker。
+              </p>
+            </div>
+          </details>
+        ) : null}
+
         <details className="config-strategy">
           <summary className="config-strategy-trigger" title="展开切割策略参数">
             <span className="config-strategy-trigger-main">

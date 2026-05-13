@@ -16,6 +16,7 @@ import type {
   RecognitionResult,
   RepairCutSilenceResult,
   SegmentRecord,
+  SemanticPipelineResult,
 } from "./types";
 
 export const ipc = {
@@ -69,6 +70,24 @@ export const ipc = {
    *  remain cached/persisted, so you can re-launch later and resume. */
   cancelRecognize() {
     return invoke<void>("cancel_recognize");
+  },
+  /** Mode 2 — run the full Mandarin semantic-cut pipeline end-to-end.
+   *  Preprocess → fine pre-cut → ASR → LLM semantic-cut → normalise
+   *  → auto-QA → emit per-source xlsx + WAV segments. The orchestrator
+   *  loops over each input file; progress arrives via the
+   *  `semantic:progress` Tauri event (listen with @tauri-apps/api/event).
+   *
+   *  Caller responsibility: set `config.mode = "semantic"` AND
+   *  `config.semanticEndpoint` to an Ollama box with `num_ctx≥32K`
+   *  available — without that, Phase 4 refuses to run.
+   */
+  runSemanticPipeline(args: {
+    inputPaths: string[];
+    outDir: string;
+    config: CutConfig;
+    recognitionOptions: RecognitionOptions;
+  }) {
+    return invoke<SemanticPipelineResult>("run_semantic_pipeline", args);
   },
   polishTextWithLlm(args: {
     text: string;

@@ -237,6 +237,23 @@ export type ProjectFile = {
   systemPrompt?: string;
 };
 
+/** Per-source-file report from `run_semantic_pipeline`. */
+export type SemanticPipelineFileReport = {
+  sourcePath: string;
+  xlsxPath: string;
+  segmentCount: number;
+  /** Indices of segments where Phase 6 auto-QA flagged at least one issue. */
+  qaFlaggedIndices: number[];
+};
+
+/** Result of one `run_semantic_pipeline` invocation. The pipeline
+ *  processes every input even if some fail; failures land in `errors`
+ *  while successes accumulate in `reports`. */
+export type SemanticPipelineResult = {
+  reports: SemanticPipelineFileReport[];
+  errors: string[];
+};
+
 export type PlaybackAudio = {
   path: string;
   durationMs?: number;
