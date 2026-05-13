@@ -668,6 +668,137 @@ function App() {
     }
   }
 
+  /** Run the Mandarin semantic-cut pipeline (Mode 2). Unlike `cutAudioBatch`
+   *  this doesn't write into `segments` state — Mode 2's output is a per-
+   *  source folder containing the cut WAVs + a populated xlsx that the
+   *  reviewer opens directly. The progress bar listens to the backend's
+   *  `semantic:progress` event stream (one event per stage transition per
+   *  source: preprocess → fine_pre_cut → asr → semantic_cut → normalise_qa
+   *  → export). */
+  async function runSemanticPipelineFlow(
+    targetScan: ProjectScan,
+    audioList: AudioFileInfo[],
+  ) {
+    if (!(config.semanticEndpoint ?? "").trim()) {
+      pushToast({
+        variant: "error",
+        title: "未配置 LLM 端点",
+        detail:
+          "模式 2 需要一个 num_ctx ≥ 32K 的 Ollama 节点。在「语义参数」里填 LLM 端点（如 http://100.64.0.4:11434）后再切。",
+      });
+      return;
+    }
+    if (audioList.length === 0) {
+      pushToast({
+        variant: "info",
+        title: "没有音频可处理",
+        detail: "先扫描一个包含 WAV/M4A 的目录",
+      });
+      return;
+    }
+
+    setBusy(true);
+    setProgress({
+      visible: true,
+      label: "模式 2 · 语义流水线",
+      detail: `${audioList.length} 个文件准备中`,
+      current: 0,
+      total: audioList.length,
+      indeterminate: true,
+    });
+
+    // Listen for stage transitions from the Rust orchestrator.
+    const phaseLabels: Record<string, string> = {
+      starting: "准备",
+      preprocess: "loudnorm + 降噪",
+      fine_pre_cut: "细预切",
+      asr: "Whisper 识别",
+      semantic_cut: "Qwen 语义切点",
+      normalise_qa: "规范化 + 自动 QA",
+      export: "导出 xlsx + WAV",
+      done: "完成",
+    };
+    const unlisten = await listen<{
+      source?: string;
+      phase?: string;
+      current?: number;
+      total?: number;
+      pieces?: number;
+      segments?: number;
+    }>("semantic:progress", (event) => {
+      const ev = event.payload;
+      const phase = ev.phase ?? "";
+      const label = phaseLabels[phase] ?? phase;
+      const fileLabel = ev.source
+        ? ev.source.split(/[\\/]/).pop() ?? ev.source
+        : "";
+      const detail = [label, fileLabel].filter(Boolean).join(" · ");
+      setProgress((prev) => ({
+        ...prev,
+        visible: true,
+        label: "模式 2 · 语义流水线",
+        detail,
+        current: ev.current ?? prev.current,
+        total: ev.total ?? prev.total ?? audioList.length,
+      }));
+    });
+
+    try {
+      const result = await ipc.runSemanticPipeline({
+        inputPaths: audioList.map((a) => a.path),
+        outDir: targetScan.segmentsDir,
+        config,
+        recognitionOptions: {
+          whisperModel: settings.whisperModel,
+          // Mode 2 uses普通话 Whisper hint; override any dialect prompt.
+          initialPrompt:
+            "以下是普通话口语对话/独白，请按发音转写为汉字稿。",
+          useCache: settings.useAsrCache,
+          // Mode 2 has its own post-ASR normalisation (Phase 5 Qwen call);
+          // the dialect-flavour polish must not run.
+          useLlm: false,
+          ollamaUrl: settings.ollamaUrl,
+          ollamaModel: settings.ollamaModel,
+          ollamaExtraEndpoints: settings.ollamaExtraEndpoints,
+          whisperConcurrency: settings.whisperConcurrency,
+          whisperEndpoints: settings.whisperEndpoints,
+        },
+      });
+
+      const okCount = result.reports.length;
+      const errCount = result.errors.length;
+      if (okCount > 0) {
+        pushToast({
+          variant: "success",
+          title: `模式 2 完成 · ${okCount} 个文件`,
+          detail: result.reports
+            .map(
+              (r) =>
+                `${r.sourcePath.split(/[\\/]/).pop()} → ${r.segmentCount} 段 · QA 标记 ${r.qaFlaggedIndices.length}`,
+            )
+            .join("\n"),
+        });
+      }
+      if (errCount > 0) {
+        pushToast({
+          variant: "error",
+          title: `${errCount} 个文件失败`,
+          detail: result.errors.join("\n"),
+        });
+      }
+    } catch (err) {
+      pushToast({
+        variant: "error",
+        title: "模式 2 流水线失败",
+        detail: String(err),
+      });
+    } finally {
+      unlisten();
+      setBusy(false);
+      setProgress((current) => ({ ...current, visible: false }));
+    }
+  }
+
   async function cutAudioBatch(
     targetScan: ProjectScan,
     audioList?: AudioFileInfo[],
@@ -718,6 +849,18 @@ function App() {
     setAnnotationSegmentId("");
     setSelectedSegmentId("");
     setCutValidationById({});
+
+    // Mode 2 (Mandarin semantic) doesn't go through the SegmentRecord
+    // path — it runs preprocess → ASR → LLM cut → xlsx export server-side
+    // and emits files into `<segmentsDir>/<stem>/`. The dialect cutter's
+    // "already cut?" filter doesn't apply; we just hand all audio over
+    // to the orchestrator and let it skip already-processed dirs if the
+    // user re-runs.
+    if (config.mode === "semantic") {
+      await runSemanticPipelineFlow(scan, scan.audioFiles);
+      return;
+    }
+
     try {
       const cutSourcePaths = new Set(segments.map((segment) => segment.sourcePath));
       const audioToCut = scan.audioFiles.filter(
