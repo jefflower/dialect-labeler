@@ -540,16 +540,21 @@ export function ConfigBand(props: ConfigBandProps) {
           cutting with the wrong mode. */}
       <div className="config-row" style={{ flexWrap: "wrap", rowGap: 6 }}>
         {currentMode === "semantic" ? (
-          <details className="config-strategy">
+          // Default open: Mode 2 is opt-in, and once you're in Mode 2
+          // the whole point of the panel is to configure it (window,
+          // prompt, Whisper/LLM pools). A collapsed-by-default details
+          // makes the config look missing — confused users couldn't
+          // find the prompt textarea + endpoint editors.
+          <details className="config-strategy" open>
             <summary
               className="config-strategy-trigger"
-              title="展开模式 2 语义切割参数"
+              title="模式 2 配置：语义参数 + Whisper / LLM 端点 + 切点提示词"
             >
               <span className="config-strategy-trigger-main">
                 <Sliders size={14} />
-                <span>语义参数</span>
+                <span>语义配置</span>
                 <span className="config-strategy-current">
-                  {props.config.semanticEndpoint || "未配置 LLM 端点"}
+                  滑窗 ·切点提示词 · Whisper / LLM 端点
                 </span>
               </span>
               <span className="config-strategy-chevron">
@@ -719,8 +724,8 @@ export function ConfigBand(props: ConfigBandProps) {
                 className="config-strategy-hint"
                 style={{ marginTop: 8, opacity: 0.7 }}
               >
-                Mode 2 直接走「切」按钮——前端检测到 <code>mode = semantic</code>{" "}
-                时改走 <code>run_semantic_pipeline</code> 命令；出 xlsx + 切片 WAV。
+                算法：滑窗 → Whisper 转写 → LLM 单点决策 →
+                继续。每个窗口的提示词由上面的「切点提示词模板」决定（留空 → 用内置普通话/长沙话默认）。产物是 Mode-1 兼容项目目录，下载后 Windows 客户端 → 「打开」 → 选 <code>project.json</code> 即可标注。
               </p>
             </div>
           </details>
