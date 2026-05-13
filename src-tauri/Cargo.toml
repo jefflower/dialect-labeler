@@ -1,6 +1,6 @@
 [package]
 name = "dialect-labeler"
-version = "0.1.0"
+version = "0.2.0"
 description = "Dialect audio segmentation and annotation workbench"
 authors = ["lan_chs"]
 edition = "2021"
