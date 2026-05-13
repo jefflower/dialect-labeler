@@ -2051,6 +2051,107 @@ pub(crate) fn parse_semantic_normalize_response(raw: &str) -> Result<String, Str
     Ok(text)
 }
 
+// ===========================================================================
+// Phase 6 — Auto-QA on the normalised segments
+// ===========================================================================
+//
+// Pure function: no LLM call, no audio analysis. Just looks at the
+// normalised text + segment duration and flags every rule violation
+// the spec § 三·转写规则 + § 二·切句规则 makes machine-checkable. The
+// returned strings end up in the Excel's `问题记录` column so the
+// human reviewer knows where to focus.
+//
+// Deliberately conservative: it's better to under-flag than to drown
+// the reviewer in false positives. Things that NEED audio analysis
+// (波形异常截断、底噪、口癖) are tracked in Phase 7's audio-quality
+// pass, not here.
+
+/// QA-flag every problem the normalised text + duration alone can
+/// surface. Returns a flat list of Chinese issue descriptions in spec
+/// terminology — the Excel's `问题记录` column joins them with `；`.
+pub(crate) fn auto_qa_segment(
+    text: &str,
+    duration_ms: u64,
+    config: &CutConfig,
+) -> Vec<String> {
+    let mut issues: Vec<String> = Vec::new();
+    let min_ms = ((config.min_segment_s - 1.0).max(0.0) * 1000.0) as u64;
+    let max_ms = (config.max_segment_s * 1000.0) as u64;
+
+    // 1. Duration bounds (spec § 二·一·1).
+    if duration_ms < min_ms {
+        issues.push(format!(
+            "时长 {duration_ms}ms 低于建议下限 {min_ms}ms（≈ {:.0}s）",
+            min_ms as f64 / 1000.0
+        ));
+    }
+    if duration_ms > max_ms {
+        issues.push(format!(
+            "时长 {duration_ms}ms 超出上限 {max_ms}ms（≈ {:.0}s）",
+            max_ms as f64 / 1000.0
+        ));
+    }
+
+    // 2. Empty / suspiciously sparse content.
+    let trimmed = text.trim();
+    let char_count = trimmed.chars().count();
+    if trimmed.is_empty() {
+        issues.push("文本为空".into());
+        return issues; // No point running the rest of the checks.
+    }
+
+    // 3. Digit leak — spec § 三·一: numerals must be in Chinese.
+    // ASCII digits 0-9 inside the body are an error UNLESS they're
+    // inside a quoted English term, but for v1 we flag any leak and
+    // let the human reviewer disposition.
+    if trimmed.chars().any(|c| c.is_ascii_digit()) {
+        issues.push("文字格式错误：数字未汉化".into());
+    }
+
+    // 4. Latin punctuation — spec § 三·二: 全部中文标点.
+    let latin_punct = [',', '.', '!', '?', ';', ':', '"', '\''];
+    if trimmed.chars().any(|c| latin_punct.contains(&c)) {
+        issues.push("标点错误：出现英文标点".into());
+    }
+
+    // 5. The "内个" → "那个" rule (spec § 三·一).
+    if trimmed.contains("内个") {
+        issues.push("文字格式错误：内个 未改为 那个".into());
+    }
+
+    // 6. Sentence-ending punctuation. A complete semantic unit should
+    // end with 。？！…  Allow trailing 】 (the long-sustain bracket).
+    let valid_ends = ['。', '？', '！', '…', '】', '」', '）', '》'];
+    if !trimmed
+        .chars()
+        .last()
+        .map(|c| valid_ends.contains(&c))
+        .unwrap_or(false)
+    {
+        issues.push("标点错误：结尾缺句末标点".into());
+    }
+
+    // 7. Density check — very long duration vs. very short text usually
+    // means long pauses or mostly-silent content the cutter shouldn't
+    // have kept. Spec § 二·四·3: 1s+ silence inside a segment should be
+    // edited out. We can't detect 1s gaps from text alone, but we can
+    // flag the suspicious ratio.
+    if char_count > 0 {
+        let ms_per_char = duration_ms as f64 / char_count as f64;
+        // Normal Mandarin speech is ~3-5 chars/s → 200-330 ms/char.
+        // > 800 ms/char means either very slow speech or unedited
+        // pauses; either way it's worth a flag.
+        if ms_per_char > 800.0 {
+            issues.push(format!(
+                "可能存在长停顿：{:.0}ms/字，远高于普通话语速",
+                ms_per_char
+            ));
+        }
+    }
+
+    issues
+}
+
 /// Audio preprocessing for Semantic mode.
 ///
 /// Two-stage ffmpeg filter (when rnnoise model is available):
@@ -7153,6 +7254,81 @@ mod tests {
         ];
         let err = validate_semantic_cuts(&overlap, &candidates, &cfg).unwrap_err();
         assert!(err.contains("重叠"), "got: {err}");
+    }
+
+    // ====================================================================
+    // Phase 6: auto-QA — pure-fn tests
+    // ====================================================================
+
+    fn semantic_cfg_for_qa() -> CutConfig {
+        CutConfig {
+            mode: CutMode::Semantic,
+            min_segment_s: 6.0,
+            max_segment_s: 90.0,
+            ..CutConfig::default()
+        }
+    }
+
+    #[test]
+    fn auto_qa_clean_segment_returns_no_issues() {
+        let cfg = semantic_cfg_for_qa();
+        let issues = auto_qa_segment(
+            "你今天过得怎么样？我今天过得还不错，谢谢关心。",
+            8_400,
+            &cfg,
+        );
+        assert!(
+            issues.is_empty(),
+            "clean segment must pass; got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn auto_qa_flags_duration_out_of_range() {
+        let cfg = semantic_cfg_for_qa();
+        // Below the 5s grace floor.
+        let short = auto_qa_segment("好。", 3_000, &cfg);
+        assert!(short.iter().any(|i| i.contains("低于建议下限")));
+        // Above the 90s ceiling.
+        let long = auto_qa_segment("……。", 95_000, &cfg);
+        assert!(long.iter().any(|i| i.contains("超出上限")));
+    }
+
+    #[test]
+    fn auto_qa_flags_digit_leak_and_latin_punctuation() {
+        let cfg = semantic_cfg_for_qa();
+        let issues = auto_qa_segment("销量增长了20%，达到100台.", 8_000, &cfg);
+        assert!(issues.iter().any(|i| i.contains("数字未汉化")));
+        assert!(issues.iter().any(|i| i.contains("英文标点")));
+    }
+
+    #[test]
+    fn auto_qa_flags_unmapped_neige() {
+        let cfg = semantic_cfg_for_qa();
+        let issues = auto_qa_segment("我们去吃内个东西吧。", 7_500, &cfg);
+        assert!(issues.iter().any(|i| i.contains("内个 未改为 那个")));
+    }
+
+    #[test]
+    fn auto_qa_flags_missing_terminal_punct() {
+        let cfg = semantic_cfg_for_qa();
+        let issues = auto_qa_segment("今天天气真不错", 7_500, &cfg);
+        assert!(issues.iter().any(|i| i.contains("缺句末标点")));
+    }
+
+    #[test]
+    fn auto_qa_flags_empty_text_and_short_circuits() {
+        let cfg = semantic_cfg_for_qa();
+        let issues = auto_qa_segment("   ", 8_000, &cfg);
+        assert_eq!(issues, vec!["文本为空".to_string()]);
+    }
+
+    #[test]
+    fn auto_qa_flags_density_anomaly() {
+        let cfg = semantic_cfg_for_qa();
+        // 89s / 5 chars = 17800 ms/char → way past 800ms threshold.
+        let issues = auto_qa_segment("好的，今天。", 89_000, &cfg);
+        assert!(issues.iter().any(|i| i.contains("可能存在长停顿")));
     }
 
     // ====================================================================
