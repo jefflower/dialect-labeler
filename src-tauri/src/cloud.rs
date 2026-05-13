@@ -24,7 +24,8 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{
     cut_audio_file_impl, export_dataset_bundle_impl, recognize_segments_impl,
-    scan_project_folder_impl, CutConfig, ExportOptions, RecognitionOptions, SegmentRecord,
+    run_semantic_pipeline_impl, scan_project_folder_impl, CutConfig, CutMode, ExportOptions,
+    RecognitionOptions, SegmentRecord,
 };
 
 const POLL_INTERVAL_SECONDS: u64 = 5;
@@ -665,6 +666,51 @@ fn run_pipeline(
     }
 
     let cut_config = worker_config.cut.clone().unwrap_or_default();
+
+    // ---- Mode dispatch -------------------------------------------------
+    // Dialect (default) → existing cut + recognize + JSONL bundle path.
+    // Semantic → orchestrated `run_semantic_pipeline_impl` emits xlsx +
+    // WAV-per-segment per-source directly under `bundle_dir`; cloud
+    // pipeline just zips and reports.
+    if cut_config.mode == CutMode::Semantic {
+        fs::create_dir_all(bundle_dir)?;
+        let input_paths: Vec<String> =
+            scan.audio_files.iter().map(|a| a.path.clone()).collect();
+        let result = run_semantic_pipeline_impl(
+            app.clone(),
+            input_paths.clone(),
+            bundle_dir.to_string_lossy().to_string(),
+            cut_config.clone(),
+            worker_config.to_recognition_options(),
+        )
+        .map_err(CloudError::Pipeline)?;
+        if !result.errors.is_empty() {
+            return Err(CloudError::Pipeline(format!(
+                "semantic pipeline failed for {} source(s): {}",
+                result.errors.len(),
+                result.errors.join("; ")
+            )));
+        }
+        zip_dir(bundle_dir, output_zip).map_err(CloudError::Pipeline)?;
+        let output_bytes = fs::metadata(output_zip).map(|m| m.len()).unwrap_or(0);
+        let total_segments: usize = result.reports.iter().map(|r| r.segment_count).sum();
+        let total_flagged: usize = result.reports.iter().map(|r| r.qa_flagged_indices.len()).sum();
+        let summary = json!({
+            "mode": "semantic",
+            "segment_count": total_segments,
+            "source_files": result.reports.len(),
+            "qa_flagged_count": total_flagged,
+            "xlsx_paths": result.reports.iter().map(|r| r.xlsx_path.clone()).collect::<Vec<_>>(),
+            "asr_engine": worker_config
+                .whisper_model
+                .clone()
+                .unwrap_or_else(|| "large-v3".to_string()),
+            "semantic_endpoint": cut_config.semantic_endpoint.clone(),
+            "semantic_model": cut_config.semantic_model.clone(),
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        });
+        return Ok((summary, output_bytes));
+    }
 
     let mut all_segments: Vec<SegmentRecord> = Vec::new();
     for audio in &scan.audio_files {
