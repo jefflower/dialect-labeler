@@ -664,14 +664,7 @@ fn run_pipeline(
         ));
     }
 
-    let cut_config = worker_config.cut.clone().unwrap_or(CutConfig {
-        silence_db: -30.0,
-        min_silence_ms: 400,
-        min_segment_ms: 300,
-        pre_roll_ms: 100,
-        post_roll_ms: 200,
-        max_segment_ms: 0,
-    });
+    let cut_config = worker_config.cut.clone().unwrap_or_default();
 
     let mut all_segments: Vec<SegmentRecord> = Vec::new();
     for audio in &scan.audio_files {

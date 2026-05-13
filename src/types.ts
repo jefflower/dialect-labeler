@@ -32,6 +32,22 @@ export type ProjectScan = {
   existingProject?: ProjectFile | null;
 };
 
+/**
+ * Cutting algorithm.
+ *
+ * `dialect` — physical silence detection. Fast, deterministic,
+ * language-agnostic. Used by the 长沙 / 台湾 dialect workflows. Segment
+ * boundaries are driven entirely by audio gaps so they can land
+ * mid-thought when the speaker doesn't pause at sentence ends.
+ *
+ * `semantic` — Mandarin-only, LLM-assisted. Pre-cuts on silence, ASRs
+ * every piece, then asks Qwen2.5 (must be on an endpoint with
+ * num_ctx ≥32K) to merge the pieces into 6–90s segments that respect
+ * complete semantic units. Implements the `录制数据剪辑转写规则（新）`
+ * spec § 二·切句规则.
+ */
+export type CutMode = "dialect" | "semantic";
+
 export type CutConfig = {
   silenceDb: number;
   minSilenceMs: number;
@@ -40,6 +56,27 @@ export type CutConfig = {
   postRollMs: number;
   /** Kept for project-file compatibility. The cutter no longer force-splits by length. */
   maxSegmentMs: number;
+
+  // ---- Mode dispatch + semantic-mode-only knobs --------------------------
+  // All optional in the type, so old project.json files (saved before
+  // Mode 2) still deserialise. Rust side fills defaults with #[serde(default)].
+  /** Cutting algorithm; defaults to `dialect`. */
+  mode?: CutMode;
+  /** Target avg loudness for preprocessing (ITU-R BS.1770). Spec § 七·1: -18 LUFS. */
+  targetLoudnessLufs?: number;
+  /** Min segment length, seconds. Spec § 二·一·1: 6s. */
+  minSegmentS?: number;
+  /** Max segment length, seconds. Spec § 二·一·1: 90s. */
+  maxSegmentS?: number;
+  /** Min head/tail silence pad, ms. Spec § 二·三·1: ≥150ms. */
+  headTailSilenceMs?: number;
+  /** Pinned Ollama endpoint for the long-context semantic-cut call.
+   *  e.g. `http://100.64.0.4:11434`. Must be a box with ≥40GB RAM. */
+  semanticEndpoint?: string;
+  /** Model name on `semanticEndpoint`. Default `qwen2.5:32b`. */
+  semanticModel?: string;
+  /** `num_ctx` override sent with the semantic-cut LLM call. Default 32768. */
+  semanticNumCtx?: number;
 };
 
 export type CutPresetDef = {

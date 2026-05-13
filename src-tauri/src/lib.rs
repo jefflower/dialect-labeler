@@ -178,6 +178,29 @@ struct ProjectScan {
     existing_project: Option<Value>,
 }
 
+/// Which cutting algorithm to use.
+///
+/// `Dialect` (default) — physical silence detection only. Fast, deterministic,
+/// language-agnostic. The 长沙 / 台湾 dialect dataset workflows use this. The
+/// downside is that semantic boundaries (end of a thought, start of a new
+/// topic) frequently happen WITHOUT a clear silence gap, so cuts can land
+/// mid-thought.
+///
+/// `Semantic` — Mandarin-only, LLM-assisted. Pre-cuts on silence, ASRs every
+/// piece, then asks Qwen2.5 to merge the small pieces into 6–90s segments
+/// that respect "complete semantic unit" boundaries (sentence end, topic
+/// shift, Q→A boundary). Spec: `录制数据剪辑转写规则（新）` § 二·切句规则.
+/// Requires the Ollama endpoint to be reachable from the worker and to be
+/// configured for a large `num_ctx` (≥32K) since one hour of audio is
+/// roughly 15K tokens of ASR.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CutMode {
+    #[default]
+    Dialect,
+    Semantic,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CutConfig {
@@ -190,6 +213,78 @@ pub(crate) struct CutConfig {
     /// longer force-splits by length; dialogue timing is driven by silence.
     #[serde(default)]
     pub(crate) max_segment_ms: u64,
+
+    // ---- Mode dispatch + Semantic-mode-only fields ------------------------
+    // All `#[serde(default)]` so a project.json saved before Mode 2 existed
+    // still deserialises cleanly (mode = Dialect, the rest unused).
+    /// Cutting algorithm. Defaults to `Dialect` for backwards compatibility.
+    #[serde(default)]
+    pub(crate) mode: CutMode,
+    /// Target average loudness for the preprocessing pass (ITU-R BS.1770).
+    /// Spec § 七·1 calls for -18 LUFS/LKFS. Only honoured in Semantic mode;
+    /// Dialect mode skips loudnorm entirely (the dialect pipeline runs the
+    /// audio through Whisper / Ollama directly without normalisation).
+    #[serde(default = "default_target_loudness_lufs")]
+    pub(crate) target_loudness_lufs: f32,
+    /// Minimum segment length in Semantic mode (seconds). Spec § 二·一·1
+    /// says 6s, with elastic allowance for shorter independent clauses.
+    #[serde(default = "default_min_segment_s")]
+    pub(crate) min_segment_s: f64,
+    /// Maximum segment length in Semantic mode (seconds). Spec § 二·一·1
+    /// says 90s; if a segment would exceed this the LLM must find a
+    /// natural break point.
+    #[serde(default = "default_max_segment_s")]
+    pub(crate) max_segment_s: f64,
+    /// Minimum head/tail silence padding in Semantic mode (ms). Spec
+    /// § 二·三·1 says ≥150ms to avoid abrupt cuts.
+    #[serde(default = "default_head_tail_silence_ms")]
+    pub(crate) head_tail_silence_ms: u64,
+    /// Pinned Ollama endpoint for the semantic-cut LLM call. Must be a
+    /// box with enough RAM to hold a 32B model + 32K KV cache (~36 GiB).
+    /// If empty, falls back to the global Ollama pool — but a typical
+    /// 32B@2K-ctx pool member will silently truncate the long prompt.
+    /// Format: `http://100.64.0.4:11434` (no trailing slash, no path).
+    #[serde(default)]
+    pub(crate) semantic_endpoint: String,
+    /// Model name on `semantic_endpoint`. Defaults to `qwen2.5:32b`.
+    #[serde(default = "default_semantic_model")]
+    pub(crate) semantic_model: String,
+    /// `num_ctx` override sent with the semantic-cut LLM call. Must be
+    /// large enough for one hour of ASR (~15K tokens, plus prompt
+    /// scaffolding and JSON output). Default 32768.
+    #[serde(default = "default_semantic_num_ctx")]
+    pub(crate) semantic_num_ctx: u32,
+}
+
+fn default_target_loudness_lufs() -> f32 { -18.0 }
+fn default_min_segment_s() -> f64 { 6.0 }
+fn default_max_segment_s() -> f64 { 90.0 }
+fn default_head_tail_silence_ms() -> u64 { 150 }
+fn default_semantic_model() -> String { "qwen2.5:32b".to_string() }
+fn default_semantic_num_ctx() -> u32 { 32768 }
+
+impl Default for CutConfig {
+    /// Sensible Dialect-mode defaults — the historical config the
+    /// silence-only cutter has always used. Semantic-mode fields use
+    /// their `default_*` constants but are inert when `mode = Dialect`.
+    fn default() -> Self {
+        Self {
+            silence_db: -30.0,
+            min_silence_ms: 400,
+            min_segment_ms: 300,
+            pre_roll_ms: 100,
+            post_roll_ms: 200,
+            max_segment_ms: 0,
+            mode: CutMode::Dialect,
+            target_loudness_lufs: default_target_loudness_lufs(),
+            min_segment_s: default_min_segment_s(),
+            max_segment_s: default_max_segment_s(),
+            head_tail_silence_ms: default_head_tail_silence_ms(),
+            semantic_endpoint: String::new(),
+            semantic_model: default_semantic_model(),
+            semantic_num_ctx: default_semantic_num_ctx(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1399,6 +1494,67 @@ fn rename_segments_by_dialogue_sequence_impl(
 }
 
 pub(crate) fn cut_audio_file_impl(
+    input_path: String,
+    segments_dir: String,
+    config: CutConfig,
+    role: Option<String>,
+    topic_id: Option<u32>,
+    original_text: Option<String>,
+    emotion: Option<Vec<String>>,
+    target_file_names: Vec<String>,
+) -> Result<Vec<SegmentRecord>, String> {
+    // Mode-based dispatch. The Dialect path (silence-only) is the
+    // historical behaviour; the Semantic path (silence + ASR + LLM
+    // boundary decision) is the new Mandarin pipeline introduced by
+    // `录制数据剪辑转写规则（新）`.
+    match config.mode {
+        CutMode::Dialect => cut_audio_file_dialect_impl(
+            input_path,
+            segments_dir,
+            config,
+            role,
+            topic_id,
+            original_text,
+            emotion,
+            target_file_names,
+        ),
+        CutMode::Semantic => cut_audio_file_semantic_impl(
+            input_path,
+            segments_dir,
+            config,
+            role,
+            topic_id,
+            original_text,
+            emotion,
+            target_file_names,
+        ),
+    }
+}
+
+/// Stub for the Semantic-mode pipeline. Real implementation lands in
+/// subsequent commits — preprocess → fine pre-cut → ASR → LLM cut →
+/// re-cut → normalise → QA → Excel export. Returns an error until then
+/// so a user who flips the mode toggle gets a clear message rather than
+/// silently falling back to Dialect.
+fn cut_audio_file_semantic_impl(
+    _input_path: String,
+    _segments_dir: String,
+    _config: CutConfig,
+    _role: Option<String>,
+    _topic_id: Option<u32>,
+    _original_text: Option<String>,
+    _emotion: Option<Vec<String>>,
+    _target_file_names: Vec<String>,
+) -> Result<Vec<SegmentRecord>, String> {
+    Err(
+        "Semantic cut mode not yet implemented. Tracked under Mode 2 \
+         milestones; the silence + ASR + LLM pipeline is in flight. \
+         Switch the project's mode back to `dialect` to use the current cutter."
+            .to_string(),
+    )
+}
+
+fn cut_audio_file_dialect_impl(
     input_path: String,
     segments_dir: String,
     config: CutConfig,
@@ -6135,6 +6291,58 @@ mod tests {
         assert_eq!(raw, "/foo/bar.wav");
     }
 
+    /// Old project.json files (saved before `mode` + the semantic-* fields
+    /// existed) must still load — every new field carries `#[serde(default)]`
+    /// and falls back to Dialect-compatible values.
+    #[test]
+    fn cutconfig_deserializes_legacy_payload_as_dialect() {
+        let legacy = r#"{
+            "silenceDb": -28,
+            "minSilenceMs": 350,
+            "minSegmentMs": 250,
+            "preRollMs": 120,
+            "postRollMs": 200,
+            "maxSegmentMs": 30000
+        }"#;
+        let cfg: CutConfig = serde_json::from_str(legacy).expect("legacy CutConfig must load");
+        assert_eq!(cfg.mode, CutMode::Dialect);
+        assert!((cfg.target_loudness_lufs - (-18.0)).abs() < 1e-3);
+        assert!((cfg.min_segment_s - 6.0).abs() < 1e-3);
+        assert!((cfg.max_segment_s - 90.0).abs() < 1e-3);
+        assert_eq!(cfg.semantic_model, "qwen2.5:32b");
+        assert_eq!(cfg.semantic_num_ctx, 32768);
+    }
+
+    /// Until the Semantic pipeline is implemented, `cut_audio_file_impl`
+    /// with `mode = Semantic` must NOT silently fall back to the Dialect
+    /// cutter — it returns a clear error so the toggle gives a real
+    /// diagnostic.
+    #[test]
+    fn semantic_mode_returns_not_implemented_error() {
+        let dir = std::env::temp_dir().join(format!("semantic-stub-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("never-used.wav");
+        fs::write(&input, b"fake").unwrap();
+        let cfg = CutConfig {
+            mode: CutMode::Semantic,
+            ..CutConfig::default()
+        };
+        let res = cut_audio_file_impl(
+            path_to_string(&input),
+            path_to_string(&dir),
+            cfg,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
+        let err = res.expect_err("must error until Semantic pipeline lands");
+        assert!(err.contains("not yet implemented"), "got: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn portablize_payload_rewrites_bundle_paths_to_relative() {
         // Simulate what `export_dataset_bundle_impl` produces just before
@@ -6615,6 +6823,7 @@ mod tests {
             pre_roll_ms: 100,
             post_roll_ms: 200,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
 
         let segments = cut_audio_file_impl(
@@ -6650,6 +6859,7 @@ mod tests {
             pre_roll_ms: 100,
             post_roll_ms: 200,
             max_segment_ms: 20_000,
+            ..CutConfig::default()
         };
         let ranges = build_segment_ranges(50.0, &[], &config);
         assert_eq!(ranges.len(), 3);
@@ -6673,6 +6883,7 @@ mod tests {
             pre_roll_ms: 100,
             post_roll_ms: 200,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
         let ranges = build_segment_ranges(50.0, &[], &config);
         assert_eq!(ranges.len(), 1, "max=0 disables force-split");
@@ -6695,6 +6906,7 @@ mod tests {
             pre_roll_ms: 0,
             post_roll_ms: 0,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
         let ranges = build_segment_ranges(5.5, &events, &config);
         assert_eq!(ranges.len(), 1, "ranges={:?}", ranges);
@@ -6716,6 +6928,7 @@ mod tests {
             pre_roll_ms: 0,
             post_roll_ms: 0,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
         let ranges = build_segment_ranges(30.0, &events, &config);
         assert_eq!(ranges.len(), 2, "ranges={:?}", ranges);
@@ -6749,6 +6962,7 @@ mod tests {
             pre_roll_ms: 0,
             post_roll_ms: 0,
             max_segment_ms: 25_000,
+            ..CutConfig::default()
         };
         let ranges = build_segment_ranges(50.0, &events, &config);
         // Expected:
@@ -6775,6 +6989,7 @@ mod tests {
             pre_roll_ms: 0,
             post_roll_ms: 0,
             max_segment_ms: 20_000,
+            ..CutConfig::default()
         };
         let ranges = build_segment_ranges(50.0, &[], &config);
         assert_eq!(ranges.len(), 3);
@@ -6794,6 +7009,7 @@ mod tests {
             pre_roll_ms: 0,
             post_roll_ms: 0,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
         let ranges = build_segment_ranges(3.0, &[], &config);
         assert_eq!(ranges.len(), 1);
@@ -6814,6 +7030,7 @@ mod tests {
             pre_roll_ms: 0,
             post_roll_ms: 0,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
         let ranges = build_segment_ranges(10.0, &events, &config);
         assert_eq!(ranges.len(), 1, "ranges={:?}", ranges);
@@ -6861,6 +7078,7 @@ mod tests {
             pre_roll_ms: 0,
             post_roll_ms: 0,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
         let ranges = build_segment_ranges(16.0, &events, &config);
         assert_eq!(ranges.len(), 1, "ranges={:?}", ranges);
@@ -6885,6 +7103,7 @@ mod tests {
             pre_roll_ms: 0,
             post_roll_ms: 0,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
         let ranges = build_segment_ranges(20.0, &events, &config);
         assert_eq!(ranges.len(), 2, "ranges={:?}", ranges);
@@ -6909,6 +7128,7 @@ mod tests {
             pre_roll_ms: 0,
             post_roll_ms: 0,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
         let ranges = build_segment_ranges(11.0, &events, &config);
         assert_eq!(ranges.len(), 2, "ranges={:?}", ranges);
@@ -7048,6 +7268,7 @@ mod tests {
             pre_roll_ms: 100,
             post_roll_ms: 200,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
         let check_segment = SegmentRecord {
             id: "seg".to_string(),
@@ -7139,6 +7360,7 @@ mod tests {
             pre_roll_ms: 100,
             post_roll_ms: 200,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
 
         let result = clean_cut_segment_noise_impl(vec![segment], config).expect("clean");
@@ -7192,6 +7414,7 @@ mod tests {
             pre_roll_ms: 100,
             post_roll_ms: 200,
             max_segment_ms: 0,
+            ..CutConfig::default()
         };
 
         let result = repair_cut_segment_silence_impl(vec![segment], config).expect("repair");
