@@ -1,15 +1,21 @@
 name: Build Windows Reviewer
 
-# Builds a slimmed-down "审核版" Windows binary every push to main + on
-# version tags. The reviewer build hides every Whisper / Ollama UI element
-# (controlled by the VITE_REVIEW_ONLY=1 env at frontend build time). It is
-# intended for QA people who only need to: pick an input/output folder + a
-# JSONL path, browse already-AI-processed segments, fine-tune annotations,
-# and one-click export.
+# Builds a slimmed-down "审核版" Windows binary.
+# - The Windows build hides Whisper / Ollama UI (VITE_REVIEW_ONLY=1 at
+#   frontend build time) and ships only for QA folks who need to review
+#   already-AI-processed annotations + export.
+# - Builds are EXPENSIVE on CI (5-10 min, big binary). They are
+#   triggered explicitly, NOT on every push to main:
+#     · `v*` tag push        — official release; also mirrors to the
+#                              dispatcher's /downloads page when
+#                              DISPATCHER_URL/_TOKEN are set.
+#     · workflow_dispatch    — manual "Run workflow" button on the
+#                              Actions tab. Use this for snapshot
+#                              builds when QA needs to test an
+#                              in-flight branch.
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
