@@ -1782,16 +1782,21 @@ fn truncate_for_log(s: &str, max_chars: usize) -> String {
 
 /// Validate the LLM's cut decisions against the spec + the candidate
 /// boundary pool. Returns the same vector on success, or an error
-/// listing all rule violations.
+/// listing all hard-rule violations.
 ///
-/// Rules enforced:
+/// HARD rules (reject on violation):
 ///   - Each segment's [start_ms, end_ms] must each appear in
 ///     `candidates_ms` (so the cut lands on a real silence gap).
-///   - Each segment length must be ≥ min_segment_s − 1s (soft floor;
-///     spec § 二·一·1 allows shorter independent clauses) AND
-///     ≤ max_segment_s (hard ceiling).
-///   - Segments must be sorted by start_ms.
-///   - No overlap: each segment's start_ms ≥ previous end_ms.
+///   - Each segment length ≤ max_segment_s (Whisper / training
+///     quality cliff). Length below `min_segment_s` is NOT a hard
+///     fail — spec § 二·一·1 says "如果有独立语义的一句低于 6s 也可以"
+///     and short complete utterances ("希望大家会喜欢") are common.
+///     Phase 6 auto-QA still surfaces them as warnings in the
+///     `问题记录` column for human review.
+///   - Each segment must have positive length (end > start; a hard
+///     1s minimum guards against an empty / off-by-one segment).
+///   - Sorted by start_ms, no overlap (each segment's start_ms ≥
+///     previous end_ms).
 ///
 /// Note: segments don't have to COVER the entire input — spec § 二·四
 /// allows dropping unusable bits (long silence / mumble / noise).
@@ -1801,7 +1806,9 @@ pub(crate) fn validate_semantic_cuts(
     config: &CutConfig,
 ) -> Result<(), String> {
     let candidate_set: std::collections::HashSet<u64> = candidates_ms.iter().copied().collect();
-    let min_ms = ((config.min_segment_s - 1.0).max(0.0) * 1000.0) as u64;
+    // Absolute floor — anything shorter than 1s is almost certainly an
+    // off-by-one or an empty segment, not a "real" short utterance.
+    const HARD_MIN_MS: u64 = 1000;
     let max_ms = (config.max_segment_s * 1000.0) as u64;
     let mut prev_end = 0u64;
     let mut errors: Vec<String> = Vec::new();
@@ -1819,9 +1826,9 @@ pub(crate) fn validate_semantic_cuts(
             ));
         }
         let len = d.end_ms.saturating_sub(d.start_ms);
-        if len < min_ms {
+        if len < HARD_MIN_MS {
             errors.push(format!(
-                "[{i}] 时长 {len}ms 低于下限 {min_ms}ms"
+                "[{i}] 时长 {len}ms 低于绝对下限 {HARD_MIN_MS}ms (空段/越界)"
             ));
         }
         if len > max_ms {
@@ -7667,15 +7674,25 @@ mod tests {
             max_segment_s: 90.0,
             ..CutConfig::default()
         };
-        let candidates = vec![0u64, 8000, 20000, 95000];
+        let candidates = vec![0u64, 1800, 8000, 20000, 95000];
 
-        // Happy path: lengths in [5s, 90s] (5s ok because min has a 1s
-        // grace per spec § 二·一·1 "弹性处理"); cut points all in pool.
+        // Happy path. Length floor is 1s (HARD_MIN_MS) — sub-spec-target
+        // short utterances are OK per § 二·一·1 弹性处理; auto-QA
+        // surfaces them as warnings.
         let good = vec![
             SemanticCutDecision { start_ms: 0, end_ms: 8000, reason: String::new() },
             SemanticCutDecision { start_ms: 8000, end_ms: 20000, reason: String::new() },
         ];
         validate_semantic_cuts(&good, &candidates, &cfg).expect("good cuts validate");
+
+        // Sub-6s but ≥1s — accepted (spec 弹性处理).
+        let short_ok = vec![SemanticCutDecision {
+            start_ms: 0,
+            end_ms: 1800,
+            reason: String::new(),
+        }];
+        validate_semantic_cuts(&short_ok, &candidates, &cfg)
+            .expect("1.8s short utterance must pass — spec 弹性下限");
 
         // Cut point not in candidate pool.
         let invented = vec![SemanticCutDecision {
@@ -7702,6 +7719,232 @@ mod tests {
         ];
         let err = validate_semantic_cuts(&overlap, &candidates, &cfg).unwrap_err();
         assert!(err.contains("重叠"), "got: {err}");
+    }
+
+    // ====================================================================
+    // Phase 10: end-to-end smoke test against real Tailnet endpoints
+    //
+    // Gated on env so CI hosts without the fleet skip cleanly. Set
+    //   SMOKE_WHISPER_URL=http://100.64.0.4:9090
+    //   SMOKE_OLLAMA_URL=http://100.64.0.4:11434
+    // to fire. Uses macOS `say` to synthesise a ~30s Mandarin sample,
+    // runs every pipeline phase by hand (skips `recognize_segments_impl`
+    // which would need an AppHandle), validates the xlsx + WAVs.
+    // ====================================================================
+
+    /// POST one audio file to faster-whisper-server's /transcribe and
+    /// return the recognised text. Pure helper used by the e2e smoke.
+    fn smoke_whisper_transcribe(
+        endpoint: &str,
+        wav: &Path,
+    ) -> Result<String, String> {
+        use std::io::Read;
+        let mut audio = Vec::new();
+        fs::File::open(wav)
+            .map_err(|e| e.to_string())?
+            .read_to_end(&mut audio)
+            .map_err(|e| e.to_string())?;
+        // Tiny inline multipart writer — keeps the test from pulling in
+        // an http-multipart crate just for the smoke.
+        let boundary = format!("----smoke{}", std::process::id());
+        let mut body = Vec::new();
+        let part = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"audio\"; \
+             filename=\"piece.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        );
+        body.extend_from_slice(part.as_bytes());
+        body.extend_from_slice(&audio);
+        let tail = format!(
+            "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nzh\r\n\
+             --{boundary}--\r\n"
+        );
+        body.extend_from_slice(tail.as_bytes());
+
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(60))
+            .build();
+        let resp = agent
+            .post(&format!("{}/transcribe", endpoint.trim_end_matches('/')))
+            .set(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .send_bytes(&body)
+            .map_err(|err| format!("whisper HTTP: {err}"))?;
+        let raw = resp.into_string().map_err(|err| err.to_string())?;
+        let val: Value =
+            serde_json::from_str(&raw).map_err(|err| format!("whisper JSON: {err}"))?;
+        Ok(val
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string())
+    }
+
+    #[test]
+    fn smoke_e2e_semantic_pipeline_with_real_endpoints() {
+        let Ok(whisper_url) = std::env::var("SMOKE_WHISPER_URL") else {
+            eprintln!("skipping e2e — set SMOKE_WHISPER_URL to fire");
+            return;
+        };
+        let Ok(ollama_url) = std::env::var("SMOKE_OLLAMA_URL") else {
+            eprintln!("skipping e2e — set SMOKE_OLLAMA_URL to fire");
+            return;
+        };
+        let ffmpeg_ok = silent_command("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let say_ok = silent_command("say")
+            .arg("-v")
+            .arg("Tingting")
+            .arg("test")
+            .arg("-o")
+            .arg("/tmp/.say-probe.aiff")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let _ = fs::remove_file("/tmp/.say-probe.aiff");
+        if !ffmpeg_ok || !say_ok {
+            eprintln!("skipping e2e — needs ffmpeg + macOS `say` (Tingting)");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("mode2-e2e-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Two-sentence Mandarin sample — enough to exercise the LLM's
+        // "split at sentence boundary" decision without being huge.
+        let script = "大家好，欢迎收听今天的节目。今天我们要聊一聊人工智能的发展，\
+                      它正在改变我们工作和生活的方方面面。希望大家会喜欢。";
+        let aiff = dir.join("source.aiff");
+        let src_wav = dir.join("spkA_Podcast_singleshot_260512_30s.wav");
+        let synth = silent_command("say")
+            .arg("-v").arg("Tingting")
+            .arg(script)
+            .arg("-o").arg(&aiff)
+            .status()
+            .expect("say");
+        assert!(synth.success(), "say synth failed");
+        let conv = silent_command("ffmpeg")
+            .arg("-y").arg("-hide_banner").arg("-loglevel").arg("error")
+            .arg("-i").arg(&aiff)
+            .arg("-ar").arg("48000").arg("-ac").arg("1")
+            .arg("-c:a").arg("pcm_s16le")
+            .arg(&src_wav)
+            .status()
+            .expect("ffmpeg");
+        assert!(conv.success(), "ffmpeg convert failed");
+
+        let cfg = CutConfig {
+            mode: CutMode::Semantic,
+            semantic_endpoint: ollama_url,
+            semantic_model: "qwen2.5:32b".to_string(),
+            semantic_num_ctx: 32768,
+            target_loudness_lufs: -18.0,
+            min_segment_s: 4.0, // shorter for our 20s sample
+            max_segment_s: 90.0,
+            head_tail_silence_ms: 150,
+            ..CutConfig::default()
+        };
+
+        // Phase 2: preprocess.
+        let normalised = dir.join("01_normalised.wav");
+        preprocess_audio_for_semantic(&src_wav, &normalised, cfg.target_loudness_lufs, None)
+            .expect("preprocess");
+        eprintln!("[smoke] preprocess ok → {}", normalised.display());
+
+        // Phase 3: fine pre-cut.
+        let pieces_dir = dir.join("pieces");
+        let (piece_paths, candidates_ms) =
+            fine_pre_cut_for_semantic(&normalised, &pieces_dir).expect("pre-cut");
+        eprintln!(
+            "[smoke] pre-cut → {} pieces, {} candidate boundaries",
+            piece_paths.len(),
+            candidates_ms.len()
+        );
+        assert!(piece_paths.len() >= 1);
+
+        // Phase 3b: ASR each piece via Whisper HTTP directly (no AppHandle needed).
+        let mut pieces: Vec<AsredPiece> = Vec::with_capacity(piece_paths.len());
+        for (i, p) in piece_paths.iter().enumerate() {
+            let text = match smoke_whisper_transcribe(&whisper_url, p) {
+                Ok(t) => t,
+                Err(err) => {
+                    eprintln!("[smoke] whisper failed on piece {i}: {err}");
+                    String::new()
+                }
+            };
+            let start = candidates_ms.get(i).copied().unwrap_or(0);
+            let end = candidates_ms.get(i + 1).copied().unwrap_or(start);
+            eprintln!("[smoke]   piece {i:02} [{start}-{end}ms]: {text}");
+            pieces.push(AsredPiece {
+                text,
+                start_ms: start,
+                end_ms: end,
+            });
+        }
+        assert!(pieces.iter().any(|p| !p.text.trim().is_empty()), "all ASR empty");
+
+        // Phase 4: LLM semantic cut.
+        let decisions = llm_decide_semantic_cuts(&pieces, &candidates_ms, &cfg)
+            .expect("llm semantic cut");
+        eprintln!("[smoke] LLM merged into {} segments", decisions.len());
+        for (i, d) in decisions.iter().enumerate() {
+            eprintln!("[smoke]   seg {i}: [{}-{}ms] {}", d.start_ms, d.end_ms, d.reason);
+        }
+        assert!(!decisions.is_empty());
+
+        // Phase 5 + 6: normalise + auto-QA each.
+        let mut export_segments: Vec<SemanticExportSegment> = Vec::new();
+        for (i, d) in decisions.iter().enumerate() {
+            let raw: String = pieces
+                .iter()
+                .filter(|p| p.start_ms >= d.start_ms && p.end_ms <= d.end_ms)
+                .map(|p| p.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let final_text = match llm_normalize_segment_text(&raw, &cfg) {
+                Ok(t) => t,
+                Err(err) => {
+                    eprintln!("[smoke] normalise failed seg {i}: {err}, using raw");
+                    raw.clone()
+                }
+            };
+            let problems = auto_qa_segment(&final_text, d.end_ms - d.start_ms, &cfg);
+            eprintln!(
+                "[smoke]   seg {i}: \"{final_text}\" | problems: {problems:?}"
+            );
+            export_segments.push(SemanticExportSegment {
+                start_ms: d.start_ms,
+                end_ms: d.end_ms,
+                final_text,
+                problems,
+            });
+        }
+
+        // Phase 7: export.
+        let out_dir = dir.join("out");
+        let spec_stem = derive_spec_stem(&src_wav);
+        let (xlsx, wavs) = export_semantic_mode(
+            &out_dir,
+            &normalised,
+            &spec_stem,
+            "source.wav",
+            &export_segments,
+        )
+        .expect("export");
+        eprintln!("[smoke] xlsx → {}", xlsx.display());
+        eprintln!("[smoke] {} wavs emitted", wavs.len());
+        assert!(xlsx.is_file());
+        assert_eq!(wavs.len(), export_segments.len());
+
+        eprintln!("[smoke] === E2E SMOKE PASSED ===");
+        // Don't auto-cleanup — keep artefacts so we can eyeball results.
+        eprintln!("[smoke] artefacts kept at {}", dir.display());
     }
 
     // ====================================================================
