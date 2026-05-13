@@ -473,3 +473,161 @@ def test_retry_blocked_by_other_active_task(client: TestClient) -> None:
     )
     resp = client.post(f"/api/tasks/{task_a}/retry", headers=auth_headers(owner))
     assert resp.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Mode field — committed at upload time, returned on every read. Default is
+# `dialect` for backwards-compat with old clients.
+# ---------------------------------------------------------------------------
+
+
+def test_create_task_defaults_mode_to_dialect(client: TestClient) -> None:
+    """Old clients that don't send `mode` should still get a working task."""
+    register(client, "u@example.com")
+    token = login(client, "u@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "no-mode"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(token),
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["mode"] == "dialect"
+
+
+def test_create_task_accepts_semantic_mode(client: TestClient) -> None:
+    register(client, "u@example.com")
+    token = login(client, "u@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "mando", "mode": "semantic"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(token),
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["mode"] == "semantic"
+
+    # Round-trips through GET so we know the column was actually persisted.
+    detail = client.get(f"/api/tasks/{body['id']}", headers=auth_headers(token)).json()
+    assert detail["mode"] == "semantic"
+
+
+def test_create_task_rejects_invalid_mode(client: TestClient) -> None:
+    """Typo defence — we'd rather 400 than silently default."""
+    register(client, "u@example.com")
+    token = login(client, "u@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "typo", "mode": "diaclet"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(token),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "diaclet" in resp.text
+
+
+def test_claim_returns_mode_so_worker_can_route(client: TestClient) -> None:
+    """Worker reads `mode` off the claim payload and uses it to override
+    whatever is in the bundle's project.json. Without this field the Mac
+    Worker would silently process a Mode-2 upload with Mode-1 settings."""
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    client.post(
+        "/api/tasks",
+        data={"name": "mando", "mode": "semantic"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    resp = client.post("/api/worker/claim", headers=auth_headers(worker))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["mode"] == "semantic"
+
+
+# ---------------------------------------------------------------------------
+# Progress push — Worker reports stage + percent so owner polling sees it.
+# ---------------------------------------------------------------------------
+
+
+def test_progress_push_updates_task_row(client: TestClient) -> None:
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    create = client.post(
+        "/api/tasks",
+        data={"name": "p"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = create.json()["id"]
+    client.post("/api/worker/claim", headers=auth_headers(worker))
+
+    push = client.post(
+        f"/api/worker/tasks/{task_id}/progress",
+        json={"percent": 37, "stage": "ASR", "detail": "12 / 30 files"},
+        headers=auth_headers(worker),
+    )
+    assert push.status_code == 204, push.text
+
+    detail = client.get(f"/api/tasks/{task_id}", headers=auth_headers(owner)).json()
+    assert detail["progress_percent"] == 37
+    assert detail["progress_stage"] == "ASR"
+    assert detail["progress_detail"] == "12 / 30 files"
+    assert detail["progress_updated_at"] is not None
+
+
+def test_progress_clamped_to_0_100(client: TestClient) -> None:
+    """The schema enforces ge/le; pydantic returns 422 for out-of-range."""
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    create = client.post(
+        "/api/tasks",
+        data={"name": "p"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = create.json()["id"]
+    client.post("/api/worker/claim", headers=auth_headers(worker))
+    resp = client.post(
+        f"/api/worker/tasks/{task_id}/progress",
+        json={"percent": 250, "stage": "x"},
+        headers=auth_headers(worker),
+    )
+    assert resp.status_code == 422
+
+
+def test_retry_clears_stale_progress(client: TestClient) -> None:
+    """A retried task starting from zero should not advertise the
+    previous attempt's last progress value."""
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    create = client.post(
+        "/api/tasks",
+        data={"name": "p"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = create.json()["id"]
+    client.post("/api/worker/claim", headers=auth_headers(worker))
+    client.post(
+        f"/api/worker/tasks/{task_id}/progress",
+        json={"percent": 70, "stage": "almost", "detail": "..."},
+        headers=auth_headers(worker),
+    )
+    client.post(
+        f"/api/worker/tasks/{task_id}/fail",
+        json={"error": "boom"},
+        headers=auth_headers(worker),
+    )
+    client.post(f"/api/tasks/{task_id}/retry", headers=auth_headers(owner))
+    detail = client.get(f"/api/tasks/{task_id}", headers=auth_headers(owner)).json()
+    assert detail["progress_percent"] is None
+    assert detail["progress_stage"] is None
+    assert detail["progress_detail"] is None

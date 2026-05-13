@@ -121,6 +121,7 @@ export default function TaskDetailPage() {
         <span className="status-chip" style={{ background: s.color }}>
           {s.label}
         </span>
+        <ModeChip mode={task.mode ?? "dialect"} />
         <div className="grow" />
         <button onClick={() => navigate("/tasks")}>← 返回列表</button>
         {(task.status === "failed" || task.status === "expired") && (
@@ -149,6 +150,72 @@ export default function TaskDetailPage() {
           <strong>Worker 报错：</strong> {task.error}
         </div>
       )}
+
+      {/* Live progress card. Only renders while the Worker is actively
+          pushing updates — once a task hits a terminal state the
+          progress fields are stale, so we hide the bar to avoid
+          implying "still going". */}
+      {task.progress_percent != null &&
+        (task.status === "claimed" || task.status === "running") && (
+          <div className="card" style={{ marginBottom: 18 }}>
+            <div style={{ padding: "14px 22px" }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "baseline",
+                  gap: 10,
+                  marginBottom: 8,
+                }}
+              >
+                <strong style={{ fontSize: 14 }}>
+                  {task.progress_stage ?? "处理中"}
+                </strong>
+                <span
+                  style={{
+                    fontVariantNumeric: "tabular-nums",
+                    color: "var(--muted)",
+                  }}
+                >
+                  {task.progress_percent}%
+                </span>
+                {task.progress_detail && (
+                  <span style={{ color: "var(--muted)" }}>
+                    · {task.progress_detail}
+                  </span>
+                )}
+                <div style={{ flex: 1 }} />
+                {task.progress_updated_at && (
+                  <span
+                    style={{
+                      fontSize: 12,
+                      color: "var(--muted)",
+                    }}
+                    title={task.progress_updated_at}
+                  >
+                    {formatRelative(task.progress_updated_at)}更新
+                  </span>
+                )}
+              </div>
+              <div
+                style={{
+                  height: 8,
+                  borderRadius: 4,
+                  background: "#e2e8f0",
+                  overflow: "hidden",
+                }}
+              >
+                <div
+                  style={{
+                    width: `${task.progress_percent}%`,
+                    height: "100%",
+                    background: "var(--accent, #0d9488)",
+                    transition: "width 0.4s ease",
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        )}
 
       <div className="card" style={{ marginBottom: 18 }}>
         <dl className="detail-grid">
@@ -300,4 +367,27 @@ function roleLabel(role: string): string {
     default:
       return role;
   }
+}
+
+/** Chip next to the status indicator showing which cut mode the owner
+ *  picked at upload time. Distinct color from status chips so a quick
+ *  glance distinguishes "what kind of job" from "where in the pipeline".
+ */
+function ModeChip({ mode }: { mode: "dialect" | "semantic" }) {
+  const label = mode === "semantic" ? "模式 2 · 语义" : "模式 1 · 方言";
+  const bg = mode === "semantic" ? "rgba(124, 58, 237, 0.12)" : "rgba(13, 148, 136, 0.12)";
+  const fg = mode === "semantic" ? "#7c3aed" : "#0d9488";
+  const hint =
+    mode === "semantic"
+      ? "Mode 2：LLM 决定切点，规范化文本，产出 xlsx"
+      : "Mode 1：按静音切，保留全部声学事件";
+  return (
+    <span
+      className="status-chip"
+      style={{ background: bg, color: fg, fontWeight: 500 }}
+      title={hint}
+    >
+      {label}
+    </span>
+  );
 }

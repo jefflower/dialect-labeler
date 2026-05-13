@@ -35,6 +35,10 @@ import { ipc } from "../lib";
 
 const STORE_FILE = "cloud-session.json";
 const SESSION_KEY = "cloud.session.v1";
+// Auto-resume flag, read by App.tsx on app startup so the worker
+// re-enables itself without anyone opening this modal. Kept in the same
+// store file as the session for atomicity.
+const AUTOSTART_KEY = "cloud.workerAutostart.v1";
 const DEFAULT_BASE = "http://localhost:8080";
 
 type SessionStored = {
@@ -164,6 +168,10 @@ export function CloudPane({ open, onClose, workerConfig }: Props) {
       await ipc.cloudLogout();
       const store = await Store.load(STORE_FILE);
       await store.delete(SESSION_KEY);
+      // Clear autostart too — keeping it would re-arm a worker after
+      // the next relaunch even though we no longer have credentials,
+      // resulting in 401 spam in the logs.
+      await store.delete(AUTOSTART_KEY);
       await store.save();
       await refresh();
     } finally {
@@ -178,6 +186,17 @@ export function CloudPane({ open, onClose, workerConfig }: Props) {
       try {
         await ipc.cloudSetWorkerConfig({ config: workerConfig });
         await ipc.cloudSetWorkerEnabled({ enabled: next });
+        // Persist the desired-on-launch flag so the App.tsx startup
+        // hook can resume after a relaunch / reboot without anyone
+        // opening this modal. Best-effort — if the store write fails
+        // the in-memory toggle still works for the current session.
+        try {
+          const store = await Store.load(STORE_FILE);
+          await store.set(AUTOSTART_KEY, next);
+          await store.save();
+        } catch (storeErr) {
+          console.warn("autostart flag persist failed", storeErr);
+        }
         await refresh();
       } catch (err) {
         setError(String(err));

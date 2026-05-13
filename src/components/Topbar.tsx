@@ -2,15 +2,17 @@ import {
   Cloud,
   Download,
   Keyboard,
+  Languages,
   Moon,
   Package,
   Save,
+  Scissors,
   Settings,
   Sun,
   Sunrise,
   XCircle,
 } from "lucide-react";
-import type { Theme } from "../types";
+import type { CutMode, Theme } from "../types";
 import { BUILD_CHANNEL, REVIEW_ONLY } from "../env";
 
 type TopbarProps = {
@@ -31,6 +33,14 @@ type TopbarProps = {
   /** Clear all project-scoped state so the user can pick a fresh
    *  input/output pair. Doesn't touch the disk. */
   onCloseProject: () => void;
+  /** Work-mode tabs live in the topbar header now (used to be a
+   *  separate band below). When `null` the tab block is hidden — that's
+   *  the case for review-only builds that don't run the cutter. Locked
+   *  flag disables the tabs while a project is already loaded so the
+   *  user can't change mode mid-stream. */
+  mode?: CutMode;
+  onModeChange?: (next: CutMode) => void;
+  modeLocked?: boolean;
 };
 
 const themeIcon = {
@@ -55,15 +65,37 @@ export function Topbar({
   onExport,
   onExportBundle,
   onCloseProject,
+  mode,
+  onModeChange,
+  modeLocked,
 }: TopbarProps) {
   const ThemeIcon = themeIcon[theme] ?? Sunrise;
   const dotClass = hasError ? "error" : busy ? "busy" : hasProject ? "" : "idle";
+  // Show mode tabs only when the parent wired them in. Review-only
+  // builds skip the cutter entirely so we hide the picker.
+  const showModeTabs = mode != null && onModeChange != null;
+
+  const tabStyle = (selected: boolean): React.CSSProperties => ({
+    background: selected ? "rgba(13, 148, 136, 0.12)" : "transparent",
+    border: "none",
+    padding: "6px 14px",
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    cursor: modeLocked ? "not-allowed" : "pointer",
+    color: selected
+      ? "var(--text-primary, #0f172a)"
+      : "var(--text-secondary, #64748b)",
+    fontSize: 13,
+    fontWeight: selected ? 600 : 400,
+    borderRadius: 6,
+    opacity: modeLocked && !selected ? 0.5 : 1,
+    whiteSpace: "nowrap",
+  });
+
   return (
     <header className="topbar">
       <div className="topbar-brand">
-        <div className="brand-mark" aria-hidden>
-          湘
-        </div>
         <div className="brand-text">
           <h1>
             方言标注工作台
@@ -78,6 +110,51 @@ export function Topbar({
             <span>{status}</span>
           </p>
         </div>
+        {/* Work-mode tabs sit right next to the title — inlined here
+            (used to be a dedicated row below the topbar) so the picker
+            is always the first decision the user sees and no vertical
+            space is wasted on it. Locked once a project is loaded so
+            the choice stays committed for the active session. */}
+        {showModeTabs && (
+          <div
+            role="tablist"
+            aria-label="工作模式"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+              marginLeft: 18,
+              paddingLeft: 18,
+              borderLeft: "1px solid var(--border, #e2e8f0)",
+            }}
+            title={
+              modeLocked
+                ? "已加载项目，模式锁定。关闭项目后可重选。"
+                : "导入文件夹前先选好模式"
+            }
+          >
+            <button
+              role="tab"
+              aria-selected={mode === "dialect"}
+              disabled={modeLocked}
+              onClick={() => !modeLocked && onModeChange?.("dialect")}
+              style={tabStyle(mode === "dialect")}
+            >
+              <Scissors size={13} />
+              模式 1 · 方言
+            </button>
+            <button
+              role="tab"
+              aria-selected={mode === "semantic"}
+              disabled={modeLocked}
+              onClick={() => !modeLocked && onModeChange?.("semantic")}
+              style={tabStyle(mode === "semantic")}
+            >
+              <Languages size={13} />
+              模式 2 · 语义
+            </button>
+          </div>
+        )}
       </div>
       <div className="topbar-actions">
         <button

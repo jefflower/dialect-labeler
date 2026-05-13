@@ -42,6 +42,10 @@ class TaskOut(BaseModel):
     owner_id: int
     name: str
     status: str
+    # Cut mode chosen at upload time. `dialect` = Mode 1 (silence-based),
+    # `semantic` = Mode 2 (Mandarin LLM-driven). Stored on the row so the
+    # Worker can authoritatively translate it into CutConfig.mode.
+    mode: str = "dialect"
     input_size: int | None = None
     input_uploaded_at: datetime | None = None
     output_size: int | None = None
@@ -50,6 +54,13 @@ class TaskOut(BaseModel):
     files_cleaned_at: datetime | None = None
     error: str | None = None
     summary: dict | None = None
+    # Worker-pushed progress snapshot. Cleared (NULL) until the Worker
+    # starts pushing updates. UI renders a progress bar when
+    # `progress_percent` is non-null.
+    progress_percent: int | None = None
+    progress_stage: str | None = None
+    progress_detail: str | None = None
+    progress_updated_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
@@ -70,6 +81,10 @@ class TaskClaim(BaseModel):
     owner_id: int
     input_size: int | None
     claim_expires_at: datetime
+    # Mode the owner picked at upload time. The Worker MUST honour this
+    # value when constructing CutConfig — it overrides whatever's in the
+    # uploaded bundle's project.json. Always populated on a fresh claim.
+    mode: str = "dialect"
 
 
 class TaskCompleteIn(BaseModel):
@@ -82,3 +97,15 @@ class TaskCompleteIn(BaseModel):
 
 class TaskFailIn(BaseModel):
     error: str = Field(max_length=4000)
+
+
+class TaskProgressIn(BaseModel):
+    """Worker pushes a snapshot of where it is in the pipeline. Best-effort
+    UI hint — losing one of these doesn't fail the task. Validation is
+    permissive on purpose: a worker that emits a malformed update should
+    log + drop, not crash.
+    """
+
+    percent: int = Field(ge=0, le=100)
+    stage: str = Field(max_length=64)
+    detail: str | None = Field(default=None, max_length=255)

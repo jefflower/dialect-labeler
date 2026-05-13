@@ -596,11 +596,125 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  padding: var(--space-3);
+  padding: var(--space-3) var(--space-4);
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   align-items: stretch;
+  /* Mode 1 panel now contains the full settings stack — cut params,
+     端点池, Whisper / Ollama config, 方言预设, 导出, 标签字典, 依赖体检.
+     Cap height to keep the page navigable and let the inner content
+     scroll on its own. `min(70vh, ...)` keeps it sane on tall + short
+     viewports both. `scroll-padding-top` keeps anchor jumps clear of
+     the sticky section header. */
+  max-height: min(70vh, 720px);
+  overflow-y: auto;
+  scroll-padding-top: 56px;
+  scrollbar-gutter: stable;
+  position: relative;
+  box-shadow: inset 0 -1px 0 rgba(15, 23, 42, 0.02);
+}
+.config-strategy-body::-webkit-scrollbar {
+  width: 8px;
+}
+.config-strategy-body::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 8px;
+}
+.config-strategy-body::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
+
+/* ---- Mode-1 sub-section headers ----
+   Replaces the inline styles that were on each <h4>. Sticky inside
+   the scrollable body so the current section's name pins at top as
+   the user scrolls down through the long config. */
+.config-strategy-body h4 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: var(--space-5) calc(-1 * var(--space-4)) var(--space-2);
+  padding: 10px var(--space-4) 10px calc(var(--space-4) + 4px);
+  border-left: 3px solid var(--accent);
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--accent) 9%, transparent),
+    transparent 65%
+  );
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-primary);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  backdrop-filter: saturate(140%) blur(10px);
+  -webkit-backdrop-filter: saturate(140%) blur(10px);
+}
+.config-strategy-body h4 svg {
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+.config-strategy-body h4:first-of-type {
+  margin-top: var(--space-3);
+}
+
+/* The descriptive paragraph that follows each h4 — kept small and
+   muted so the actual fields below dominate. */
+.config-strategy-body h4 + p {
+  margin: 0 0 var(--space-3);
+  font-size: 12px;
+  color: var(--text-tertiary);
+  line-height: 1.55;
+}
+
+/* Subtle inter-section divider — drawn just inside the panel so each
+   group reads as a distinct chunk while still belonging to the same
+   page. The h4 sits on top of the divider thanks to its own
+   margin-top + background. */
+.config-strategy-body > h4:not(:first-of-type) {
+  border-top: 1px solid var(--border);
+}
+
+/* Tag editor blocks stacked together — give them air. */
+.config-strategy-body .tag-editor + .tag-editor {
+  margin-top: var(--space-2);
+}
+
+/* Inputs / textareas / selects inside the Mode 1 panel — friendlier
+   focus state with a soft accent ring. */
+.config-strategy-body input[type="text"],
+.config-strategy-body input[type="number"],
+.config-strategy-body input:not([type]),
+.config-strategy-body textarea,
+.config-strategy-body select {
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.config-strategy-body input:focus,
+.config-strategy-body textarea:focus,
+.config-strategy-body select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px
+    color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+/* Help/help-tip blocks inside Mode 1 panel — pull them back from the
+   prevailing inline default and give a small left accent bar so they
+   read as "explanation" instead of "field". */
+.config-strategy-body .help-tip {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  line-height: 1.55;
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--border);
+  margin-top: var(--space-2);
+}
+
+/* The dependency-row block uses its own existing styles; just add a
+   bit more breathing room when inside the panel. */
+.config-strategy-body .dependency-row {
+  margin-top: var(--space-2);
 }
 
 .config-strategy-toolbar,

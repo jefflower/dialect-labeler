@@ -60,7 +60,9 @@ export default function TasksPage() {
             <thead>
               <tr>
                 <th>名称</th>
+                <th>模式</th>
                 <th>状态</th>
+                <th>进度</th>
                 <th>输入</th>
                 <th>产物</th>
                 <th>创建</th>
@@ -69,6 +71,15 @@ export default function TasksPage() {
             <tbody>
               {tasks.map((t) => {
                 const s = formatStatus(t.status);
+                const mode = t.mode ?? "dialect";
+                const modeLabel = mode === "semantic" ? "模式 2 · 语义" : "模式 1 · 方言";
+                const modeBg =
+                  mode === "semantic" ? "rgba(124, 58, 237, 0.12)" : "rgba(13, 148, 136, 0.12)";
+                const modeFg =
+                  mode === "semantic" ? "#7c3aed" : "#0d9488";
+                const showProgress =
+                  t.progress_percent != null &&
+                  (t.status === "claimed" || t.status === "running");
                 return (
                   <tr key={t.id}>
                     <td>
@@ -77,10 +88,63 @@ export default function TasksPage() {
                     <td>
                       <span
                         className="status-chip"
+                        style={{
+                          background: modeBg,
+                          color: modeFg,
+                          fontWeight: 500,
+                        }}
+                        title={
+                          mode === "semantic"
+                            ? "Mode 2：LLM 决定切点，规范化文本，产出 xlsx"
+                            : "Mode 1：按静音切，保留全部声学事件"
+                        }
+                      >
+                        {modeLabel}
+                      </span>
+                    </td>
+                    <td>
+                      <span
+                        className="status-chip"
                         style={{ background: s.color }}
                       >
                         {s.label}
                       </span>
+                    </td>
+                    <td style={{ minWidth: 140 }}>
+                      {showProgress ? (
+                        <div
+                          title={`${t.progress_stage ?? ""} · ${t.progress_detail ?? ""}`.trim()}
+                        >
+                          <div
+                            style={{
+                              fontSize: 11,
+                              opacity: 0.7,
+                              marginBottom: 2,
+                            }}
+                          >
+                            {t.progress_stage ?? "处理中"} · {t.progress_percent}%
+                          </div>
+                          <div
+                            style={{
+                              height: 4,
+                              borderRadius: 2,
+                              background: "#e2e8f0",
+                              overflow: "hidden",
+                            }}
+                          >
+                            <div
+                              style={{
+                                width: `${t.progress_percent ?? 0}%`,
+                                height: "100%",
+                                background: "var(--accent, #0d9488)",
+                                transition: "width 0.4s ease",
+                              }}
+                            />
+                          </div>
+                        </div>
+                      ) : (
+                        <span style={{ opacity: 0.4 }}>—</span>
+                      )}
                     </td>
                     <td>{formatBytes(t.input_size)}</td>
                     <td>{formatBytes(t.output_size)}</td>

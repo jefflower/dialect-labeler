@@ -274,6 +274,34 @@ pub(crate) struct CutConfig {
     pub(crate) semantic_ollama_endpoints: Vec<OllamaEndpointDef>,
     #[serde(default)]
     pub(crate) semantic_whisper_endpoints: Vec<WhisperEndpointDef>,
+
+    /// Sliding-window size in seconds for the Mode-2 cutter. Each
+    /// iteration of the algorithm processes at most this many seconds
+    /// of audio: extracts the window, Whisper-transcribes it, and asks
+    /// the LLM where to cut INSIDE the window. Defaults to whatever
+    /// `max_segment_s` is set to (which is the spec's 90s ceiling), so
+    /// the window AND the segment max are the same knob by default.
+    /// Decouple by setting this larger than `max_segment_s` if you
+    /// want the LLM to see more context before deciding where to cut.
+    #[serde(default)]
+    pub(crate) semantic_window_s: Option<f64>,
+
+    /// Optional override for the LLM "where should I cut?" prompt
+    /// template. The default is tuned for Mandarin / Changsha dialect;
+    /// users can swap it for Taiwanese / Sichuanese / English / etc.
+    ///
+    /// Template placeholders (all optional — missing ones are simply
+    /// not substituted):
+    ///   `{transcript}` — Whisper segments table (1 line per utterance)
+    ///   `{window_ms}`  — window size in ms
+    ///   `{min_ms}`     — min segment ms
+    ///   `{max_s}`      — max segment seconds (float, 1 decimal)
+    ///   `{sweet_lo}`   — sweet-spot lower bound in ms
+    ///   `{sweet_hi}`   — sweet-spot upper bound in ms
+    ///
+    /// If empty, the built-in Mandarin default is used.
+    #[serde(default)]
+    pub(crate) semantic_cut_prompt: String,
 }
 
 fn default_target_loudness_lufs() -> f32 { -18.0 }
@@ -305,6 +333,8 @@ impl Default for CutConfig {
             semantic_num_ctx: default_semantic_num_ctx(),
             semantic_ollama_endpoints: Vec::new(),
             semantic_whisper_endpoints: Vec::new(),
+            semantic_window_s: None,
+            semantic_cut_prompt: String::new(),
         }
     }
 }
@@ -1865,25 +1895,54 @@ fn truncate_for_log(s: &str, max_chars: usize) -> String {
 /// Note: segments don't have to COVER the entire input — spec § 二·四
 /// allows dropping unusable bits (long silence / mumble / noise).
 pub(crate) fn validate_semantic_cuts(
-    decisions: &[SemanticCutDecision],
+    decisions: &mut [SemanticCutDecision],
     candidates_ms: &[u64],
     config: &CutConfig,
 ) -> Result<(), String> {
-    let candidate_set: std::collections::HashSet<u64> = candidates_ms.iter().copied().collect();
     // Absolute floor — anything shorter than 1s is almost certainly an
     // off-by-one or an empty segment, not a "real" short utterance.
     const HARD_MIN_MS: u64 = 1000;
+    // Snap tolerance for "did the LLM almost pick a real candidate?".
+    // The LLM occasionally returns a timestamp 1-50ms off the actual
+    // piece boundary (Qwen rounding or piece-text length confusion).
+    // Snap to the nearest candidate within this window before failing
+    // hard — keeps Mode 2 robust without weakening the gate on
+    // genuinely fabricated values.
+    const SNAP_TOLERANCE_MS: u64 = 250;
     let max_ms = (config.max_segment_s * 1000.0) as u64;
+
+    fn snap(ms: u64, candidates: &[u64]) -> Option<u64> {
+        // Closest candidate by absolute distance. Returns the snapped
+        // value only when within SNAP_TOLERANCE_MS; None otherwise.
+        let mut best: Option<(u64, u64)> = None;
+        for &c in candidates {
+            let diff = if c > ms { c - ms } else { ms - c };
+            match best {
+                None => best = Some((c, diff)),
+                Some((_, prev)) if diff < prev => best = Some((c, diff)),
+                _ => {}
+            }
+        }
+        match best {
+            Some((c, diff)) if diff <= SNAP_TOLERANCE_MS => Some(c),
+            _ => None,
+        }
+    }
+
     let mut prev_end = 0u64;
     let mut errors: Vec<String> = Vec::new();
-    for (i, d) in decisions.iter().enumerate() {
-        if !candidate_set.contains(&d.start_ms) {
+    for (i, d) in decisions.iter_mut().enumerate() {
+        if let Some(snapped) = snap(d.start_ms, candidates_ms) {
+            d.start_ms = snapped;
+        } else {
             errors.push(format!(
                 "[{i}] start_ms {} 不在候选切点池里",
                 d.start_ms
             ));
         }
-        if !candidate_set.contains(&d.end_ms) {
+        if let Some(snapped) = snap(d.end_ms, candidates_ms) {
+            d.end_ms = snapped;
+        } else {
             errors.push(format!(
                 "[{i}] end_ms {} 不在候选切点池里",
                 d.end_ms
@@ -2033,8 +2092,8 @@ fn llm_decide_semantic_cuts_one_endpoint(
                 truncate_for_log(&raw_body, 300)
             )
         })?;
-    let decisions = parse_semantic_cut_response(inner)?;
-    validate_semantic_cuts(&decisions, candidates_ms, config)?;
+    let mut decisions = parse_semantic_cut_response(inner)?;
+    validate_semantic_cuts(&mut decisions, candidates_ms, config)?;
     Ok(decisions)
 }
 
@@ -2309,11 +2368,22 @@ pub(crate) fn auto_qa_segment(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SemanticPipelineFileReport {
     pub(crate) source_path: String,
-    pub(crate) xlsx_path: String,
     pub(crate) segment_count: usize,
-    /// Soft warnings — pipeline succeeded but Phase 6 flagged at least
-    /// one segment. Listed by segment index.
-    pub(crate) qa_flagged_indices: Vec<usize>,
+    /// Mode-1-style segment records emitted by the semantic cut. Each
+    /// carries the cut WAV's path (under `<out>/segments/`), the
+    /// timestamp range, and the raw ASR text concatenated from the
+    /// underlying pre-cut pieces. Callers (cloud worker / local Tauri)
+    /// decide whether to write a project.json next to these segments
+    /// or splice them into an existing one. The path inside the
+    /// records is RELATIVE to the project root (e.g.
+    /// `./segments/<basename>_NNNN_<startMs>-<endMs>.wav`) so the bundle
+    /// is portable — Windows annotators can copy it anywhere and open
+    /// project.json without path rewrites.
+    pub(crate) segments: Vec<SegmentRecord>,
+    /// Absolute path of the copied source WAV inside the bundle's
+    /// `source/` subdir, so the caller can write a matching `audioFiles`
+    /// entry in project.json.
+    pub(crate) source_copy_path: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2407,6 +2477,30 @@ pub(crate) fn run_semantic_pipeline_impl(
     Ok(SemanticPipelineResult { reports, errors })
 }
 
+/// Process one source file with the sliding-window semantic cutter.
+///
+/// Per-iteration loop (per § user-proposed algorithm):
+///   1. Take the next ≤90s slice starting at the cursor.
+///   2. Send the slice to Whisper (one of the configured endpoints).
+///   3. Hand the resulting `segments[]` (per-utterance timestamps) to
+///      Qwen and ask: "where in this slice should we cut to end on a
+///      complete utterance?"
+///   4. Cut the source WAV at `cursor + cut_at` and emit one segment.
+///   5. Advance cursor to the cut point and repeat until the source
+///      is exhausted.
+///
+/// Why a sliding window vs the previous "pre-cut everything → big LLM
+/// merge" pass:
+///   - LLM context per iteration stays tiny (one window's Whisper
+///     segments ≈ a few hundred tokens), so num_ctx pressure is gone.
+///   - One iteration failing doesn't sink the whole task — we can
+///     retry the same window or force a fixed 90s cut.
+///   - The LLM only ever picks ONE number per call, so off-by-a-few-ms
+///     errors that broke the candidate-pool validator can't happen
+///     (we accept whatever ms the LLM returns within the window).
+///   - Serial by nature: cursor depends on previous decision. Fine —
+///     each window finishes in ~10s (Whisper 90s + Qwen one-shot),
+///     so a 13min source runs in ~3 minutes regardless.
 fn process_single_semantic_file(
     app: &tauri::AppHandle,
     input_path: &str,
@@ -2421,162 +2515,436 @@ fn process_single_semantic_file(
         return Err("input file not found".into());
     }
     let source_basename = path_file_name(&input);
-    let spec_stem = derive_spec_stem(&input);
-    let file_out_dir = out_root.join(&spec_stem);
-    fs::create_dir_all(&file_out_dir).map_err(|err| err.to_string())?;
-    let work_dir = file_out_dir.join(".semantic-pipeline");
+    let source_stem = path_file_stem(&input);
+
+    let source_dir = out_root.join("source");
+    let segments_dir = out_root.join("segments");
+    fs::create_dir_all(&source_dir).map_err(|err| err.to_string())?;
+    fs::create_dir_all(&segments_dir).map_err(|err| err.to_string())?;
+    let work_dir = out_root.join(".semantic-pipeline");
     fs::create_dir_all(&work_dir).map_err(|err| err.to_string())?;
 
-    // ---- Phase 2: preprocess ---------------------------------------------
-    let _ = app.emit(
-        "semantic:progress",
-        &serde_json::json!({"source": input_path, "phase": "preprocess"}),
-    );
-    let normalised = work_dir.join("01_normalised.wav");
-    preprocess_audio_for_semantic(
-        &input,
-        &normalised,
-        config.target_loudness_lufs,
-        find_rnnoise_model().as_deref(),
-    )?;
+    let probe = probe_audio(&input)?;
+    let total_ms = probe.duration_ms.ok_or_else(|| {
+        "ffprobe couldn't read source duration".to_string()
+    })?;
+    let codec = output_pcm_codec(&probe);
 
-    // ---- Phase 3: fine pre-cut + candidate pool --------------------------
-    let _ = app.emit(
-        "semantic:progress",
-        &serde_json::json!({"source": input_path, "phase": "fine_pre_cut"}),
-    );
-    let pieces_dir = work_dir.join("02_pieces");
-    let (piece_paths, candidates_ms) =
-        fine_pre_cut_for_semantic(&normalised, &pieces_dir)?;
-    if piece_paths.is_empty() {
-        return Err("fine pre-cut produced 0 pieces".into());
+    // Copy source into the bundle so Windows annotators have it alongside
+    // the segments.
+    let source_dest = source_dir.join(&source_basename);
+    fs::copy(&input, &source_dest).map_err(|err| err.to_string())?;
+
+    // Resolve Whisper endpoints — Mode 2's own pool first, else the
+    // recognition options' (Mode 1) pool.
+    let whisper_endpoints: Vec<String> = config
+        .effective_semantic_whisper_endpoints()
+        .iter()
+        .filter(|e| !e.url.trim().is_empty())
+        .map(|e| e.url.clone())
+        .chain(
+            asr_options
+                .whisper_endpoints
+                .as_ref()
+                .map(|v| {
+                    v.iter()
+                        .filter(|e| !e.url.trim().is_empty() && e.enabled)
+                        .map(|e| e.url.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        )
+        .collect();
+    if whisper_endpoints.is_empty() {
+        return Err("Mode 2 sliding cutter 需要至少一个 Whisper HTTP 端点".into());
     }
 
-    // ---- Phase 3b: ASR each piece via existing pool ----------------------
-    let _ = app.emit(
-        "semantic:progress",
-        &serde_json::json!({
-            "source": input_path,
-            "phase": "asr",
-            "pieces": piece_paths.len(),
-        }),
-    );
-    // Build minimal SegmentRecord list for recognize_segments_impl.
-    // start_ms/end_ms here are intra-piece — recognize doesn't care
-    // about the global timeline.
-    let asr_segments: Vec<SegmentRecord> = piece_paths
-        .iter()
-        .enumerate()
-        .map(|(i, p)| SegmentRecord {
-            id: format!("piece_{i:04}"),
-            source_path: path_to_string(&input),
+    // Same for Ollama — Mode 2 pool first, fall back to the (unioned)
+    // Mode-1 pool we already promoted in cloud.rs / App.tsx.
+    let ollama_pool = config.effective_semantic_ollama_endpoints();
+    if ollama_pool.is_empty() {
+        return Err("Mode 2 sliding cutter 需要至少一个 Ollama 端点（num_ctx ≥ 8K）".into());
+    }
+    let ollama_model = ollama_pool[0]
+        .model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| config.semantic_model.clone());
+
+    let initial_prompt = asr_options
+        .initial_prompt
+        .clone()
+        .unwrap_or_else(|| "以下是普通话口语对话/独白，请按发音转写为汉字稿。".to_string());
+
+    // Sliding-window length. Defaults to `max_segment_s` (the same 90s
+    // ceiling we'll cap segments at) so a fresh config "just works".
+    // Tuning intent: bumping `semantic_window_s` higher than
+    // `max_segment_s` lets the LLM see more lookahead context before
+    // picking a cut, at the cost of larger per-window Whisper requests.
+    let window_size_ms: u64 = config
+        .semantic_window_s
+        .filter(|w| *w >= 1.0)
+        .map(|w| (w * 1000.0) as u64)
+        .unwrap_or_else(|| (config.max_segment_s * 1000.0) as u64);
+    let max_ms: u64 = (config.max_segment_s * 1000.0) as u64; // 90_000 default
+    let min_ms: u64 = (config.min_segment_s * 1000.0) as u64; // 6_000 default
+
+    let mut segments: Vec<SegmentRecord> = Vec::new();
+    let mut cursor: u64 = 0;
+    let mut window_idx: usize = 0;
+    let mut whisper_rr: usize = 0; // round-robin index across Whisper pool
+
+    while cursor < total_ms {
+        window_idx += 1;
+        let window_end_planned = (cursor + window_size_ms).min(total_ms);
+        let window_ms = window_end_planned - cursor;
+
+        let _ = app.emit(
+            "semantic:progress",
+            &serde_json::json!({
+                "source": input_path,
+                "phase": "window",
+                "window_idx": window_idx,
+                "cursor_ms": cursor,
+                "window_ms": window_ms,
+                "total_ms": total_ms,
+            }),
+        );
+
+        // 1. Extract the window WAV to scratch.
+        let window_path = work_dir.join(format!("win_{window_idx:04}.wav"));
+        write_pcm_wav_segment(
+            &input,
+            &window_path,
+            cursor as f64 / 1000.0,
+            window_ms as f64 / 1000.0,
+            &probe,
+            codec,
+        )?;
+
+        // 2. Whisper ASR — round-robin across the pool. Retry on
+        // transient failure (per-endpoint try, full pool on each
+        // window's first call so a hot endpoint isn't punished
+        // forever).
+        let mut whisper_attempts = 0;
+        let asr_result = loop {
+            let url = &whisper_endpoints[whisper_rr % whisper_endpoints.len()];
+            whisper_rr = whisper_rr.wrapping_add(1);
+            match transcribe_remote_with_segments(url, &window_path, "zh", &initial_prompt) {
+                Ok(r) => break r,
+                Err(err) if whisper_attempts < whisper_endpoints.len() * 2 - 1 => {
+                    eprintln!("[semantic-sliding] whisper {url} failed: {err} (retrying)");
+                    whisper_attempts += 1;
+                    std::thread::sleep(Duration::from_millis(
+                        500 + (whisper_attempts as u64) * 500,
+                    ));
+                    continue;
+                }
+                Err(err) => return Err(format!("whisper 全部失败: {err}")),
+            }
+        };
+
+        // 3. If this is the last window OR the audio is shorter than
+        // max_ms total, emit the whole thing as one segment without
+        // asking the LLM (no cut needed).
+        // The LLM's cut must be ≤ max_ms (the spec cap), even when the
+        // window itself is larger (e.g. user set semantic_window_s=120
+        // for more lookahead but still wants ≤90s segments). Use
+        // `cut_upper` as the actual decision ceiling.
+        let cut_upper = window_ms.min(max_ms);
+        let is_final_window = window_end_planned == total_ms && window_ms <= max_ms;
+        let cut_at_in_window: u64 = if is_final_window {
+            window_ms
+        } else {
+            // 4. Ask Qwen to pick a single cut point in [min_ms, cut_upper],
+            // preferring late values for long segments.
+            match llm_pick_one_cut(
+                &asr_result,
+                cut_upper,
+                min_ms,
+                &ollama_pool,
+                &ollama_model,
+                config.semantic_num_ctx,
+                &config.semantic_cut_prompt,
+            ) {
+                Ok(cut) => cut.clamp(min_ms.min(cut_upper), cut_upper),
+                Err(err) => {
+                    eprintln!(
+                        "[semantic-sliding] LLM cut decision failed (window {window_idx}): {err}; \
+                         falling back to last whisper segment end"
+                    );
+                    // Fallback: cut at the end of the last Whisper
+                    // segment within the cut window. Beats forcing a
+                    // hard 90s cut mid-word.
+                    asr_result
+                        .segments
+                        .iter()
+                        .rev()
+                        .find(|s| s.end_ms >= min_ms && s.end_ms <= cut_upper)
+                        .map(|s| s.end_ms)
+                        .unwrap_or(cut_upper)
+                }
+            }
+        };
+
+        // 5. Build segment text from the Whisper segments that fall
+        // entirely before the cut point.
+        let cut_text: String = asr_result
+            .segments
+            .iter()
+            .filter(|s| s.end_ms <= cut_at_in_window + 50) // small tolerance
+            .map(|s| s.text.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("");
+
+        let seg_start_abs = cursor;
+        let seg_end_abs = cursor + cut_at_in_window;
+
+        // 6. Cut the source WAV at absolute timestamps.
+        let seg_filename = format!(
+            "{stem}_{seq:04}_{start}-{end}.wav",
+            stem = source_stem,
+            seq = segments.len() + 1,
+            start = seg_start_abs,
+            end = seg_end_abs,
+        );
+        let seg_dest = segments_dir.join(&seg_filename);
+        write_pcm_wav_segment(
+            &input,
+            &seg_dest,
+            seg_start_abs as f64 / 1000.0,
+            (seg_end_abs - seg_start_abs) as f64 / 1000.0,
+            &probe,
+            codec,
+        )?;
+
+        let seg_id = seg_filename
+            .strip_suffix(".wav")
+            .unwrap_or(&seg_filename)
+            .to_string();
+        segments.push(SegmentRecord {
+            id: seg_id,
+            source_path: format!("./source/{}", source_basename),
             source_file_name: source_basename.clone(),
-            segment_path: path_to_string(p),
-            segment_file_name: path_file_name(p),
+            segment_path: format!("./segments/{}", seg_filename),
+            segment_file_name: seg_filename,
             role: None,
-            start_ms: 0,
-            end_ms: 0,
-            duration_ms: 0,
-            original_text: String::new(),
-            phonetic_text: String::new(),
+            start_ms: seg_start_abs,
+            end_ms: seg_end_abs,
+            duration_ms: seg_end_abs - seg_start_abs,
+            original_text: cut_text.clone(),
+            phonetic_text: cut_text,
             emotion: Vec::new(),
             tags: Vec::new(),
             notes: String::new(),
-        })
-        .collect();
-
-    let asr_results = recognize_segments_impl(
-        app.clone(),
-        path_to_string(&work_dir),
-        asr_segments,
-        asr_options.clone(),
-    )?;
-    // Map ASR results back to pieces in order (recognize preserves
-    // input order in its output).
-    let pieces_asred: Vec<AsredPiece> = asr_results
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            // candidates_ms[i] is start of piece i; candidates_ms[i+1]
-            // is end. Phase 3 guarantees boundaries.len() == pieces+1.
-            let start = candidates_ms.get(i).copied().unwrap_or(0);
-            let end = candidates_ms.get(i + 1).copied().unwrap_or(start);
-            AsredPiece {
-                text: r.text.clone(),
-                start_ms: start,
-                end_ms: end,
-            }
-        })
-        .collect();
-
-    // ---- Phase 4: LLM semantic cut decision ------------------------------
-    let _ = app.emit(
-        "semantic:progress",
-        &serde_json::json!({"source": input_path, "phase": "semantic_cut"}),
-    );
-    let decisions = llm_decide_semantic_cuts(&pieces_asred, &candidates_ms, config)?;
-
-    // ---- Phase 5 + 6: normalise + QA per merged segment ------------------
-    let _ = app.emit(
-        "semantic:progress",
-        &serde_json::json!({
-            "source": input_path,
-            "phase": "normalise_qa",
-            "segments": decisions.len(),
-        }),
-    );
-    let mut export_segments: Vec<SemanticExportSegment> = Vec::with_capacity(decisions.len());
-    let mut qa_flagged: Vec<usize> = Vec::new();
-    for (i, dec) in decisions.iter().enumerate() {
-        // Concatenate texts of pieces falling within [start, end).
-        let raw_text: String = pieces_asred
-            .iter()
-            .filter(|p| p.start_ms >= dec.start_ms && p.end_ms <= dec.end_ms)
-            .map(|p| p.text.trim())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        // Phase 5 normalise — fall back to raw text on failure.
-        let final_text = match llm_normalize_segment_text(&raw_text, config) {
-            Ok(t) => t,
-            Err(err) => {
-                eprintln!("[semantic] segment {i} normalise failed: {err}");
-                raw_text.clone()
-            }
-        };
-        // Phase 6 QA.
-        let duration_ms = dec.end_ms.saturating_sub(dec.start_ms);
-        let problems = auto_qa_segment(&final_text, duration_ms, config);
-        if !problems.is_empty() {
-            qa_flagged.push(i);
-        }
-        export_segments.push(SemanticExportSegment {
-            start_ms: dec.start_ms,
-            end_ms: dec.end_ms,
-            final_text,
-            problems,
         });
+
+        // 7. Drop the scratch window file (each is ~10MB at 48kHz mono).
+        let _ = fs::remove_file(&window_path);
+
+        // 8. Advance cursor. Safety: ensure we always make progress.
+        let next_cursor = cursor + cut_at_in_window;
+        if next_cursor <= cursor {
+            // The LLM returned a cut at 0; force at least min_ms to
+            // avoid an infinite loop.
+            cursor += min_ms.max(1000);
+            eprintln!(
+                "[semantic-sliding] cut returned 0 progress; forcing cursor += {}ms",
+                min_ms.max(1000)
+            );
+        } else {
+            cursor = next_cursor;
+        }
     }
 
-    // ---- Phase 7: export WAVs + xlsx -------------------------------------
-    let _ = app.emit(
-        "semantic:progress",
-        &serde_json::json!({"source": input_path, "phase": "export"}),
-    );
-    let (xlsx_path, _wav_paths) = export_semantic_mode(
-        &file_out_dir,
-        &normalised,
-        &spec_stem,
-        &source_basename,
-        &export_segments,
-    )?;
+    let _ = fs::remove_dir_all(&work_dir);
 
+    let count = segments.len();
     Ok(SemanticPipelineFileReport {
         source_path: path_to_string(&input),
-        xlsx_path: path_to_string(&xlsx_path),
-        segment_count: export_segments.len(),
-        qa_flagged_indices: qa_flagged,
+        segment_count: count,
+        segments,
+        source_copy_path: path_to_string(&source_dest),
     })
+}
+
+/// Ask Qwen for ONE cut point inside a single window. The prompt
+/// includes the Whisper-segment timestamps so the model knows where
+/// natural utterance boundaries are within this window. Returns the
+/// cut time in ms (relative to the window's start).
+///
+/// Prompt is intentionally compact — Whisper segments rarely exceed
+/// ~30 entries per 90s window, so the whole call is a few hundred
+/// tokens and fits easily even in num_ctx=2048 backends. That removes
+/// the original "must have 32K context" requirement.
+/// Built-in default Mode-2 cut prompt. Tuned for Mandarin + Changsha
+/// dialect (the project's primary corpus). Users override via
+/// `CutConfig.semantic_cut_prompt` for other dialects / languages.
+///
+/// Template placeholders — substituted at call time:
+///   `{transcript}` `{window_ms}` `{min_ms}` `{max_s}` `{sweet_lo}` `{sweet_hi}`
+const DEFAULT_SEMANTIC_CUT_PROMPT: &str = "下面是一段普通话 / 方言录音开头 {max_s} 秒的 Whisper 转写，按检测到的语音段给出时间戳（毫秒）+ 文字。\
+请告诉我应该在多少毫秒处「切第一刀」。规则：\n\
+\n\
+1. 切点必须 ≤ {window_ms} ms（窗口上限）\n\
+2. 切点应 ≥ {min_ms} ms（避免过短段；如果实在不行也可以低一些）\n\
+3. 必须切在某一行的 end_ms 位置（语义边界）\n\
+4. 优先选 {sweet_lo}-{sweet_hi} ms 范围内、落在自然句末（句号 / 问号 / 完整意群结束）的位置；\n\
+   没有这种位置时再退而求其次。\n\
+5. 输出 JSON: {{\"cut_ms\": <int>, \"reason\": \"<简短说明>\"}}。只输出 JSON。\n\
+\n\
+转写：\n{transcript}";
+
+fn llm_pick_one_cut(
+    asr: &WhisperResult,
+    window_ms: u64,
+    min_ms: u64,
+    pool: &[OllamaEndpointDef],
+    default_model: &str,
+    num_ctx: u32,
+    cut_prompt_override: &str,
+) -> Result<u64, String> {
+    if asr.segments.is_empty() {
+        // No utterances detected in this window — cut at window end so
+        // we don't loop forever on silence.
+        return Ok(window_ms);
+    }
+
+    // Build a compact timestamped transcript for the LLM. One line per
+    // Whisper segment.
+    let mut transcript = String::new();
+    for (i, s) in asr.segments.iter().enumerate() {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            &mut transcript,
+            "[{:>2}] {:>5}-{:>5}ms  {}",
+            i + 1,
+            s.start_ms,
+            s.end_ms,
+            s.text.trim(),
+        );
+    }
+
+    let min_s = min_ms as f64 / 1000.0;
+    let max_s = window_ms as f64 / 1000.0;
+    let sweet_lo = (max_s * 0.65).max(min_s);
+    let sweet_hi = (max_s * 0.95).max(sweet_lo);
+
+    // Render the user-side prompt. User-provided template wins; fall
+    // back to the canonical default. Placeholders are dumb string
+    // replacements — missing ones stay literal, extras are tolerated.
+    let template = if cut_prompt_override.trim().is_empty() {
+        DEFAULT_SEMANTIC_CUT_PROMPT.to_string()
+    } else {
+        cut_prompt_override.to_string()
+    };
+    let user = template
+        .replace("{transcript}", &transcript)
+        .replace("{window_ms}", &window_ms.to_string())
+        .replace("{min_ms}", &min_ms.to_string())
+        .replace("{max_s}", &format!("{max_s:.1}"))
+        .replace("{sweet_lo}", &format!("{sweet_lo:.0}"))
+        .replace("{sweet_hi}", &format!("{sweet_hi:.0}"));
+    // If the user's template didn't include `{transcript}`, append it
+    // so the LLM always sees the data — avoids the "I rewrote my
+    // prompt and forgot the placeholder" failure mode.
+    let user = if user.contains(&transcript) {
+        user
+    } else {
+        format!("{user}\n\n转写：\n{transcript}")
+    };
+
+    let system = "你是音频切割助手。你的任务是在一段录音的开头部分找到一个语义完整的切点，\
+                  让切出的第一段话既完整、又尽量接近窗口上限。只输出 JSON，不要其他文字。"
+        .to_string();
+
+    let mut last_err: Option<String> = None;
+    for endpoint in pool {
+        if !endpoint.enabled {
+            continue;
+        }
+        let model = endpoint
+            .model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| default_model.to_string());
+        let req_body = serde_json::json!({
+            "model": model,
+            "stream": false,
+            "messages": [
+                {"role": "system", "content": &system},
+                {"role": "user", "content": &user},
+            ],
+            "options": {
+                "temperature": 0.1,
+                "num_ctx": num_ctx.max(2048),
+            },
+            "format": "json",
+        });
+        let url = format!(
+            "{}/api/chat",
+            endpoint.url.trim_end_matches('/')
+        );
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(180))
+            .build();
+        let resp = match agent.post(&url).send_json(req_body) {
+            Ok(r) => r,
+            Err(err) => {
+                last_err = Some(format!("HTTP {url} failed: {err}"));
+                continue;
+            }
+        };
+        let raw_body = match resp.into_string() {
+            Ok(s) => s,
+            Err(err) => {
+                last_err = Some(format!("read body failed: {err}"));
+                continue;
+            }
+        };
+        let v: Value = match serde_json::from_str(&raw_body) {
+            Ok(v) => v,
+            Err(err) => {
+                last_err = Some(format!(
+                    "Ollama 非 JSON 响应: {err} (body={})",
+                    truncate_for_log(&raw_body, 200)
+                ));
+                continue;
+            }
+        };
+        let content = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
+        // Strip <think>...</think> wrappers + fenced JSON in case the
+        // model decorates its output.
+        let cleaned = strip_thinking(content);
+        let trimmed = cleaned
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(parsed) => {
+                if let Some(cut) = parsed.get("cut_ms").and_then(|c| c.as_u64()) {
+                    return Ok(cut);
+                }
+                last_err = Some(format!(
+                    "JSON 缺 cut_ms 字段: {}",
+                    truncate_for_log(trimmed, 200)
+                ));
+            }
+            Err(err) => {
+                last_err = Some(format!(
+                    "解析切点 JSON 失败: {err} (content={})",
+                    truncate_for_log(trimmed, 200)
+                ));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "所有 Ollama 端点都未返回有效切点".into()))
 }
 
 #[tauri::command]
@@ -5396,6 +5764,120 @@ fn normalise_http_url(raw: &str) -> Option<String> {
 /// Multipart body is hand-rolled — ureq has no native multipart and pulling
 /// in reqwest for one endpoint would drag the whole tokio stack. The wire
 /// shape is just five form fields wrapped by a boundary, ≤30 lines.
+/// One Whisper segment: a span of audio with its own start/end and the
+/// model's transcription for just that span. Mode-2 sliding-window
+/// cutter uses these as natural cut candidates within each 90s window.
+#[derive(Clone, Debug)]
+pub(crate) struct WhisperSegment {
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+    pub(crate) text: String,
+}
+
+/// Full Whisper transcribe response — text concatenated across all
+/// segments plus the segments themselves with timing.
+#[derive(Clone, Debug)]
+pub(crate) struct WhisperResult {
+    pub(crate) full_text: String,
+    pub(crate) segments: Vec<WhisperSegment>,
+}
+
+/// POST a WAV to `<base_url>/transcribe` and parse both the full text
+/// and the per-utterance segments. Mirrors `transcribe_remote` but
+/// returns the structured response. Mode 2's sliding-window cutter
+/// uses the segments to find natural cut candidates inside each window.
+fn transcribe_remote_with_segments(
+    base_url: &str,
+    segment_path: &Path,
+    language: &str,
+    initial_prompt: &str,
+) -> Result<WhisperResult, String> {
+    let bytes = fs::read(segment_path)
+        .map_err(|err| format!("读取切片失败 {}: {}", segment_path.display(), err))?;
+    let filename = segment_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("segment.wav");
+
+    let boundary = format!("----dlbWhisper{}", uniq_token());
+    let mut body: Vec<u8> = Vec::with_capacity(bytes.len() + 1024);
+    let crlf = b"\r\n";
+
+    let mut field_text = |name: &str, value: &str| {
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(crlf);
+    };
+    field_text("language", language);
+    field_text("initial_prompt", initial_prompt);
+
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"audio\"; filename=\"{}\"\r\n",
+            filename.replace('"', "_")
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(b"Content-Type: audio/wav\r\n\r\n");
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(crlf);
+    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+    let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(600))
+        .build();
+    let resp = agent
+        .post(&url)
+        .set(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={}", boundary),
+        )
+        .send_bytes(&body)
+        .map_err(|err| format!("whisper HTTP {}: {}", url, err))?;
+    let raw = resp
+        .into_string()
+        .map_err(|err| format!("whisper 响应读取失败：{}", err))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("whisper 响应非法 JSON：{} (body={})", err, raw))?;
+    let full_text = value
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let segments: Vec<WhisperSegment> = value
+        .get("segments")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let start = s.get("start").and_then(|v| v.as_f64())?;
+                    let end = s.get("end").and_then(|v| v.as_f64())?;
+                    let text = s
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    Some(WhisperSegment {
+                        start_ms: (start * 1000.0).max(0.0) as u64,
+                        end_ms: (end * 1000.0).max(0.0) as u64,
+                        text,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(WhisperResult {
+        full_text,
+        segments,
+    })
+}
+
 fn transcribe_remote(
     base_url: &str,
     segment_path: &Path,
@@ -7907,45 +8389,45 @@ mod tests {
         // Happy path. Length floor is 1s (HARD_MIN_MS) — sub-spec-target
         // short utterances are OK per § 二·一·1 弹性处理; auto-QA
         // surfaces them as warnings.
-        let good = vec![
+        let mut good = vec![
             SemanticCutDecision { start_ms: 0, end_ms: 8000, reason: String::new() },
             SemanticCutDecision { start_ms: 8000, end_ms: 20000, reason: String::new() },
         ];
-        validate_semantic_cuts(&good, &candidates, &cfg).expect("good cuts validate");
+        validate_semantic_cuts(&mut good, &candidates, &cfg).expect("good cuts validate");
 
         // Sub-6s but ≥1s — accepted (spec 弹性处理).
-        let short_ok = vec![SemanticCutDecision {
+        let mut short_ok = vec![SemanticCutDecision {
             start_ms: 0,
             end_ms: 1800,
             reason: String::new(),
         }];
-        validate_semantic_cuts(&short_ok, &candidates, &cfg)
+        validate_semantic_cuts(&mut short_ok, &candidates, &cfg)
             .expect("1.8s short utterance must pass — spec 弹性下限");
 
         // Cut point not in candidate pool.
-        let invented = vec![SemanticCutDecision {
+        let mut invented = vec![SemanticCutDecision {
             start_ms: 0,
             end_ms: 12345,  // not in candidates
             reason: String::new(),
         }];
-        let err = validate_semantic_cuts(&invented, &candidates, &cfg).unwrap_err();
+        let err = validate_semantic_cuts(&mut invented, &candidates, &cfg).unwrap_err();
         assert!(err.contains("不在候选切点池"), "got: {err}");
 
         // Too long: 95s > 90s ceiling.
-        let too_long = vec![SemanticCutDecision {
+        let mut too_long = vec![SemanticCutDecision {
             start_ms: 0,
             end_ms: 95000,
             reason: String::new(),
         }];
-        let err = validate_semantic_cuts(&too_long, &candidates, &cfg).unwrap_err();
+        let err = validate_semantic_cuts(&mut too_long, &candidates, &cfg).unwrap_err();
         assert!(err.contains("超过上限"), "got: {err}");
 
         // Overlap.
-        let overlap = vec![
+        let mut overlap = vec![
             SemanticCutDecision { start_ms: 0, end_ms: 20000, reason: String::new() },
             SemanticCutDecision { start_ms: 8000, end_ms: 95000, reason: String::new() },
         ];
-        let err = validate_semantic_cuts(&overlap, &candidates, &cfg).unwrap_err();
+        let err = validate_semantic_cuts(&mut overlap, &candidates, &cfg).unwrap_err();
         assert!(err.contains("重叠"), "got: {err}");
     }
 
@@ -9833,6 +10315,97 @@ pub fn run() {
                             let _ = window_clone.hide();
                         }
                     });
+                }
+
+                // Env-driven Cloud Worker autostart.
+                //
+                // The frontend has its own autostart hook (App.tsx reads
+                // cloud-session.json + cloud.workerAutostart.v1) but it
+                // depends on the webview actually loading the React tree
+                // — which doesn't happen reliably when the app is
+                // launched from a launchd LaunchAgent at boot with no
+                // user session attached. This Rust hook is the
+                // headless-friendly counterpart: when the four env vars
+                // below are set we log in + flip the worker on directly
+                // from setup, no webview round-trip needed.
+                //
+                // Required env (all four must be set):
+                //   CLOUD_DISPATCHER_URL     — e.g. http://47.93.1.242:8080
+                //   CLOUD_WORKER_EMAIL       — pre-created worker account
+                //   CLOUD_WORKER_PASSWORD    — its password
+                //   CLOUD_WORKER_AUTOSTART=1 — opt-in switch (so a stray
+                //                              env var doesn't auto-fire)
+                //
+                // Optional:
+                //   CLOUD_WORKER_CONFIG_JSON — full JSON for CloudWorkerConfig
+                //                              (whisper/ollama pools etc).
+                //                              If omitted, falls back to the
+                //                              CloudWorkerConfig default,
+                //                              which has empty pools and
+                //                              will likely fail mid-pipeline
+                //                              — usable only for smoke tests.
+                let autostart_on = std::env::var("CLOUD_WORKER_AUTOSTART")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if autostart_on {
+                    let url = std::env::var("CLOUD_DISPATCHER_URL").ok();
+                    let email = std::env::var("CLOUD_WORKER_EMAIL").ok();
+                    let password = std::env::var("CLOUD_WORKER_PASSWORD").ok();
+                    if let (Some(url), Some(email), Some(password)) = (url, email, password) {
+                        let app_handle = _app.handle().clone();
+                        std::thread::spawn(move || {
+                            // Small delay so the Tauri runtime has fully
+                            // wired State<CloudState>. Without it the
+                            // try_state lookup races on the first hot
+                            // launch.
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            match cloud::login_request(&url, &email, &password) {
+                                Ok((token, user)) => {
+                                    if let Some(state) =
+                                        app_handle.try_state::<cloud::CloudState>()
+                                    {
+                                        state.set_credentials(
+                                            url.clone(),
+                                            token,
+                                            user.clone(),
+                                        );
+                                        // Optional config injection.
+                                        if let Ok(cfg_json) =
+                                            std::env::var("CLOUD_WORKER_CONFIG_JSON")
+                                        {
+                                            match serde_json::from_str::<cloud::WorkerConfig>(
+                                                &cfg_json,
+                                            ) {
+                                                Ok(cfg) => state.set_worker_config(cfg),
+                                                Err(err) => eprintln!(
+                                                    "[autostart] worker config JSON parse failed: {err}"
+                                                ),
+                                            }
+                                        }
+                                        if let Err(err) = state
+                                            .set_worker_enabled(app_handle.clone(), true)
+                                        {
+                                            eprintln!(
+                                                "[autostart] set_worker_enabled failed: {err}"
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "[autostart] worker enabled — logged in as {}",
+                                                user.email
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!("[autostart] login failed: {err}");
+                                }
+                            }
+                        });
+                    } else {
+                        eprintln!(
+                            "[autostart] CLOUD_WORKER_AUTOSTART=1 but CLOUD_DISPATCHER_URL / CLOUD_WORKER_EMAIL / CLOUD_WORKER_PASSWORD missing — not starting worker"
+                        );
+                    }
                 }
             }
             Ok(())

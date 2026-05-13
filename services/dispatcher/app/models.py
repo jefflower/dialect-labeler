@@ -61,6 +61,17 @@ ACTIVE_TASK_STATES = (
     TASK_SUCCEEDED,
 )
 
+# Cut mode values. Mirrors `CutMode` on the Tauri client. Stored as
+# plain strings on the Task row so the Worker can blindly translate
+# `task.mode` into `CutConfig.mode` without a lookup table. The mode
+# is committed at upload time (POST /api/tasks) — the Worker IGNORES
+# whatever `mode` is buried in the uploaded bundle's project.json. This
+# avoids the silent-mode-mismatch class of bugs where a Windows
+# uploader and a Mac Worker disagreed on what the user actually wanted.
+MODE_DIALECT = "dialect"  # Mode 1: silence-based cutter (default)
+MODE_SEMANTIC = "semantic"  # Mode 2: LLM-driven Mandarin semantic cutter
+VALID_MODES = (MODE_DIALECT, MODE_SEMANTIC)
+
 # Roles.
 ROLE_ADMIN = "admin"
 ROLE_USER = "user"
@@ -116,6 +127,36 @@ class Task(Base):
     # input from looping a worker pool indefinitely.
     attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
+    )
+
+    # Cut mode committed at upload time. See `MODE_*` constants above.
+    # Defaults to `dialect` so old rows created before this column was
+    # added round-trip cleanly.
+    mode: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default=MODE_DIALECT,
+        server_default=MODE_DIALECT,
+    )
+
+    # Worker-pushed progress snapshot. Worker calls
+    # POST /api/worker/tasks/{id}/progress at stage transitions and
+    # roughly every 5s within long stages. Owner polling GET /api/tasks
+    # then sees the latest values without needing realtime channels.
+    # `progress_percent` is 0..100, `progress_stage` is a short label
+    # (e.g. "ASR" / "切割" / "LLM 改写"), `progress_detail` is a free-form
+    # one-liner (e.g. "12 / 30 files · 38%"). All cleared on retry.
+    progress_percent: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    progress_stage: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    progress_detail: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    progress_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     # Files. Path is relative to STORAGE_DIR. After cleanup these go NULL

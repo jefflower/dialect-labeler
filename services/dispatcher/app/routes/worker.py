@@ -36,7 +36,7 @@ from ..models import (
     utcnow,
 )
 from ..queue_ops import claim_next_pending, extend_lease
-from ..schemas import TaskClaim, TaskCompleteIn, TaskFailIn
+from ..schemas import TaskClaim, TaskCompleteIn, TaskFailIn, TaskProgressIn
 from ..storage import Storage, get_storage, output_key
 
 router = APIRouter(prefix="/api/worker", tags=["worker"])
@@ -74,6 +74,7 @@ def claim(
         owner_id=task.owner_id,
         input_size=task.input_size,
         claim_expires_at=task.claim_expires_at,  # type: ignore[arg-type]
+        mode=task.mode or "dialect",
     )
 
 
@@ -172,3 +173,34 @@ def fail(
     task.completed_at = utcnow()
     task.claim_expires_at = None
     db.commit()
+
+
+@router.post(
+    "/tasks/{task_id}/progress",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def progress(
+    task_id: str,
+    payload: TaskProgressIn,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+) -> None:
+    """Worker-pushed progress snapshot.
+
+    Persisted to the row so owner polling `GET /api/tasks/{id}` sees the
+    latest values without a realtime channel. Lossy by design — Worker
+    is expected to fire one of these every 5s within a long stage plus
+    one at every stage transition, but we don't care if a few drop on
+    the wire. Re-extends the lease as a side effect so the Worker
+    doesn't need to interleave heartbeat + progress calls.
+    """
+    task = _load_held(db, task_id, user.id)
+    task.progress_percent = max(0, min(100, payload.percent))
+    task.progress_stage = payload.stage
+    task.progress_detail = payload.detail
+    task.progress_updated_at = utcnow()
+    db.commit()
+    # Treat the progress push as a soft heartbeat so the Worker doesn't
+    # have to interleave two calls. extend_lease commits independently.
+    settings = get_settings()
+    extend_lease(db, task_id, user.id, settings.lease_ttl_seconds)

@@ -107,6 +107,29 @@ def _apply_sqlite_inline_migrations(engine: Engine) -> None:
             conn.execute(
                 text("ALTER TABLE tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
             )
+        # Mode committed at upload time. Default to `dialect` so existing
+        # rows keep their original behaviour.
+        if "mode" not in columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE tasks ADD COLUMN mode VARCHAR(16) NOT NULL DEFAULT 'dialect'"
+                )
+            )
+        # Worker-pushed progress snapshot. All four are nullable — a
+        # task that hasn't started yet (or one created before this
+        # migration) simply has progress=NULL across the board.
+        if "progress_percent" not in columns:
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN progress_percent INTEGER"))
+        if "progress_stage" not in columns:
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN progress_stage VARCHAR(64)"))
+        if "progress_detail" not in columns:
+            conn.execute(
+                text("ALTER TABLE tasks ADD COLUMN progress_detail VARCHAR(255)")
+            )
+        if "progress_updated_at" not in columns:
+            conn.execute(
+                text("ALTER TABLE tasks ADD COLUMN progress_updated_at DATETIME")
+            )
 
 
 def get_db() -> Iterator[Session]:

@@ -140,6 +140,16 @@ pub(crate) struct TaskClaim {
     pub(crate) input_size: Option<i64>,
     #[allow(dead_code)]
     pub(crate) claim_expires_at: String,
+    /// Cut mode the owner picked at upload time. The Worker forces this
+    /// onto `CutConfig.mode` before running, overriding whatever the
+    /// uploaded bundle's project.json says. Defaults to `dialect` for
+    /// dispatchers that pre-date the mode column.
+    #[serde(default = "default_mode")]
+    pub(crate) mode: String,
+}
+
+fn default_mode() -> String {
+    "dialect".to_string()
 }
 
 /// Snapshot returned to the frontend so the CloudPane can render
@@ -329,6 +339,36 @@ impl CloudClient {
             .post(&self.url(&format!("/api/worker/tasks/{task_id}/fail")))
             .set("authorization", &self.auth_header())
             .send_json(json!({ "error": trimmed }))?;
+        Ok(())
+    }
+
+    /// Push a progress snapshot. Best-effort — caller logs and ignores
+    /// any HTTP/transport error so the actual pipeline never gets
+    /// blocked on a slow dispatcher round-trip. The dispatcher also
+    /// re-extends the lease as a side effect, so a Worker that pushes
+    /// progress every 5–10s doesn't need to interleave heartbeat calls.
+    pub fn progress(
+        &self,
+        task_id: &str,
+        percent: u8,
+        stage: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        // Dispatcher caps detail at 255 chars; trim before sending so
+        // we don't 422 on long stage labels.
+        let detail_trimmed: Option<String> =
+            detail.map(|s| s.chars().take(255).collect());
+        // Truncate stage to 64 chars to match the dispatcher schema.
+        let stage_trimmed: String = stage.chars().take(64).collect();
+        let payload = json!({
+            "percent": percent.min(100),
+            "stage": stage_trimmed,
+            "detail": detail_trimmed,
+        });
+        self.agent
+            .post(&self.url(&format!("/api/worker/tasks/{task_id}/progress")))
+            .set("authorization", &self.auth_header())
+            .send_json(payload)?;
         Ok(())
     }
 }
@@ -585,6 +625,7 @@ fn run_task(app: &AppHandle, client: &CloudClient, claim: &TaskClaim) -> Result<
 
     let pipeline_result = run_pipeline(
         app,
+        client,
         claim,
         &input_zip,
         &extract_dir,
@@ -608,6 +649,12 @@ fn run_task(app: &AppHandle, client: &CloudClient, claim: &TaskClaim) -> Result<
         started_at_unix_ms: unix_ms(),
     }));
     let _ = app.emit("cloud://status-changed", ());
+    let _ = client.progress(
+        &task_id,
+        95,
+        "上传产物",
+        Some(&format!("{} bytes", output_bytes)),
+    );
     client.upload_output(&task_id, &output_zip)?;
 
     // ---- 7. complete ----
@@ -615,12 +662,14 @@ fn run_task(app: &AppHandle, client: &CloudClient, claim: &TaskClaim) -> Result<
     if let Some(obj) = full_summary.as_object_mut() {
         obj.insert("output_size".to_string(), json!(output_bytes));
     }
+    let _ = client.progress(&task_id, 100, "完成", None);
     client.complete(&task_id, &full_summary)?;
     Ok(())
 }
 
 fn run_pipeline(
     app: &AppHandle,
+    client: &CloudClient,
     claim: &TaskClaim,
     input_zip: &Path,
     extract_dir: &Path,
@@ -647,6 +696,11 @@ fn run_pipeline(
         started_at_unix_ms: unix_ms(),
     }));
     let _ = app.emit("cloud://status-changed", ());
+    // Best-effort progress push. We swallow the result so a flaky
+    // dispatcher network can't take down the worker — the local
+    // pipeline still runs and reports terminal success/failure at the
+    // end.
+    let _ = client.progress(&claim.id, 10, "解压输入", None);
     unzip_into(input_zip, extract_dir).map_err(CloudError::Pipeline)?;
 
     // ---- 3. scan + cut ----
@@ -657,6 +711,7 @@ fn run_pipeline(
         started_at_unix_ms: unix_ms(),
     }));
     let _ = app.emit("cloud://status-changed", ());
+    let _ = client.progress(&claim.id, 15, "扫描音频", None);
     let scan = scan_project_folder_impl(extract_dir.to_string_lossy().to_string(), None, None)
         .map_err(CloudError::Pipeline)?;
     if scan.audio_files.is_empty() {
@@ -665,7 +720,31 @@ fn run_pipeline(
         ));
     }
 
-    let cut_config = worker_config.cut.clone().unwrap_or_default();
+    // The mode the OWNER picked at upload time is the authoritative
+    // source. Override whatever the locally-cached worker config says
+    // so a Worker that's mid-edit doesn't accidentally process a
+    // semantic-mode task with dialect settings (or vice versa). Old
+    // dispatchers that don't send `mode` get the serde default of
+    // "dialect", which matches their pre-Mode-2 behaviour.
+    let mut cut_config = worker_config.cut.clone().unwrap_or_default();
+    cut_config.mode = match claim.mode.as_str() {
+        "semantic" => CutMode::Semantic,
+        _ => CutMode::Dialect,
+    };
+    let _ = client.progress(
+        &claim.id,
+        5,
+        if cut_config.mode == CutMode::Semantic {
+            "semantic-init"
+        } else {
+            "dialect-init"
+        },
+        Some(&format!(
+            "mode={} · sources={}",
+            claim.mode,
+            scan.audio_files.len()
+        )),
+    );
 
     // ---- Mode dispatch -------------------------------------------------
     // Dialect (default) → existing cut + recognize + JSONL bundle path.
@@ -673,9 +752,52 @@ fn run_pipeline(
     // WAV-per-segment per-source directly under `bundle_dir`; cloud
     // pipeline just zips and reports.
     if cut_config.mode == CutMode::Semantic {
+        // Mode 2 needs at least one Ollama endpoint capable of
+        // num_ctx ≥ 32K. The worker may not have Mode-2-specific config
+        // (semantic_ollama_endpoints / semantic_endpoint) set — that's
+        // a sane default for a worker that mostly runs Mode 1. Fall
+        // back to the worker's Mode 1 Ollama pool so cloud Mode 2
+        // "just works" out of the box without per-mode env JSON
+        // duplication. `semantic_num_ctx` (32768 by default) is
+        // enforced on the LLM request regardless of which endpoint
+        // serves it, so the only risk is the endpoint not having
+        // enough VRAM to load the model at that ctx size — same as
+        // the dedicated Mode 2 path.
+        if cut_config.semantic_ollama_endpoints.is_empty()
+            && cut_config.semantic_endpoint.trim().is_empty()
+        {
+            if !worker_config.ollama_extra_endpoints.is_empty() {
+                cut_config.semantic_ollama_endpoints = worker_config
+                    .ollama_extra_endpoints
+                    .iter()
+                    .map(|url| crate::OllamaEndpointDef {
+                        url: url.clone(),
+                        model: worker_config.ollama_model.clone(),
+                        enabled: true,
+                    })
+                    .collect();
+                eprintln!(
+                    "[cloud] Mode 2: promoted {} Mode 1 Ollama endpoint(s) → semantic pool",
+                    cut_config.semantic_ollama_endpoints.len()
+                );
+            } else if let Some(url) = worker_config.ollama_url.as_ref() {
+                cut_config.semantic_endpoint = url.clone();
+                if let Some(model) = worker_config.ollama_model.clone() {
+                    cut_config.semantic_model = model;
+                }
+                eprintln!("[cloud] Mode 2: promoted Mode 1 primary endpoint → semantic_endpoint");
+            }
+        }
+
         fs::create_dir_all(bundle_dir)?;
         let input_paths: Vec<String> =
             scan.audio_files.iter().map(|a| a.path.clone()).collect();
+        let _ = client.progress(
+            &claim.id,
+            25,
+            "语义切割",
+            Some(&format!("{} 个源文件", input_paths.len())),
+        );
         let result = run_semantic_pipeline_impl(
             app.clone(),
             input_paths.clone(),
@@ -691,16 +813,60 @@ fn run_pipeline(
                 result.errors.join("; ")
             )));
         }
+
+        // The semantic pipeline now produces Mode-1-compatible
+        // segments + a copy of the source under bundle_dir/source. We
+        // top that off with a project.json so Windows annotators can
+        // open the unzipped bundle directly in the Tauri client (the
+        // dialect cut path writes this file via `save_project_file`;
+        // here we assemble it inline since cloud worker doesn't keep
+        // a project state machine).
+        let _ = client.progress(&claim.id, 86, "写入 project.json", None);
+        let mut all_segments: Vec<SegmentRecord> = Vec::new();
+        let mut audio_files_json: Vec<serde_json::Value> = Vec::new();
+        for report in &result.reports {
+            // Each report's first segment carries the basename — pull
+            // one entry per source so audioFiles + segments line up.
+            if let Some(first_seg) = report.segments.first() {
+                audio_files_json.push(json!({
+                    // Use the segment-derived id so we don't pull in
+                    // uuid as a dep. AudioFileInfo.id is opaque to
+                    // the dispatcher / annotator UI.
+                    "id": first_seg.source_file_name.clone(),
+                    "path": first_seg.source_path.clone(),
+                    "fileName": first_seg.source_file_name.clone(),
+                    "matchedEmotion": Vec::<String>::new(),
+                }));
+            }
+            all_segments.extend(report.segments.iter().cloned());
+        }
+        let project_json = json!({
+            "version": 2,
+            "savedAt": format!("epoch_ms_{}", unix_ms()),
+            "rootPath": ".",
+            "projectDir": ".",
+            "segmentsDir": "./segments",
+            "config": &cut_config,
+            "audioFiles": audio_files_json,
+            "manifestRecords": Vec::<serde_json::Value>::new(),
+            "segments": &all_segments,
+        });
+        let project_path = bundle_dir.join("project.json");
+        fs::write(
+            &project_path,
+            serde_json::to_string_pretty(&project_json).map_err(|err| {
+                CloudError::Pipeline(format!("serialize project.json: {err}"))
+            })?,
+        )?;
+
+        let _ = client.progress(&claim.id, 88, "打包产物", None);
         zip_dir(bundle_dir, output_zip).map_err(CloudError::Pipeline)?;
         let output_bytes = fs::metadata(output_zip).map(|m| m.len()).unwrap_or(0);
         let total_segments: usize = result.reports.iter().map(|r| r.segment_count).sum();
-        let total_flagged: usize = result.reports.iter().map(|r| r.qa_flagged_indices.len()).sum();
         let summary = json!({
             "mode": "semantic",
             "segment_count": total_segments,
             "source_files": result.reports.len(),
-            "qa_flagged_count": total_flagged,
-            "xlsx_paths": result.reports.iter().map(|r| r.xlsx_path.clone()).collect::<Vec<_>>(),
             "asr_engine": worker_config
                 .whisper_model
                 .clone()
@@ -712,8 +878,15 @@ fn run_pipeline(
         return Ok((summary, output_bytes));
     }
 
+    let _ = client.progress(
+        &claim.id,
+        25,
+        "切割",
+        Some(&format!("{} 个源文件", scan.audio_files.len())),
+    );
+    let total_sources = scan.audio_files.len().max(1);
     let mut all_segments: Vec<SegmentRecord> = Vec::new();
-    for audio in &scan.audio_files {
+    for (idx, audio) in scan.audio_files.iter().enumerate() {
         let segs = cut_audio_file_impl(
             audio.path.clone(),
             scan.segments_dir.clone(),
@@ -726,6 +899,14 @@ fn run_pipeline(
         )
         .map_err(CloudError::Pipeline)?;
         all_segments.extend(segs);
+        // 25 -> 45 across the cutting phase, scaled by source count.
+        let pct = 25 + (20 * (idx + 1) / total_sources);
+        let _ = client.progress(
+            &claim.id,
+            pct as u8,
+            "切割",
+            Some(&format!("{} / {}", idx + 1, total_sources)),
+        );
     }
 
     if all_segments.is_empty() {
@@ -742,6 +923,12 @@ fn run_pipeline(
         started_at_unix_ms: unix_ms(),
     }));
     let _ = app.emit("cloud://status-changed", ());
+    let _ = client.progress(
+        &claim.id,
+        50,
+        "识别",
+        Some(&format!("{} 段", all_segments.len())),
+    );
     let recognition = recognize_segments_impl(
         app.clone(),
         scan.project_dir.clone(),
@@ -759,7 +946,14 @@ fn run_pipeline(
         started_at_unix_ms: unix_ms(),
     }));
     let _ = app.emit("cloud://status-changed", ());
+    let _ = client.progress(&claim.id, 85, "打包产物", None);
     fs::create_dir_all(bundle_dir)?;
+    // Set audio_file_prefix="./" so the JSONL export rewrites every
+    // segment path from the absolute worker temp dir (e.g.
+    // /private/var/folders/.../bundle/segments/...) to a path relative
+    // to the bundle root (./segments/...). Without this the downloader
+    // can't replay the bundle on their own machine — the absolute path
+    // only exists on the Mac that did the processing.
     export_dataset_bundle_impl(
         bundle_dir.to_string_lossy().to_string(),
         all_segments.clone(),
@@ -767,7 +961,7 @@ fn run_pipeline(
             system_prompt: None,
             pair_user_assistant: Some(true),
             use_source_audio_for_user: Some(false),
-            audio_file_prefix: None,
+            audio_file_prefix: Some(".".to_string()),
             input_root: Some(extract_dir.to_string_lossy().to_string()),
         },
         true,

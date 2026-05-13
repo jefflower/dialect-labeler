@@ -5,8 +5,10 @@
   --border: #e3e6ea;
   --text: #1f2328;
   --muted: #6e7681;
-  --accent: #0078d4;
-  --accent-hover: #106ebe;
+  /* Brand teal, harmonized with the Tauri client. */
+  --accent: #0d9488;
+  --accent-hover: #0b8278;
+  --accent-soft: rgba(13, 148, 136, 0.08);
   --danger: #d13438;
   --good: #107c10;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
@@ -120,46 +122,170 @@ input:focus, textarea:focus, select:focus {
 }
 
 /* ----- Login ----- */
-.login-card {
-  max-width: 380px;
-  margin: 80px auto;
+.login-shell {
+  /* Full-bleed teal-tinted gradient backdrop so the panel pops. The
+     dispatcher login is the first screen new uploaders ever see; we
+     want it to feel inviting instead of admin-y. */
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
+  background:
+    radial-gradient(1200px 600px at 15% -10%, rgba(13, 148, 136, 0.18), transparent 60%),
+    radial-gradient(900px 500px at 95% 110%, rgba(124, 58, 237, 0.10), transparent 55%),
+    linear-gradient(180deg, #fafbfc 0%, #f3f5f8 100%);
+}
+
+.login-panel {
+  width: 100%;
+  max-width: 400px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 28px;
-  box-shadow: var(--shadow);
+  border-radius: 14px;
+  padding: 32px 32px 24px;
+  box-shadow:
+    0 12px 32px rgba(15, 23, 42, 0.08),
+    0 2px 6px rgba(15, 23, 42, 0.04);
 }
-.login-card h1 {
+
+.login-brand {
+  text-align: center;
+  margin-bottom: 24px;
+}
+.login-logo {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 14px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #0d9488 0%, #0b8278 100%);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 6px 16px rgba(13, 148, 136, 0.32);
+}
+.login-panel h1 {
   margin: 0 0 6px;
-  font-size: 20px;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
 }
-.login-card .subtitle {
+.login-tagline {
+  margin: 0;
+  font-size: 13px;
   color: var(--muted);
+}
+
+/* Login / 注册 segmented switcher */
+.login-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: #f1f3f5;
+  border-radius: 10px;
   margin-bottom: 20px;
 }
-.login-card label {
-  display: block;
+.login-tabs button {
+  flex: 1;
+  background: transparent;
+  border: none;
+  padding: 8px 12px;
+  border-radius: 7px;
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 14px;
+}
+.login-tabs button.active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+}
+.login-tabs button:hover:not(.active) {
+  background: rgba(255, 255, 255, 0.5);
+  color: var(--text);
+}
+
+.login-form label {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  margin: 14px 0 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.login-form label:first-child { margin-top: 0; }
+.login-form input {
+  padding: 10px 12px;
+  font-size: 14px;
+  border-radius: 8px;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.login-form input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.login-hint {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.login-error {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(209, 52, 56, 0.08);
+  color: var(--danger);
+  font-size: 13px;
+  border: 1px solid rgba(209, 52, 56, 0.16);
+}
+
+.login-submit {
+  width: 100%;
+  margin-top: 20px;
+  padding: 11px;
+  font-size: 14px;
+  font-weight: 600;
+  border-radius: 8px;
+  letter-spacing: 0.02em;
+  /* Slight gradient + shadow lift to make this the obvious action. */
+  background: linear-gradient(180deg, #0d9488 0%, #0b8278 100%);
+  border: none;
+  box-shadow: 0 1px 2px rgba(13, 148, 136, 0.4);
+  transition: transform 0.06s ease, box-shadow 0.12s ease, opacity 0.12s ease;
+}
+.login-submit:hover:not(:disabled) {
+  box-shadow: 0 4px 12px rgba(13, 148, 136, 0.45);
+  transform: translateY(-1px);
+}
+.login-submit:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.login-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: login-spin 0.7s linear infinite;
+}
+@keyframes login-spin {
+  to { transform: rotate(360deg); }
+}
+
+.login-footnote {
+  margin: 18px 0 0;
   font-size: 12px;
   color: var(--muted);
-  margin: 12px 0 4px;
-}
-.login-card .error {
-  color: var(--danger);
-  margin-top: 12px;
-  font-size: 13px;
-}
-.login-card .mode-toggle {
-  margin-top: 14px;
-  font-size: 13px;
   text-align: center;
-  color: var(--muted);
-}
-.login-card .mode-toggle button {
-  background: none;
-  border: none;
-  padding: 0;
-  color: var(--accent);
-  cursor: pointer;
 }
 
 /* ----- Tasks ----- */

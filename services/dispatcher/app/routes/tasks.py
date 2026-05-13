@@ -35,11 +35,13 @@ from ..auth import CurrentUser
 from ..db import get_db
 from ..models import (
     ACTIVE_TASK_STATES,
+    MODE_DIALECT,
     TASK_CLOSED,
     TASK_EXPIRED,
     TASK_FAILED,
     TASK_PENDING,
     TASK_SUCCEEDED,
+    VALID_MODES,
     Task,
     User,
     utcnow,
@@ -67,6 +69,7 @@ def _task_to_out(task: Task, db: Session | None = None) -> TaskOut:
         "owner_id": task.owner_id,
         "name": task.name,
         "status": task.status,
+        "mode": task.mode or MODE_DIALECT,
         "input_size": task.input_size,
         "input_uploaded_at": task.input_uploaded_at,
         "output_size": task.output_size,
@@ -75,6 +78,10 @@ def _task_to_out(task: Task, db: Session | None = None) -> TaskOut:
         "files_cleaned_at": task.files_cleaned_at,
         "error": task.error,
         "summary": summary,
+        "progress_percent": task.progress_percent,
+        "progress_stage": task.progress_stage,
+        "progress_detail": task.progress_detail,
+        "progress_updated_at": task.progress_updated_at,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
         "completed_at": task.completed_at,
@@ -108,7 +115,17 @@ async def create_task(
     storage: Annotated[Storage, Depends(get_storage)],
     name: Annotated[str, Form(min_length=1, max_length=255)],
     file: Annotated[UploadFile, File()],
+    # `mode` is form-encoded alongside `name` and `file`. Default to
+    # `dialect` so old clients that don't know about Mode 2 keep working.
+    # Validation is explicit + early so a typo doesn't get persisted.
+    mode: Annotated[str, Form()] = MODE_DIALECT,
 ) -> TaskOut:
+    if mode not in VALID_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid mode '{mode}'. Expected one of {VALID_MODES}.",
+        )
+
     # Single-task-per-user gate. Reject BEFORE accepting the upload so
     # we don't spool a multi-GB zip to disk just to bounce it.
     existing = _active_task_for(db, user.id)
@@ -138,6 +155,7 @@ async def create_task(
         owner_id=user.id,
         name=name,
         status=TASK_PENDING,
+        mode=mode,
         input_path=key,
         input_size=size,
         input_uploaded_at=now,
@@ -300,6 +318,12 @@ def retry_task(
     # cycle. The cleaner will only promote to expired on FRESH failure
     # chains.
     task.attempts = 0
+    # Stale progress from the previous attempt would confuse the UI
+    # ("we're at 70%" but the task just restarted from zero).
+    task.progress_percent = None
+    task.progress_stage = None
+    task.progress_detail = None
+    task.progress_updated_at = None
     task.updated_at = utcnow()
     # Clear any half-uploaded output from a previous attempt.
     if task.output_path:

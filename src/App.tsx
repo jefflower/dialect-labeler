@@ -219,6 +219,66 @@ function App() {
     };
   }, []);
 
+  // Auto-resume Cloud Worker on app startup.
+  //
+  // CloudPane is a modal — its effects don't fire until the user opens
+  // it. For a "managed worker" install (this Mac sits on tailnet and
+  // serves as the processing node for everyone's uploads) we want the
+  // worker to come back online automatically after a relaunch / reboot
+  // without anyone touching the UI. The hook reads cloud-session.json,
+  // pushes the saved token to Rust, then — if the persisted
+  // `worker.autostart.v1` flag is set — also pushes the current
+  // workerConfig and flips worker_enabled on.
+  //
+  // The autostart flag is a SEPARATE key from the session key, so a
+  // user who logs in to inspect status but doesn't want the worker
+  // running doesn't accidentally end up with one running on the next
+  // launch.
+  const AUTOSTART_HANDLED_REF_KEY = "__cloud_autostart_handled__";
+  useEffect(() => {
+    if ((window as unknown as Record<string, boolean>)[AUTOSTART_HANDLED_REF_KEY])
+      return;
+    (window as unknown as Record<string, boolean>)[AUTOSTART_HANDLED_REF_KEY] = true;
+    let cancelled = false;
+    (async () => {
+      console.log("[autostart] effect fired");
+      try {
+        const { Store } = await import("@tauri-apps/plugin-store");
+        const store = await Store.load("cloud-session.json");
+        const saved = await store.get<{
+          baseUrl: string;
+          token: string;
+          user: { id: number; email: string; role: string };
+        }>("cloud.session.v1");
+        console.log("[autostart] saved session?", saved ? saved.baseUrl : "<none>");
+        if (!saved?.token || cancelled) return;
+        await ipc.cloudSetSession({
+          baseUrl: saved.baseUrl,
+          token: saved.token,
+          user: saved.user,
+        });
+        console.log("[autostart] cloud_set_session ok");
+        const autostart = await store.get<boolean>("cloud.workerAutostart.v1");
+        console.log("[autostart] autostart flag:", autostart);
+        if (autostart === true && !cancelled) {
+          await ipc.cloudSetWorkerConfig({ config: cloudWorkerConfig });
+          console.log("[autostart] cloud_set_worker_config ok");
+          await ipc.cloudSetWorkerEnabled({ enabled: true });
+          console.log("[autostart] cloud_set_worker_enabled(true) ok — worker should be claiming now");
+        }
+      } catch (err) {
+        console.warn("[autostart] cloud autostart skipped", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Intentionally [] — runs exactly once on first mount. cloudWorkerConfig
+    // changes shouldn't re-trigger autostart; the worker thread re-reads
+    // worker_config on each task claim.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const cycleTheme = useCallback(() => {
     const order = ["system", "light", "dark"] as const;
     const idx = order.indexOf(settings.theme);
@@ -708,14 +768,15 @@ function App() {
     });
 
     // Listen for stage transitions from the Rust orchestrator.
+    // Phases match the simplified pipeline (no loudnorm preprocess, no
+    // per-segment normalize/QA, no xlsx export — just pre-cut → ASR →
+    // semantic merge → cut WAVs).
     const phaseLabels: Record<string, string> = {
       starting: "准备",
-      preprocess: "loudnorm + 降噪",
       fine_pre_cut: "细预切",
       asr: "Whisper 识别",
       semantic_cut: "Qwen 语义切点",
-      normalise_qa: "规范化 + 自动 QA",
-      export: "导出 xlsx + WAV",
+      cutting_wavs: "导出 WAV 切片",
       done: "完成",
     };
     const unlisten = await listen<{
@@ -743,19 +804,27 @@ function App() {
       }));
     });
 
+    // Mode-2 cuts WAVs into a SEPARATE bundle directory beside the
+    // existing project so they don't collide with Mode-1 segments from
+    // the same run. The bundle gets its own project.json so the user
+    // (or a Windows annotator who downloads it) can open it as a
+    // fresh project via "打开" → select project.json. This matches the
+    // cloud worker's behaviour bit-for-bit.
+    const bundleDir = `${targetScan.projectDir}/mode2-bundle`;
+
     try {
       const result = await ipc.runSemanticPipeline({
         inputPaths: audioList.map((a) => a.path),
-        outDir: targetScan.segmentsDir,
+        outDir: bundleDir,
         config,
         recognitionOptions: {
           whisperModel: settings.whisperModel,
-          // Mode 2 uses普通话 Whisper hint; override any dialect prompt.
           initialPrompt:
             "以下是普通话口语对话/独白，请按发音转写为汉字稿。",
           useCache: settings.useAsrCache,
-          // Mode 2 has its own post-ASR normalisation (Phase 5 Qwen call);
-          // the dialect-flavour polish must not run.
+          // The new Mode-2 pipeline only does ASR + LLM-driven cut
+          // boundary decision. No per-segment polish — that's the
+          // standard "AI 重打标签" workflow the annotator runs by hand.
           useLlm: false,
           ollamaUrl: settings.ollamaUrl,
           ollamaModel: settings.ollamaModel,
@@ -768,15 +837,50 @@ function App() {
       const okCount = result.reports.length;
       const errCount = result.errors.length;
       if (okCount > 0) {
+        // Assemble project.json from the segments + a fresh audioFiles
+        // entry per source. Matches the cloud worker's shape so the
+        // resulting bundle opens identically in the Tauri client.
+        const audioFiles = result.reports
+          .map((r) => {
+            const first = r.segments[0];
+            if (!first) return null;
+            return {
+              id: first.sourceFileName,
+              path: first.sourcePath,
+              fileName: first.sourceFileName,
+              matchedEmotion: [] as string[],
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null);
+        const allSegments = result.reports.flatMap((r) => r.segments);
+        const projectFile: ProjectFile = {
+          version: 2,
+          savedAt: new Date().toISOString(),
+          rootPath: ".",
+          projectDir: ".",
+          segmentsDir: "./segments",
+          config,
+          audioFiles,
+          manifestRecords: [],
+          segments: allSegments,
+          systemPrompt: settings.systemPrompt,
+        };
+        try {
+          await ipc.saveProjectFile({
+            projectDir: bundleDir,
+            payload: projectFile,
+          });
+        } catch (writeErr) {
+          console.warn("[mode2] project.json write failed", writeErr);
+        }
+        const totalSegments = result.reports.reduce(
+          (acc, r) => acc + r.segmentCount,
+          0,
+        );
         pushToast({
           variant: "success",
-          title: `模式 2 完成 · ${okCount} 个文件`,
-          detail: result.reports
-            .map(
-              (r) =>
-                `${r.sourcePath.split(/[\\/]/).pop()} → ${r.segmentCount} 段 · QA 标记 ${r.qaFlaggedIndices.length}`,
-            )
-            .join("\n"),
+          title: `模式 2 完成 · ${totalSegments} 段`,
+          detail: `产物在 ${bundleDir}。可直接通过「打开」加载，或拷贝到 Windows 标注。`,
         });
       }
       if (errCount > 0) {
@@ -2228,9 +2332,6 @@ function App() {
           open={settingsOpen}
           settings={settings}
           onChange={updateSettings}
-          onResetPrompt={resetLlmPrompt}
-          onPurgeOrphanTags={purgeOrphanInlineTags}
-          onMigrateSegmentFilenames={migrateSegmentFilenames}
           onClose={() => setSettingsOpen(false)}
         />
         {!REVIEW_ONLY && (
@@ -2268,6 +2369,13 @@ function App() {
           onExport={exportJsonl}
           onExportBundle={exportBundle}
           onCloseProject={closeWorkspace}
+          mode={HIDE_PROCESSING_UI ? undefined : (config.mode ?? "dialect")}
+          onModeChange={
+            HIDE_PROCESSING_UI
+              ? undefined
+              : (next) => updateCutConfig({ ...config, mode: next })
+          }
+          modeLocked={Boolean(scan)}
         />
         <div className="app-body">
           <SetupBand
@@ -2307,6 +2415,11 @@ function App() {
                 updateSettings({ ollamaExtraEndpoints: next })
               }
               ollamaModelDefault={settings.ollamaModel}
+              settings={settings}
+              onSettingsChange={updateSettings}
+              onResetLlmPrompt={resetLlmPrompt}
+              onPurgeOrphanTags={purgeOrphanInlineTags}
+              onMigrateSegmentFilenames={migrateSegmentFilenames}
               pendingCount={
                 segments.filter((s) => {
                   const asrDone = s.phoneticText.trim().length > 0;
@@ -2370,9 +2483,6 @@ function App() {
         open={settingsOpen}
         settings={settings}
         onChange={updateSettings}
-        onResetPrompt={resetLlmPrompt}
-          onPurgeOrphanTags={purgeOrphanInlineTags}
-          onMigrateSegmentFilenames={migrateSegmentFilenames}
         onClose={() => setSettingsOpen(false)}
       />
       {!REVIEW_ONLY && (

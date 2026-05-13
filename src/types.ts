@@ -90,6 +90,27 @@ export type CutConfig = {
    *  must point at a `faster-whisper-server` instance (or compatible
    *  `/transcribe` API). */
   semanticWhisperEndpoints?: WhisperEndpointDef[];
+
+  /** Sliding-window size in seconds for Mode 2. Default = `maxSegmentS`
+   *  (so window AND segment cap are the same knob until you decouple).
+   *  Set higher than `maxSegmentS` for more LLM lookahead context per
+   *  window at the cost of slower per-iteration Whisper calls. */
+  semanticWindowS?: number;
+
+  /** Override the LLM "where do I cut?" prompt template. The default
+   *  is tuned for Mandarin / Changsha dialect; swap for other dialects
+   *  / languages (Taiwanese / English / etc.). Placeholders the engine
+   *  substitutes at call time:
+   *
+   *    `{transcript}` — Whisper segments table (always appended even
+   *                     if missing from the template)
+   *    `{window_ms}`  — window size in ms
+   *    `{min_ms}`     — min segment ms
+   *    `{max_s}`      — max segment seconds (one decimal)
+   *    `{sweet_lo}` / `{sweet_hi}` — sweet-spot bounds in ms
+   *
+   *  Empty / undefined → built-in Mandarin/Changsha default. */
+  semanticCutPrompt?: string;
 };
 
 export type CutPresetDef = {
@@ -253,10 +274,16 @@ export type ProjectFile = {
 /** Per-source-file report from `run_semantic_pipeline`. */
 export type SemanticPipelineFileReport = {
   sourcePath: string;
-  xlsxPath: string;
   segmentCount: number;
-  /** Indices of segments where Phase 6 auto-QA flagged at least one issue. */
-  qaFlaggedIndices: number[];
+  /** Mode-1-compatible segment records. Caller (frontend) merges these
+   *  into the current project so the user can annotate immediately
+   *  without reloading. Each path is relative to the bundle root,
+   *  e.g. `./segments/<basename>_NNNN_<startMs>-<endMs>.wav`. */
+  segments: SegmentRecord[];
+  /** Absolute path of the copied source WAV inside the bundle's
+   *  `source/` subdir, useful if the caller needs to attach a fresh
+   *  AudioFileInfo. */
+  sourceCopyPath: string;
 };
 
 /** Result of one `run_semantic_pipeline` invocation. The pipeline

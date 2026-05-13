@@ -26,6 +26,11 @@ export interface TaskSummary {
   [k: string]: unknown;
 }
 
+/** Cut algorithm picked at upload time. Mirrors the Tauri client's
+ *  CutMode union; the dispatcher stores it on the Task row and feeds
+ *  it back to the Worker so the user's choice is authoritative. */
+export type TaskMode = "dialect" | "semantic";
+
 export interface Task {
   id: string;
   owner_id: number;
@@ -36,7 +41,10 @@ export interface Task {
     | "running"
     | "succeeded"
     | "failed"
-    | "expired";
+    | "expired"
+    | "closed";
+  /** Defaults to "dialect" when the column is absent (older dispatcher). */
+  mode: TaskMode;
   input_size: number | null;
   input_uploaded_at: string | null;
   output_size: number | null;
@@ -45,6 +53,11 @@ export interface Task {
   files_cleaned_at: string | null;
   error: string | null;
   summary: TaskSummary | null;
+  /** Worker-pushed progress snapshot. NULL until the first push lands. */
+  progress_percent: number | null;
+  progress_stage: string | null;
+  progress_detail: string | null;
+  progress_updated_at: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -153,10 +166,11 @@ export function getTask(id: string) {
   return request<Task>(`/api/tasks/${id}`);
 }
 
-export function createTask(name: string, file: File) {
+export function createTask(name: string, file: File, mode: TaskMode = "dialect") {
   const fd = new FormData();
   fd.append("name", name);
   fd.append("file", file);
+  fd.append("mode", mode);
   return request<Task>("/api/tasks", { method: "POST", body: fd });
 }
 
