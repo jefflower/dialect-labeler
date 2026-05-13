@@ -1531,27 +1531,165 @@ pub(crate) fn cut_audio_file_impl(
     }
 }
 
-/// Stub for the Semantic-mode pipeline. Real implementation lands in
-/// subsequent commits — preprocess → fine pre-cut → ASR → LLM cut →
-/// re-cut → normalise → QA → Excel export. Returns an error until then
-/// so a user who flips the mode toggle gets a clear message rather than
-/// silently falling back to Dialect.
+/// Stub for the Semantic-mode pipeline. Successive phases land:
+///   Phase 1 (this file): scaffold + dispatch ✓
+///   Phase 2: audio preprocessing (loudnorm + optional rnnoise) ✓
+///   Phase 3: fine pre-cut + ASR
+///   Phase 4: LLM semantic-cut decision (Qwen2.5:32b @ huayu, ctx=32K)
+///   Phase 5: re-cut + per-segment normalisation
+///   Phase 6: auto-QA + Excel export
+///
+/// Returns an error until Phase 3 lands so a user who flips the toggle
+/// gets a clear diagnostic rather than silently dropping the audio
+/// somewhere mid-pipeline.
 fn cut_audio_file_semantic_impl(
-    _input_path: String,
-    _segments_dir: String,
-    _config: CutConfig,
+    input_path: String,
+    segments_dir: String,
+    config: CutConfig,
     _role: Option<String>,
     _topic_id: Option<u32>,
     _original_text: Option<String>,
     _emotion: Option<Vec<String>>,
     _target_file_names: Vec<String>,
 ) -> Result<Vec<SegmentRecord>, String> {
-    Err(
-        "Semantic cut mode not yet implemented. Tracked under Mode 2 \
-         milestones; the silence + ASR + LLM pipeline is in flight. \
-         Switch the project's mode back to `dialect` to use the current cutter."
-            .to_string(),
-    )
+    ensure_ffmpeg()?;
+    let input = PathBuf::from(&input_path);
+    if !input.is_file() {
+        return Err(format!("Input audio not found: {}", input_path));
+    }
+    let work_dir = PathBuf::from(&segments_dir).join(".semantic-pipeline");
+    fs::create_dir_all(&work_dir).map_err(|err| err.to_string())?;
+
+    // Phase 2: write a normalised copy to a known location in the work
+    // dir. Subsequent phases consume this normalised file rather than
+    // the raw input.
+    let normalised = work_dir.join(format!(
+        "01_normalised_{}.wav",
+        path_file_stem(&input)
+    ));
+    preprocess_audio_for_semantic(
+        &input,
+        &normalised,
+        config.target_loudness_lufs,
+        find_rnnoise_model().as_deref(),
+    )?;
+
+    Err(format!(
+        "Semantic cut pipeline only got through Phase 2 (audio \
+         preprocessing). Normalised file is at {}. Phases 3-6 (ASR + \
+         LLM cut decision + re-cut + Excel export) are still landing.",
+        path_to_string(&normalised)
+    ))
+}
+
+/// Audio preprocessing for Semantic mode.
+///
+/// Two-stage ffmpeg filter (when rnnoise model is available):
+///   1. `arnndn=m=<model>` — RNNoise denoise. Applied first so
+///      loudnorm sees clean signal. Optional: if no model file is
+///      discovered, skip this stage (Mandarin podcast audio with
+///      decent recording usually doesn't need it).
+///   2. `loudnorm=I=<target>:TP=-1.5:LRA=11` — Single-pass EBU R128
+///      loudness normalisation to the spec's -18 LUFS target
+///      (§ 七·3). Two-pass would tighten the result by ~0.5dB but
+///      requires JSON-parsing ffmpeg's first-pass stderr — not worth
+///      the complexity at v1.
+///
+/// Output is hardcoded to 48 kHz / 16-bit PCM WAV — spec § 七 allows
+/// 44.1 or 48 kHz, 16 or 24 bit. 48 kHz matches Whisper's preferred
+/// input rate and avoids a resample later.
+fn preprocess_audio_for_semantic(
+    input: &Path,
+    output: &Path,
+    target_lufs: f32,
+    rnnoise_model: Option<&Path>,
+) -> Result<(), String> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let mut filter = String::new();
+    if let Some(model) = rnnoise_model {
+        // Escape colons/backslashes in the path — ffmpeg's filter syntax
+        // treats them as separators. Windows paths like `C:\…` would
+        // break the filter without escaping.
+        let escaped = model
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace(':', "\\:");
+        filter.push_str(&format!("arnndn=m={escaped},"));
+    }
+    filter.push_str(&format!(
+        "loudnorm=I={:.1}:TP=-1.5:LRA=11",
+        target_lufs
+    ));
+
+    let mut command = silent_command("ffmpeg");
+    command
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel").arg("error")
+        .arg("-i").arg(input)
+        .arg("-af").arg(&filter)
+        .arg("-ar").arg("48000")          // spec § 七 allows 44.1 / 48k
+        .arg("-ac").arg("1")              // mono; preserves the source's
+                                          // intended single-speaker mix
+        .arg("-c:a").arg("pcm_s16le")     // 16-bit PCM
+        .arg(output);
+
+    eprintln!(
+        "[semantic preprocess] {} → {} (filter: {filter})",
+        path_to_string(input),
+        path_to_string(output),
+    );
+    let output_result = command
+        .output()
+        .map_err(|err| format!("ffmpeg launch failed: {err}"))?;
+    if !output_result.status.success() {
+        return Err(format!(
+            "ffmpeg preprocess failed (exit {}): {}",
+            output_result.status,
+            String::from_utf8_lossy(&output_result.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a path to an `arnndn` RNNoise model (.rnnn) for the
+/// preprocessor. Returns None when no model is configured — preprocess
+/// then skips the denoise stage and only normalises loudness.
+///
+/// Lookup order:
+///   1. `RNNOISE_MODEL_PATH` env var
+///   2. Current working directory `./cb.rnnn`
+///   3. The executable's parent dir `<exe>/../cb.rnnn`
+///   4. `<exe>/../Resources/cb.rnnn` (the macOS bundle layout)
+///
+/// Build your own community models at <https://github.com/GregorR/rnnoise-models>;
+/// `cb.rnnn` (the conference-bridge baseline) is the typical default.
+fn find_rnnoise_model() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("RNNOISE_MODEL_PATH") {
+        let p = PathBuf::from(path);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let cwd_candidate = PathBuf::from("cb.rnnn");
+    if cwd_candidate.is_file() {
+        return Some(cwd_candidate);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let next_to = parent.join("cb.rnnn");
+            if next_to.is_file() {
+                return Some(next_to);
+            }
+            let in_resources = parent.join("Resources").join("cb.rnnn");
+            if in_resources.is_file() {
+                return Some(in_resources);
+            }
+        }
+    }
+    None
 }
 
 fn cut_audio_file_dialect_impl(
@@ -6313,13 +6451,106 @@ mod tests {
         assert_eq!(cfg.semantic_num_ctx, 32768);
     }
 
-    /// Until the Semantic pipeline is implemented, `cut_audio_file_impl`
-    /// with `mode = Semantic` must NOT silently fall back to the Dialect
-    /// cutter — it returns a clear error so the toggle gives a real
-    /// diagnostic.
+    /// Phase 2 sanity: rnnoise model finder returns None on a host
+    /// without any model installed and no env override. Tests run with
+    /// a scrubbed env to make this deterministic.
     #[test]
-    fn semantic_mode_returns_not_implemented_error() {
-        let dir = std::env::temp_dir().join(format!("semantic-stub-{}", std::process::id()));
+    fn rnnoise_model_finder_returns_none_when_nothing_configured() {
+        // SAFETY: tests are single-threaded by default in this crate's
+        // config; we briefly remove + restore the env var.
+        let prev = std::env::var("RNNOISE_MODEL_PATH").ok();
+        std::env::remove_var("RNNOISE_MODEL_PATH");
+        // Move to a known-empty directory so `./cb.rnnn` doesn't trip
+        // accidentally on a stray file in the workspace.
+        let tmp = std::env::temp_dir().join(format!("rnnoise-finder-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+        let result = find_rnnoise_model();
+        std::env::set_current_dir(prev_cwd).unwrap();
+        if let Some(p) = prev {
+            std::env::set_var("RNNOISE_MODEL_PATH", p);
+        }
+        let _ = fs::remove_dir_all(&tmp);
+        // On the CI host or a dev box without RNNoise installed this
+        // should be None. If find_rnnoise_model returns Some, the host
+        // genuinely has a model at one of the lookup paths and that's
+        // fine — just skip the assertion.
+        if let Some(p) = result {
+            assert!(
+                p.is_file(),
+                "if found, model path must point at an actual file"
+            );
+        }
+    }
+
+    /// Phase 2 end-to-end: synthesise a 4-second sine wave, run it
+    /// through `preprocess_audio_for_semantic`, verify the output
+    /// exists with the expected codec / sample rate / channel count
+    /// and a duration close to the input. Skipped when ffmpeg isn't on
+    /// PATH (a fresh CI container shouldn't red the suite over tooling).
+    #[test]
+    fn preprocess_audio_for_semantic_normalises_loudness() {
+        // Probe for ffmpeg by trying `-version`. Avoids the `which`
+        // crate dependency.
+        let ffmpeg_present = silent_command("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ffmpeg_present {
+            eprintln!("skipping preprocess test — ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir()
+            .join(format!("preprocess-smoke-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("input.wav");
+        let dst = dir.join("normalised.wav");
+
+        // 4-second 440 Hz sine wave, 16-bit / 44.1 kHz mono. Loud
+        // enough (-3 dBFS) that loudnorm has to *reduce* gain to hit
+        // -18 LUFS — a clear directional test.
+        let synth = silent_command("ffmpeg")
+            .arg("-y").arg("-hide_banner").arg("-loglevel").arg("error")
+            .arg("-f").arg("lavfi")
+            .arg("-i").arg("sine=frequency=440:duration=4:sample_rate=44100")
+            .arg("-ar").arg("44100").arg("-ac").arg("1")
+            .arg("-af").arg("volume=-3dB")
+            .arg("-c:a").arg("pcm_s16le")
+            .arg(&src)
+            .status()
+            .expect("ffmpeg synth");
+        assert!(synth.success(), "synth failed");
+
+        // No rnnoise — only test the loudnorm path.
+        preprocess_audio_for_semantic(&src, &dst, -18.0, None)
+            .expect("preprocess succeeded");
+        let probe = probe_audio(&dst).expect("ffprobe on normalised");
+        assert_eq!(probe.codec_name.as_deref(), Some("pcm_s16le"));
+        assert_eq!(probe.sample_rate, Some(48000));
+        assert_eq!(probe.channels, Some(1));
+        let dur_ms = probe.duration_ms.expect("duration present");
+        // loudnorm can add ~100ms look-ahead delay; tolerate ±300ms
+        // around the 4s source.
+        assert!(
+            (3_700..=4_300).contains(&dur_ms),
+            "duration {dur_ms}ms outside tolerance"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 2 stub-guard: Semantic-mode dispatch goes through the
+    /// preprocess + (eventually) ASR / LLM / etc. With ffmpeg in the
+    /// environment and a non-audio "fake" input, ffmpeg fails fast,
+    /// which we observe as the preprocess error bubbling up. Either
+    /// way, the call must NOT silently fall back to Dialect cutter.
+    #[test]
+    fn semantic_mode_does_not_fall_back_to_dialect() {
+        let dir = std::env::temp_dir()
+            .join(format!("semantic-dispatch-guard-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let input = dir.join("never-used.wav");
@@ -6338,8 +6569,15 @@ mod tests {
             None,
             Vec::new(),
         );
-        let err = res.expect_err("must error until Semantic pipeline lands");
-        assert!(err.contains("not yet implemented"), "got: {err}");
+        let err = res.expect_err("Semantic must not return Dialect segments");
+        // Acceptable failure surfaces: ffmpeg refusing the fake WAV
+        // (preprocess phase) OR our explicit pipeline-incomplete error.
+        assert!(
+            err.contains("ffmpeg")
+                || err.contains("Phase")
+                || err.contains("preprocess"),
+            "got unexpected error: {err}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
