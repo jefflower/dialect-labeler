@@ -1677,6 +1677,7 @@ fn cut_audio_file_semantic_impl(
 ///   - pre/post_roll: 50 each (small safety margin; spec § 二·三·1
 ///     mandates ≥150 ms head/tail in the FINAL output, but Phase 4
 ///     adds extra padding when it emits final cuts)
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 fn fine_pre_cut_for_semantic(
     input: &Path,
     pieces_dir: &Path,
@@ -1737,6 +1738,7 @@ fn fine_pre_cut_for_semantic(
 // unit" segments per spec § 二·切句规则.
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) struct SemanticCutDecision {
     pub(crate) start_ms: u64,
     pub(crate) end_ms: u64,
@@ -1745,6 +1747,7 @@ pub(crate) struct SemanticCutDecision {
 
 /// One ASRed pre-cut piece — input to Phase 4.
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) struct AsredPiece {
     pub(crate) text: String,
     pub(crate) start_ms: u64,
@@ -1760,6 +1763,7 @@ pub(crate) struct AsredPiece {
 ///
 /// Kept pure (no I/O, no logging) so unit tests can pin the wording
 /// without mocking ureq.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) fn build_semantic_cut_prompt(
     pieces: &[AsredPiece],
     candidates_ms: &[u64],
@@ -1818,6 +1822,7 @@ pub(crate) fn build_semantic_cut_prompt(
 /// Anything missing fields or with non-numeric ms values gets rejected
 /// with a diagnostic — the orchestrator can either retry, fall back to
 /// silence-only cuts, or surface the error.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) fn parse_semantic_cut_response(
     raw: &str,
 ) -> Result<Vec<SemanticCutDecision>, String> {
@@ -1894,6 +1899,7 @@ fn truncate_for_log(s: &str, max_chars: usize) -> String {
 ///
 /// Note: segments don't have to COVER the entire input — spec § 二·四
 /// allows dropping unusable bits (long silence / mumble / noise).
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) fn validate_semantic_cuts(
     decisions: &mut [SemanticCutDecision],
     candidates_ms: &[u64],
@@ -1988,6 +1994,7 @@ pub(crate) fn validate_semantic_cuts(
 /// parse_semantic_cut_response, validate_semantic_cuts) are unit-tested
 /// without any network; this function is only covered by an integration
 /// test that requires a reachable Ollama endpoint and is gated on env.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) fn llm_decide_semantic_cuts(
     pieces: &[AsredPiece],
     candidates_ms: &[u64],
@@ -2044,6 +2051,7 @@ pub(crate) fn llm_decide_semantic_cuts(
     Err(format!("Mode 2 LLM 池全部失败：{}", errors.join(" ; ")))
 }
 
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 fn llm_decide_semantic_cuts_one_endpoint(
     endpoint_url: &str,
     model: &str,
@@ -2110,6 +2118,7 @@ fn llm_decide_semantic_cuts_one_endpoint(
 /// System prompt for per-segment Mandarin normalisation. Pure constant
 /// so test cases can assert the wording without rebuilding the prompt
 /// every time.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) const SEMANTIC_NORMALIZE_PROMPT: &str = "\
 你是一个普通话录音转写规范化助手。任务：把下面一段 ASR 的初稿改写成符合规范的最终转写文本。
 
@@ -2144,6 +2153,7 @@ pub(crate) const SEMANTIC_NORMALIZE_PROMPT: &str = "\
 /// falls back to the raw ASR text rather than blocking the whole
 /// pipeline — Phase 6's auto-QA will surface the segment as needing
 /// human review.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) fn llm_normalize_segment_text(
     raw_asr: &str,
     config: &CutConfig,
@@ -2170,6 +2180,7 @@ pub(crate) fn llm_normalize_segment_text(
     Err(format!("Mode 2 normalize 池全部失败：{}", errors.join(" ; ")))
 }
 
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 fn llm_normalize_segment_text_one_endpoint(
     endpoint_url: &str,
     model: &str,
@@ -2226,6 +2237,7 @@ fn llm_normalize_segment_text_one_endpoint(
 /// shape `{"text": "<final text>"}` and returns the text trimmed.
 /// Reject empty text — that's a model failure and the orchestrator
 /// will fall back to raw ASR.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) fn parse_semantic_normalize_response(raw: &str) -> Result<String, String> {
     let value: Value = serde_json::from_str(raw.trim()).map_err(|err| {
         format!(
@@ -2263,6 +2275,7 @@ pub(crate) fn parse_semantic_normalize_response(raw: &str) -> Result<String, Str
 /// QA-flag every problem the normalised text + duration alone can
 /// surface. Returns a flat list of Chinese issue descriptions in spec
 /// terminology — the Excel's `问题记录` column joins them with `；`.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) fn auto_qa_segment(
     text: &str,
     duration_ms: u64,
@@ -3053,6 +3066,7 @@ async fn run_semantic_pipeline(
 // and one xlsx that the QA team opens directly.
 
 /// One row of the export deliverable.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) struct SemanticExportSegment {
     pub(crate) start_ms: u64,
     pub(crate) end_ms: u64,
@@ -3067,6 +3081,7 @@ pub(crate) struct SemanticExportSegment {
 /// `spkA_Freetalk_freetalk_260101_40m`). `seq_one_based` starts at 1.
 ///
 /// Output: `<spec_stem>_<NNNNNN>.wav` (six-digit zero-padded sequence).
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) fn semantic_segment_filename(spec_stem: &str, seq_one_based: usize) -> String {
     format!("{spec_stem}_{:06}.wav", seq_one_based)
 }
@@ -3077,6 +3092,7 @@ pub(crate) fn semantic_segment_filename(spec_stem: &str, seq_one_based: usize) -
 /// the variant `spkA_Freetalk_freetalk_260101_40m.wav`. When the
 /// filename doesn't match the spec, returns the bare file stem — the
 /// reviewer can then rename in their delivery script.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) fn derive_spec_stem(source_path: &Path) -> String {
     let stem = path_file_stem(source_path);
     // Strip a trailing `_<digits>` sequence marker if present, so a
@@ -3092,6 +3108,7 @@ pub(crate) fn derive_spec_stem(source_path: &Path) -> String {
 /// Source file naming (spec § 四·一):
 ///   `<spec_stem>_<NNNNNN>.wav`
 /// The xlsx is named `<spec_stem>.xlsx` next to the WAVs.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 pub(crate) fn export_semantic_mode(
     out_dir: &Path,
     normalised_source: &Path,
@@ -3128,6 +3145,7 @@ pub(crate) fn export_semantic_mode(
 /// without ffmpeg / a source file. Schema:
 ///
 ///   | 源文件名 | 剪辑文件名 | 转写内容 | 问题记录 |
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 fn write_semantic_xlsx(
     out: &Path,
     source_basename: &str,
@@ -3207,6 +3225,7 @@ fn write_semantic_xlsx(
 /// Output is hardcoded to 48 kHz / 16-bit PCM WAV — spec § 七 allows
 /// 44.1 or 48 kHz, 16 or 24 bit. 48 kHz matches Whisper's preferred
 /// input rate and avoids a resample later.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 fn preprocess_audio_for_semantic(
     input: &Path,
     output: &Path,
@@ -3275,6 +3294,7 @@ fn preprocess_audio_for_semantic(
 ///
 /// Build your own community models at <https://github.com/GregorR/rnnoise-models>;
 /// `cb.rnnn` (the conference-bridge baseline) is the typical default.
+#[allow(dead_code)] // legacy Mode 2 v1 — superseded by sliding-window (Phase 8); see HANDOFF.md
 fn find_rnnoise_model() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("RNNOISE_MODEL_PATH") {
         let p = PathBuf::from(path);
@@ -5850,11 +5870,11 @@ pub(crate) struct WhisperSegment {
     pub(crate) text: String,
 }
 
-/// Full Whisper transcribe response — text concatenated across all
-/// segments plus the segments themselves with timing.
+/// Whisper transcribe response — just the per-utterance segments
+/// with timing. (The full-text concat field was dropped — the sliding
+/// cutter only ever inspects `segments[]` to find cut candidates.)
 #[derive(Clone, Debug)]
 pub(crate) struct WhisperResult {
-    pub(crate) full_text: String,
     pub(crate) segments: Vec<WhisperSegment>,
 }
 
@@ -5920,11 +5940,6 @@ fn transcribe_remote_with_segments(
         .map_err(|err| format!("whisper 响应读取失败：{}", err))?;
     let value: Value = serde_json::from_str(&raw)
         .map_err(|err| format!("whisper 响应非法 JSON：{} (body={})", err, raw))?;
-    let full_text = value
-        .get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
     let segments: Vec<WhisperSegment> = value
         .get("segments")
         .and_then(|v| v.as_array())
@@ -5948,10 +5963,7 @@ fn transcribe_remote_with_segments(
                 .collect()
         })
         .unwrap_or_default();
-    Ok(WhisperResult {
-        full_text,
-        segments,
-    })
+    Ok(WhisperResult { segments })
 }
 
 fn transcribe_remote(

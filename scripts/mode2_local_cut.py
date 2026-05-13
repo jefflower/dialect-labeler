@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 """
-Local Mode-2 semantic cutter.
+Local Mode-2 semantic cutter — REFERENCE PROTOTYPE.
+
+⚠️  This script was the algorithm prototype that later got ported to
+Rust. The production path is now the Tauri client / cloud worker
+(`run_semantic_pipeline_impl` in src-tauri/src/lib.rs) which uses a
+DIFFERENT algorithm — **sliding window**, not pre-cut + merge.
+
+This script's pre-cut + global LLM-merge pass had problems in
+practice (LLM context pressure, candidate-pool boundary mismatches);
+the Rust path replaced it. Keep this file around as:
+  · a runnable algorithm prototype for the next iteration
+  · a no-Tauri-stack way to smoke-test Whisper / Ollama endpoints
+  · a tutorial showing the conceptual pipeline
+
+Do NOT route real workflows through this — use the cloud upload page
+or the Tauri client's Mode 2 panel instead.
 
 Given a long mono WAV, this script:
   1. Pre-cuts on silence into ~10-25s pieces
