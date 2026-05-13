@@ -2153,6 +2153,301 @@ pub(crate) fn auto_qa_segment(
 }
 
 // ===========================================================================
+// Phase 8 — Top-level Semantic-mode orchestrator
+// ===========================================================================
+//
+// Stitches Phases 2-7 together for one or more input WAVs. Tauri
+// command surface: `run_semantic_pipeline`. The function is sync and
+// dispatched onto the blocking thread pool so it can call the existing
+// `recognize_segments_impl` without async plumbing.
+//
+// Output layout (spec § 四·(三) "按文件夹提交"):
+//   out_dir/
+//     <stem1>/
+//       <stem1>_000001.wav
+//       <stem1>_000002.wav
+//       …
+//       <stem1>.xlsx
+//     <stem2>/…
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SemanticPipelineFileReport {
+    pub(crate) source_path: String,
+    pub(crate) xlsx_path: String,
+    pub(crate) segment_count: usize,
+    /// Soft warnings — pipeline succeeded but Phase 6 flagged at least
+    /// one segment. Listed by segment index.
+    pub(crate) qa_flagged_indices: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SemanticPipelineResult {
+    pub(crate) reports: Vec<SemanticPipelineFileReport>,
+    /// Aggregated error trace. The orchestrator processes every input
+    /// even if some fail; this collects the individual failures.
+    pub(crate) errors: Vec<String>,
+}
+
+/// Run the full Semantic pipeline for each input file.
+///
+/// Caller responsibility: a sane `config.semantic_endpoint` (Phase 4
+/// otherwise refuses). The `recognition_options` is passed to the ASR
+/// step; set `use_llm = Some(false)` because Mode 2 doesn't want the
+/// dialect-style polish — Phase 5's spec-driven normalisation runs
+/// instead.
+pub(crate) fn run_semantic_pipeline_impl(
+    app: tauri::AppHandle,
+    input_paths: Vec<String>,
+    out_dir: String,
+    config: CutConfig,
+    recognition_options: RecognitionOptions,
+) -> Result<SemanticPipelineResult, String> {
+    use tauri::Emitter as _;
+    ensure_ffmpeg()?;
+    if input_paths.is_empty() {
+        return Err("no input audio paths supplied".into());
+    }
+    if config.mode != CutMode::Semantic {
+        return Err(format!(
+            "run_semantic_pipeline only supports mode=semantic (got {:?})",
+            config.mode
+        ));
+    }
+    let out_root = PathBuf::from(&out_dir);
+    fs::create_dir_all(&out_root).map_err(|err| err.to_string())?;
+
+    // ASR options are forced into "ASR only" shape. Mode 2 has its own
+    // post-ASR pipeline (Phase 5) so the dialect-flavour polish must
+    // not run on these short pieces.
+    let mut asr_options = recognition_options.clone();
+    asr_options.use_llm = Some(false);
+
+    let mut reports: Vec<SemanticPipelineFileReport> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    let total = input_paths.len();
+    for (idx, input_path) in input_paths.iter().enumerate() {
+        let _ = app.emit(
+            "semantic:progress",
+            &serde_json::json!({
+                "source": input_path,
+                "current": idx + 1,
+                "total": total,
+                "phase": "starting",
+            }),
+        );
+        match process_single_semantic_file(
+            &app,
+            input_path,
+            &out_root,
+            &config,
+            &asr_options,
+        ) {
+            Ok(report) => reports.push(report),
+            Err(err) => {
+                eprintln!("[semantic] {input_path}: {err}");
+                errors.push(format!("{input_path}: {err}"));
+            }
+        }
+    }
+
+    let _ = app.emit(
+        "semantic:progress",
+        &serde_json::json!({"phase": "done", "ok": errors.is_empty()}),
+    );
+    Ok(SemanticPipelineResult { reports, errors })
+}
+
+fn process_single_semantic_file(
+    app: &tauri::AppHandle,
+    input_path: &str,
+    out_root: &Path,
+    config: &CutConfig,
+    asr_options: &RecognitionOptions,
+) -> Result<SemanticPipelineFileReport, String> {
+    use tauri::Emitter as _;
+
+    let input = PathBuf::from(input_path);
+    if !input.is_file() {
+        return Err("input file not found".into());
+    }
+    let source_basename = path_file_name(&input);
+    let spec_stem = derive_spec_stem(&input);
+    let file_out_dir = out_root.join(&spec_stem);
+    fs::create_dir_all(&file_out_dir).map_err(|err| err.to_string())?;
+    let work_dir = file_out_dir.join(".semantic-pipeline");
+    fs::create_dir_all(&work_dir).map_err(|err| err.to_string())?;
+
+    // ---- Phase 2: preprocess ---------------------------------------------
+    let _ = app.emit(
+        "semantic:progress",
+        &serde_json::json!({"source": input_path, "phase": "preprocess"}),
+    );
+    let normalised = work_dir.join("01_normalised.wav");
+    preprocess_audio_for_semantic(
+        &input,
+        &normalised,
+        config.target_loudness_lufs,
+        find_rnnoise_model().as_deref(),
+    )?;
+
+    // ---- Phase 3: fine pre-cut + candidate pool --------------------------
+    let _ = app.emit(
+        "semantic:progress",
+        &serde_json::json!({"source": input_path, "phase": "fine_pre_cut"}),
+    );
+    let pieces_dir = work_dir.join("02_pieces");
+    let (piece_paths, candidates_ms) =
+        fine_pre_cut_for_semantic(&normalised, &pieces_dir)?;
+    if piece_paths.is_empty() {
+        return Err("fine pre-cut produced 0 pieces".into());
+    }
+
+    // ---- Phase 3b: ASR each piece via existing pool ----------------------
+    let _ = app.emit(
+        "semantic:progress",
+        &serde_json::json!({
+            "source": input_path,
+            "phase": "asr",
+            "pieces": piece_paths.len(),
+        }),
+    );
+    // Build minimal SegmentRecord list for recognize_segments_impl.
+    // start_ms/end_ms here are intra-piece — recognize doesn't care
+    // about the global timeline.
+    let asr_segments: Vec<SegmentRecord> = piece_paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| SegmentRecord {
+            id: format!("piece_{i:04}"),
+            source_path: path_to_string(&input),
+            source_file_name: source_basename.clone(),
+            segment_path: path_to_string(p),
+            segment_file_name: path_file_name(p),
+            role: None,
+            start_ms: 0,
+            end_ms: 0,
+            duration_ms: 0,
+            original_text: String::new(),
+            phonetic_text: String::new(),
+            emotion: Vec::new(),
+            tags: Vec::new(),
+            notes: String::new(),
+        })
+        .collect();
+
+    let asr_results = recognize_segments_impl(
+        app.clone(),
+        path_to_string(&work_dir),
+        asr_segments,
+        asr_options.clone(),
+    )?;
+    // Map ASR results back to pieces in order (recognize preserves
+    // input order in its output).
+    let pieces_asred: Vec<AsredPiece> = asr_results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            // candidates_ms[i] is start of piece i; candidates_ms[i+1]
+            // is end. Phase 3 guarantees boundaries.len() == pieces+1.
+            let start = candidates_ms.get(i).copied().unwrap_or(0);
+            let end = candidates_ms.get(i + 1).copied().unwrap_or(start);
+            AsredPiece {
+                text: r.text.clone(),
+                start_ms: start,
+                end_ms: end,
+            }
+        })
+        .collect();
+
+    // ---- Phase 4: LLM semantic cut decision ------------------------------
+    let _ = app.emit(
+        "semantic:progress",
+        &serde_json::json!({"source": input_path, "phase": "semantic_cut"}),
+    );
+    let decisions = llm_decide_semantic_cuts(&pieces_asred, &candidates_ms, config)?;
+
+    // ---- Phase 5 + 6: normalise + QA per merged segment ------------------
+    let _ = app.emit(
+        "semantic:progress",
+        &serde_json::json!({
+            "source": input_path,
+            "phase": "normalise_qa",
+            "segments": decisions.len(),
+        }),
+    );
+    let mut export_segments: Vec<SemanticExportSegment> = Vec::with_capacity(decisions.len());
+    let mut qa_flagged: Vec<usize> = Vec::new();
+    for (i, dec) in decisions.iter().enumerate() {
+        // Concatenate texts of pieces falling within [start, end).
+        let raw_text: String = pieces_asred
+            .iter()
+            .filter(|p| p.start_ms >= dec.start_ms && p.end_ms <= dec.end_ms)
+            .map(|p| p.text.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Phase 5 normalise — fall back to raw text on failure.
+        let final_text = match llm_normalize_segment_text(&raw_text, config) {
+            Ok(t) => t,
+            Err(err) => {
+                eprintln!("[semantic] segment {i} normalise failed: {err}");
+                raw_text.clone()
+            }
+        };
+        // Phase 6 QA.
+        let duration_ms = dec.end_ms.saturating_sub(dec.start_ms);
+        let problems = auto_qa_segment(&final_text, duration_ms, config);
+        if !problems.is_empty() {
+            qa_flagged.push(i);
+        }
+        export_segments.push(SemanticExportSegment {
+            start_ms: dec.start_ms,
+            end_ms: dec.end_ms,
+            final_text,
+            problems,
+        });
+    }
+
+    // ---- Phase 7: export WAVs + xlsx -------------------------------------
+    let _ = app.emit(
+        "semantic:progress",
+        &serde_json::json!({"source": input_path, "phase": "export"}),
+    );
+    let (xlsx_path, _wav_paths) = export_semantic_mode(
+        &file_out_dir,
+        &normalised,
+        &spec_stem,
+        &source_basename,
+        &export_segments,
+    )?;
+
+    Ok(SemanticPipelineFileReport {
+        source_path: path_to_string(&input),
+        xlsx_path: path_to_string(&xlsx_path),
+        segment_count: export_segments.len(),
+        qa_flagged_indices: qa_flagged,
+    })
+}
+
+#[tauri::command]
+async fn run_semantic_pipeline(
+    app: tauri::AppHandle,
+    input_paths: Vec<String>,
+    out_dir: String,
+    config: CutConfig,
+    recognition_options: RecognitionOptions,
+) -> Result<SemanticPipelineResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_semantic_pipeline_impl(app, input_paths, out_dir, config, recognition_options)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+// ===========================================================================
 // Phase 7 — Export (WAV slicing + xlsx) for Semantic mode
 // ===========================================================================
 //
@@ -9086,6 +9381,7 @@ pub fn run() {
             repair_cut_segment_silence,
             recognize_segments,
             cancel_recognize,
+            run_semantic_pipeline,
             polish_text_with_llm,
             list_ollama_models,
             check_dependencies,
