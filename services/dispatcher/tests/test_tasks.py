@@ -224,3 +224,110 @@ def test_delete_removes_files_and_row(client: TestClient, tmp_state) -> None:
     assert not any((storage_dir / "inputs").iterdir())
     resp = client.get(f"/api/tasks/{task_id}", headers=auth_headers(token))
     assert resp.status_code == 404
+
+
+def _complete_task_as_worker(client: TestClient, owner_token: str, worker_token: str) -> str:
+    """Create a task as owner, run it through the worker lifecycle to
+    `succeeded`, return the task id. Helper for access-control tests
+    that need an output to attempt cross-user download."""
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "owned"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner_token),
+    )
+    task_id = resp.json()["id"]
+    client.post("/api/worker/claim", headers=auth_headers(worker_token))
+    client.put(
+        f"/api/worker/tasks/{task_id}/output",
+        content=b"output-bytes",
+        headers={**auth_headers(worker_token), "Content-Type": "application/zip"},
+    )
+    client.post(
+        f"/api/worker/tasks/{task_id}/complete",
+        json={"summary": {"segment_count": 1}},
+        headers=auth_headers(worker_token),
+    )
+    return task_id
+
+
+def test_cannot_download_another_users_output(client: TestClient) -> None:
+    register(client, "a@example.com")  # admin
+    register(client, "b@example.com")
+    register(client, "c@example.com")
+    register(client, "w@example.com")  # worker
+    token_b = login(client, "b@example.com")
+    token_c = login(client, "c@example.com")
+    token_w = login(client, "w@example.com")
+    task_id = _complete_task_as_worker(client, token_b, token_w)
+    # Sanity: owner can download.
+    resp = client.get(f"/api/tasks/{task_id}/output", headers=auth_headers(token_b))
+    assert resp.status_code == 200
+    # Non-owner non-admin must NOT see the bytes.
+    resp = client.get(f"/api/tasks/{task_id}/output", headers=auth_headers(token_c))
+    assert resp.status_code in (403, 404)
+
+
+def test_cannot_delete_another_users_task(client: TestClient) -> None:
+    register(client, "a@example.com")  # admin
+    register(client, "b@example.com")
+    register(client, "c@example.com")
+    token_b = login(client, "b@example.com")
+    token_c = login(client, "c@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "b-secret"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(token_b),
+    )
+    task_id = resp.json()["id"]
+    resp = client.delete(f"/api/tasks/{task_id}", headers=auth_headers(token_c))
+    assert resp.status_code in (403, 404)
+    # Owner still sees the task.
+    resp = client.get(f"/api/tasks/{task_id}", headers=auth_headers(token_b))
+    assert resp.status_code == 200
+
+
+def test_cannot_retry_another_users_task(client: TestClient) -> None:
+    register(client, "a@example.com")
+    register(client, "b@example.com")
+    register(client, "c@example.com")
+    register(client, "w@example.com")
+    token_b = login(client, "b@example.com")
+    token_c = login(client, "c@example.com")
+    token_w = login(client, "w@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "owned"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(token_b),
+    )
+    task_id = resp.json()["id"]
+    client.post("/api/worker/claim", headers=auth_headers(token_w))
+    client.post(
+        f"/api/worker/tasks/{task_id}/fail",
+        json={"error": "boom"},
+        headers=auth_headers(token_w),
+    )
+    resp = client.post(f"/api/tasks/{task_id}/retry", headers=auth_headers(token_c))
+    assert resp.status_code in (403, 404)
+
+
+def test_admin_can_delete_other_users_task(client: TestClient) -> None:
+    """First registrant is admin (conftest pattern). They can delete
+    any user's task — used for cleanup of abandoned uploads."""
+    register(client, "admin@example.com")  # becomes admin
+    register(client, "b@example.com")
+    token_admin = login(client, "admin@example.com")
+    token_b = login(client, "b@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "to-prune"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(token_b),
+    )
+    task_id = resp.json()["id"]
+    resp = client.delete(f"/api/tasks/{task_id}", headers=auth_headers(token_admin))
+    assert resp.status_code == 204
+    resp = client.get(f"/api/tasks/{task_id}", headers=auth_headers(token_b))
+    assert resp.status_code == 404

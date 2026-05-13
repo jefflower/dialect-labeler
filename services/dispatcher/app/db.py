@@ -80,10 +80,33 @@ def reset_db_for_tests() -> None:
 
 
 def init_db() -> None:
-    """Create all tables. Idempotent."""
+    """Create all tables. Idempotent.
+
+    Also runs lightweight in-place column adds for SQLite — `create_all`
+    won't `ALTER TABLE` an existing table to add a new column, so any
+    column added after the initial release needs a `PRAGMA table_info`
+    check + `ALTER TABLE … ADD COLUMN`. Kept inline (vs. Alembic) because
+    schema drift here is rare and the box is single-host.
+    """
     from . import models  # noqa: F401 — register mappers
 
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    if engine.url.get_backend_name() == "sqlite":
+        _apply_sqlite_inline_migrations(engine)
+
+
+def _apply_sqlite_inline_migrations(engine: Engine) -> None:
+    """Idempotent ALTER TABLE migrations for SQLite."""
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(tasks)")).fetchall()
+        columns = {row[1] for row in rows}
+        if "attempts" not in columns:
+            conn.execute(
+                text("ALTER TABLE tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            )
 
 
 def get_db() -> Iterator[Session]:

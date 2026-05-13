@@ -114,3 +114,58 @@ def test_successful_login_clears_rate_limit_bucket(client: TestClient) -> None:
             json={"email": "ok@example.com", "password": "wrong"},
         )
         assert resp.status_code == 401, f"got {resp.status_code} {resp.text}"
+
+
+def test_authenticated_response_includes_request_id(client: TestClient) -> None:
+    register(client, "u@example.com")
+    token = login(client, "u@example.com")
+    resp = client.get("/api/tasks", headers=auth_headers(token))
+    assert resp.status_code == 200
+    assert resp.headers.get("X-Request-ID")
+
+
+def test_old_token_refreshed_via_response_header(
+    client: TestClient, monkeypatch
+) -> None:
+    """An authenticated request whose token is older than
+    `jwt_refresh_after_hours` should come back with a fresh `X-Refreshed-Token`
+    header that decodes to the same user but a later expiry."""
+    from datetime import datetime, timezone
+
+    import jwt as pyjwt
+
+    from app import config
+    from app.config import get_settings
+
+    monkeypatch.setenv("JWT_REFRESH_AFTER_HOURS", "0")  # always refresh
+    config.reset_settings_for_tests()
+
+    register(client, "u@example.com")
+    token = login(client, "u@example.com")
+    settings = get_settings()
+    payload_before = pyjwt.decode(
+        token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
+    )
+
+    resp = client.get("/api/tasks", headers=auth_headers(token))
+    assert resp.status_code == 200
+    fresh = resp.headers.get("X-Refreshed-Token")
+    assert fresh, "expected X-Refreshed-Token on an aged token"
+    payload_after = pyjwt.decode(
+        fresh, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
+    )
+    assert payload_after["sub"] == payload_before["sub"]
+    assert payload_after["exp"] >= payload_before["exp"]
+    assert payload_after["iat"] >= payload_before["iat"]
+
+
+def test_recent_token_not_refreshed(client: TestClient) -> None:
+    """A freshly-minted token does NOT get refreshed on the next request —
+    avoids pointless crypto work on every API call."""
+    register(client, "u@example.com")
+    token = login(client, "u@example.com")
+    # Default jwt_refresh_after_hours = 24, default jwt_ttl_hours = 720;
+    # the just-issued token is well under the refresh threshold.
+    resp = client.get("/api/tasks", headers=auth_headers(token))
+    assert resp.status_code == 200
+    assert resp.headers.get("X-Refreshed-Token") is None

@@ -96,6 +96,13 @@ async function request<T>(
   }
 
   const resp = await fetch(path, { ...options, headers });
+  // Sliding session: backend rotates the JWT on aged requests via this
+  // header. Pick it up before checking resp.ok so the new token survives
+  // even on 4xx responses (e.g., 409 conflicts on an authenticated POST).
+  const refreshed = resp.headers.get("X-Refreshed-Token");
+  if (refreshed) {
+    setToken(refreshed);
+  }
   if (!resp.ok) {
     let body: unknown = null;
     try {

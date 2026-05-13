@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from .models import (
     TASK_CLAIMED,
+    TASK_EXPIRED,
     TASK_PENDING,
     TASK_RUNNING,
     Task,
@@ -52,6 +53,9 @@ def claim_next_pending(
                 status=TASK_CLAIMED,
                 claimed_by=worker_user_id,
                 claim_expires_at=expires_at,
+                # Atomic SQL-side increment so two racing claims can't
+                # both observe the same pre-increment value.
+                attempts=Task.attempts + 1,
                 updated_at=utcnow(),
             )
         )
@@ -83,17 +87,41 @@ def extend_lease(
     return result.rowcount == 1
 
 
-def release_expired_claims(db: Session, now: datetime | None = None) -> int:
-    """Return any task whose lease ran out to `pending` so another
-    worker can pick it up. Returns count of recovered tasks."""
+def release_expired_claims(
+    db: Session, now: datetime | None = None, max_attempts: int = 3
+) -> dict[str, int]:
+    """Handle tasks whose worker lease ran out.
+
+    Two outcomes per row:
+      - Under the retry cap → reset to `pending`, another worker picks
+        it up.
+      - At or over the cap → promote to `TASK_EXPIRED`. Owner can still
+        retry from the UI (which resets attempts), but no worker will
+        auto-claim it again.
+
+    Returns ``{"recovered": N, "expired": M}``.
+    """
     now = now or utcnow()
-    result = db.execute(
+    base_filter = (
+        Task.status.in_([TASK_CLAIMED, TASK_RUNNING]),
+        Task.claim_expires_at.is_not(None),
+        Task.claim_expires_at < now,
+    )
+
+    expired_result = db.execute(
         update(Task)
-        .where(
-            Task.status.in_([TASK_CLAIMED, TASK_RUNNING]),
-            Task.claim_expires_at.is_not(None),
-            Task.claim_expires_at < now,
+        .where(*base_filter, Task.attempts >= max_attempts)
+        .values(
+            status=TASK_EXPIRED,
+            claimed_by=None,
+            claim_expires_at=None,
+            updated_at=now,
+            error="lease expired and exceeded max_attempts",
         )
+    )
+    recovered_result = db.execute(
+        update(Task)
+        .where(*base_filter, Task.attempts < max_attempts)
         .values(
             status=TASK_PENDING,
             claimed_by=None,
@@ -102,4 +130,7 @@ def release_expired_claims(db: Session, now: datetime | None = None) -> int:
         )
     )
     db.commit()
-    return result.rowcount or 0
+    return {
+        "recovered": recovered_result.rowcount or 0,
+        "expired": expired_result.rowcount or 0,
+    }

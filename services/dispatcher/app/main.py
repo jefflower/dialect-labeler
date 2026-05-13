@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .auth import hash_password
+from .auth import create_access_token, hash_password, should_refresh_token
 from .cleaner import schedule_cleaner
 from .config import get_settings
 from .db import get_session_factory, init_db
@@ -99,6 +99,15 @@ def create_app() -> FastAPI:
             req_id, method, path, response.status_code, elapsed_ms,
         )
         response.headers["X-Request-ID"] = req_id
+        # Sliding session: if this request used a token older than
+        # `jwt_refresh_after_hours`, mint a fresh one and let the client
+        # write it back to localStorage. Cheap (auth dependency already
+        # decoded the token and stashed iat on request.state).
+        if response.status_code < 400:
+            user_id = getattr(request.state, "auth_user_id", None)
+            iat = getattr(request.state, "auth_token_iat", None)
+            if user_id is not None and should_refresh_token(iat):
+                response.headers["X-Refreshed-Token"] = create_access_token(user_id)
         return response
 
     app.include_router(auth_routes.router)

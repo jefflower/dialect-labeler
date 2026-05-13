@@ -21,13 +21,23 @@ class Settings(BaseSettings):
     # Auth
     jwt_secret: str = ""
     jwt_algorithm: str = "HS256"
-    jwt_ttl_hours: int = 168  # 7 days
+    jwt_ttl_hours: int = 720  # 30 days — sliding refresh in middleware
+    # Re-issue the token on any authenticated request older than this.
+    # Together with jwt_ttl_hours, gives users effectively unlimited
+    # sessions as long as they use the app at least once per refresh
+    # window. Set short for tests, long for prod.
+    jwt_refresh_after_hours: int = 24
     allow_open_registration: bool = False
     admin_email: str = ""
     admin_password: str = ""
 
     # Queue / lease
     lease_ttl_seconds: int = 300  # 5 minutes
+    # Hard cap on claim attempts. After this many leases expire on the
+    # same task, the cleaner promotes it to TASK_EXPIRED instead of
+    # resetting to pending — prevents a poison input from looping a
+    # worker pool indefinitely. Owner can still retry via the UI.
+    max_attempts: int = 3
 
     # File retention. The cleaner deletes files past these windows but
     # never touches the metadata row.

@@ -1883,19 +1883,29 @@ pub(crate) fn export_dataset_bundle_impl(
 
     // Also write project.json into the bundle so a downstream reviewer
     // (e.g. the Windows audit build) can resume editing with all
-    // annotations intact. Paths are already pointed at the bundle's own
-    // segments/ + source/ subdirectories from the copy step above, so the
-    // file is portable to any machine that opens the same directory.
+    // annotations intact. We deliberately store EVERY path field
+    // RELATIVE to the bundle root so the zip survives being moved
+    // anywhere on the receiver's disk (the Windows reviewer scenario
+    // that previously broke when paths still held macOS tempdir
+    // strings):
+    //   - rootPath / projectDir = "." → resolved against the dir the
+    //     receiver opens the project from
+    //   - segmentsDir = "./segments"
+    //   - segments[].segmentPath = "./segments/<file>.wav"
+    //   - segments[].sourcePath = "./source/<file>.wav" when source was
+    //     copied into the bundle; otherwise left as-is (an outside-the-
+    //     bundle absolute path; useful for display, ignored by playback
+    //     since the Windows reviewer does not re-cut).
     let saved_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or_default();
-    let project_payload = serde_json::json!({
+    let mut project_payload = serde_json::json!({
         "version": 2,
         "savedAt": format!("epoch_ms_{}", saved_at_ms),
-        "rootPath": bundle_root_str.clone(),
-        "projectDir": bundle_root_str.clone(),
-        "segmentsDir": path_to_string(&segments_out),
+        "rootPath": ".",
+        "projectDir": ".",
+        "segmentsDir": "./segments",
         "config": {
             "silenceDb": -35.0,
             "minSilenceMs": 450,
@@ -1909,6 +1919,14 @@ pub(crate) fn export_dataset_bundle_impl(
         "segments": new_segments,
         "systemPrompt": system_prompt
     });
+    // Rewrite known absolute path fields inside `segments[]` to "./…"
+    // form using the same helper save_project_file uses for in-place
+    // saves. portablize_payload skips the top-level rootPath/projectDir
+    // fields (already "." above) and only touches the known
+    // segments[].{sourcePath,segmentPath} + segmentsDir entries — those
+    // are absolute right now because the copy step at line ~1532 set
+    // them to <bundle>/segments/<file>.wav.
+    project_payload = portablize_payload(project_payload, &bundle_canonical);
     let project_path = bundle_canonical.join("project.json");
     fs::write(
         &project_path,
@@ -6118,6 +6136,72 @@ mod tests {
     }
 
     #[test]
+    fn portablize_payload_rewrites_bundle_paths_to_relative() {
+        // Simulate what `export_dataset_bundle_impl` produces just before
+        // writing project.json: a bundle dir on disk with a fake
+        // segments/file under it. portablize_payload must rewrite the
+        // absolute segmentsDir + segments[].{segmentPath,sourcePath}
+        // values to "./..." form so the bundle is portable. Out-of-bundle
+        // paths (the original source file) stay absolute.
+        let tmp = std::env::temp_dir().join(format!(
+            "portablize-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let segments_dir = tmp.join("segments");
+        let source_dir = tmp.join("source");
+        fs::create_dir_all(&segments_dir).unwrap();
+        fs::create_dir_all(&source_dir).unwrap();
+        let seg_file = segments_dir.join("文本演绎_0001_01_01_发音人.wav");
+        let src_file = source_dir.join("台湾话-发音人-文本演绎-话题1.wav");
+        fs::write(&seg_file, b"fake").unwrap();
+        fs::write(&src_file, b"fake").unwrap();
+        let bundle_canonical = tmp.canonicalize().unwrap();
+
+        let payload = serde_json::json!({
+            "rootPath": ".",
+            "projectDir": ".",
+            "segmentsDir": path_to_string(&segments_dir),
+            "segments": [
+                {
+                    "segmentPath": path_to_string(&seg_file),
+                    "sourcePath": path_to_string(&src_file),
+                },
+                {
+                    // Outside-the-bundle source path must be left alone.
+                    "segmentPath": path_to_string(&seg_file),
+                    "sourcePath": "/somewhere/else/台湾话.wav",
+                },
+            ]
+        });
+        let result = portablize_payload(payload, &bundle_canonical);
+
+        // Top-level "." values pass through untouched.
+        assert_eq!(result["rootPath"], json!("."));
+        assert_eq!(result["projectDir"], json!("."));
+        // segmentsDir → "./segments" — under bundle, gets rewritten.
+        assert_eq!(
+            result["segmentsDir"].as_str().unwrap().replace('\\', "/"),
+            "./segments"
+        );
+        // First segment: both paths are inside the bundle → both rewritten.
+        let s0 = &result["segments"][0];
+        assert_eq!(
+            s0["segmentPath"].as_str().unwrap().replace('\\', "/"),
+            "./segments/文本演绎_0001_01_01_发音人.wav"
+        );
+        assert_eq!(
+            s0["sourcePath"].as_str().unwrap().replace('\\', "/"),
+            "./source/台湾话-发音人-文本演绎-话题1.wav"
+        );
+        // Second segment: outside-the-bundle source stays absolute.
+        let s1 = &result["segments"][1];
+        assert_eq!(s1["sourcePath"], json!("/somewhere/else/台湾话.wav"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn pair_key_strips_role_suffix() {
         // Source file names are `..._<话题>_<轮>_<role>.wav` — sub-segment
         // indices (01/02/…) only show up in segment_file_name, never here.
@@ -7293,15 +7377,14 @@ fn cloud_set_worker_enabled(
 }
 
 // ============================================================
-// Updater
+// App version (surfaced in CloudPane → links to /downloads)
 // ============================================================
 //
-// The actual update check is driven from the frontend via
-// `@tauri-apps/plugin-updater` — it has cancellation, progress events,
-// and install handling built in. Wiring it from Rust here would just
-// duplicate that. The reason this Rust-side command exists is to expose
-// the current app version so the CloudPane can show "you're on v0.1.0,
-// latest is v0.1.1" before the user clicks the install button.
+// v1 ships without auto-update. CloudPane reads this and renders a link
+// to the dispatcher's /downloads page so the user can grab a newer build
+// manually. Re-introducing tauri-plugin-updater would also require a
+// signing key + pubkey in tauri.conf.json — explicitly out of scope for
+// v1 per the deploy plan.
 
 #[tauri::command]
 fn app_version() -> &'static str {
@@ -7408,7 +7491,6 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(cloud::CloudState::new());
 
     builder

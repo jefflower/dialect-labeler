@@ -210,6 +210,11 @@ def retry_task(
     task.claimed_by = None
     task.claim_expires_at = None
     task.completed_at = None
+    # Owner is explicitly asking for another shot; reset the attempt
+    # counter so the cap doesn't immediately kick in again on the next
+    # cycle. The cleaner will only promote to expired on FRESH failure
+    # chains.
+    task.attempts = 0
     task.updated_at = utcnow()
     # Clear any half-uploaded output from a previous attempt.
     if task.output_path:

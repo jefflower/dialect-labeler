@@ -25,7 +25,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { Store } from "@tauri-apps/plugin-store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { check, type Update } from "@tauri-apps/plugin-updater";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   CloudStatus,
   CloudUser,
@@ -61,15 +61,6 @@ const STAGE_LABELS: Record<string, string> = {
   uploading: "上传产物",
 };
 
-type UpdateState =
-  | { kind: "idle" }
-  | { kind: "checking" }
-  | { kind: "up-to-date"; current: string }
-  | { kind: "available"; current: string; next: string; update: Update }
-  | { kind: "installing"; next: string }
-  | { kind: "installed"; next: string }
-  | { kind: "error"; message: string };
-
 export function CloudPane({ open, onClose, workerConfig }: Props) {
   const [status, setStatus] = useState<CloudStatus | null>(null);
   const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE);
@@ -78,7 +69,6 @@ export function CloudPane({ open, onClose, workerConfig }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
-  const [update, setUpdate] = useState<UpdateState>({ kind: "idle" });
 
   const refresh = useCallback(async () => {
     try {
@@ -209,35 +199,19 @@ export function CloudPane({ open, onClose, workerConfig }: Props) {
     invoke<string>("app_version").then(setAppVersion).catch(() => undefined);
   }, []);
 
-  const onCheckUpdate = useCallback(async () => {
-    setUpdate({ kind: "checking" });
-    try {
-      const result = await check();
-      if (!result) {
-        setUpdate({ kind: "up-to-date", current: appVersion ?? "?" });
-        return;
-      }
-      setUpdate({
-        kind: "available",
-        current: appVersion ?? "?",
-        next: result.version,
-        update: result,
-      });
-    } catch (err) {
-      setUpdate({ kind: "error", message: String(err) });
-    }
-  }, [appVersion]);
+  const downloadsUrl = useMemo(() => {
+    const base = (status?.base_url || baseUrl || "").replace(/\/+$/, "");
+    return base ? `${base}/downloads` : "";
+  }, [status?.base_url, baseUrl]);
 
-  const onInstallUpdate = useCallback(async () => {
-    if (update.kind !== "available") return;
-    setUpdate({ kind: "installing", next: update.next });
+  const onOpenDownloads = useCallback(async () => {
+    if (!downloadsUrl) return;
     try {
-      await update.update.downloadAndInstall();
-      setUpdate({ kind: "installed", next: update.next });
+      await openUrl(downloadsUrl);
     } catch (err) {
-      setUpdate({ kind: "error", message: String(err) });
+      console.warn("open downloads page failed", err);
     }
-  }, [update]);
+  }, [downloadsUrl]);
 
   if (!open) return null;
 
@@ -362,58 +336,24 @@ export function CloudPane({ open, onClose, workerConfig }: Props) {
                   <DownloadIcon size={14} /> 客户端版本
                 </strong>
                 <p className="cloud-hint">
-                  当前 v{appVersion ?? "?"}。{updateBlurb(update)}
+                  当前 v{appVersion ?? "?"}。新版从下载页手动获取。
                 </p>
               </div>
-              {update.kind === "available" ? (
-                <button
-                  className="btn-primary"
-                  onClick={onInstallUpdate}
-                  disabled={busy}
-                >
-                  安装 v{update.next}
-                </button>
-              ) : update.kind === "installed" ? (
-                <span className="cloud-hint">下次启动生效</span>
-              ) : (
-                <button
-                  className="btn-ghost"
-                  onClick={onCheckUpdate}
-                  disabled={update.kind === "checking" || update.kind === "installing"}
-                >
-                  {update.kind === "checking" ? (
-                    <Loader2 size={14} className="spin" />
-                  ) : (
-                    <DownloadIcon size={14} />
-                  )}
-                  检查更新
-                </button>
-              )}
+              <button
+                className="btn-ghost"
+                onClick={onOpenDownloads}
+                disabled={!downloadsUrl}
+                title={downloadsUrl || "未连接服务器"}
+              >
+                <DownloadIcon size={14} />
+                打开下载页
+              </button>
             </div>
           </section>
         )}
       </div>
     </div>
   );
-}
-
-function updateBlurb(update: UpdateState): string {
-  switch (update.kind) {
-    case "idle":
-      return "点「检查更新」看看有没有新版";
-    case "checking":
-      return "正在检查…";
-    case "up-to-date":
-      return "已经是最新版";
-    case "available":
-      return `服务器上有新版 v${update.next}`;
-    case "installing":
-      return `下载安装 v${update.next} 中…`;
-    case "installed":
-      return `已安装 v${update.next}，下次启动生效`;
-    case "error":
-      return `检查失败：${update.message}`;
-  }
 }
 
 export default CloudPane;

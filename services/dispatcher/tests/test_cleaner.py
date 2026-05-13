@@ -156,7 +156,154 @@ def test_expired_lease_returns_task_to_pending(client: TestClient) -> None:
 
     counts = run_cleanup_pass()
     assert counts["leases_recovered"] == 1
+    assert counts["leases_expired"] == 0
     # The same task should now be claimable again.
     resp = client.post("/api/worker/claim", headers=auth_headers(worker))
     assert resp.status_code == 200
     assert resp.json()["id"] == task_id
+
+
+def test_claim_increments_attempts(client: TestClient) -> None:
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "t"},
+        files={"file": ("t.zip", io.BytesIO(_zip()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = resp.json()["id"]
+
+    from app.db import session_scope
+    from app.models import Task
+
+    with session_scope() as db:
+        assert db.get(Task, task_id).attempts == 0
+
+    client.post("/api/worker/claim", headers=auth_headers(worker))
+    with session_scope() as db:
+        assert db.get(Task, task_id).attempts == 1
+
+
+def test_lease_expires_to_expired_after_max_attempts(client: TestClient) -> None:
+    """After max_attempts repeated lease expirations the cleaner promotes
+    the task to `expired` and stops handing it back to workers."""
+    from app.config import get_settings
+    from app.cleaner import run_cleanup_pass
+    from app.db import session_scope
+    from app.models import Task, TASK_EXPIRED, utcnow
+
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "poison"},
+        files={"file": ("t.zip", io.BytesIO(_zip()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = resp.json()["id"]
+    max_attempts = get_settings().max_attempts
+
+    # Repeatedly: claim, let the lease lapse, run the cleaner.
+    for cycle in range(max_attempts):
+        resp = client.post("/api/worker/claim", headers=auth_headers(worker))
+        assert resp.status_code == 200
+        with session_scope() as db:
+            db.get(Task, task_id).claim_expires_at = utcnow() - timedelta(seconds=1)
+        counts = run_cleanup_pass()
+        if cycle < max_attempts - 1:
+            assert counts["leases_recovered"] == 1
+            assert counts["leases_expired"] == 0
+        else:
+            assert counts["leases_recovered"] == 0
+            assert counts["leases_expired"] == 1
+
+    # Task is now expired and not handed out again.
+    with session_scope() as db:
+        task = db.get(Task, task_id)
+        assert task.status == TASK_EXPIRED
+        assert task.attempts == max_attempts
+        assert task.claimed_by is None
+
+    resp = client.post("/api/worker/claim", headers=auth_headers(worker))
+    assert resp.status_code == 204
+
+
+def test_owner_retry_resets_attempts(client: TestClient) -> None:
+    """An expired task can be retried by the owner; attempts resets so the
+    cap doesn't immediately fire again on the next lease cycle."""
+    from app.cleaner import run_cleanup_pass
+    from app.config import get_settings
+    from app.db import session_scope
+    from app.models import TASK_EXPIRED, TASK_PENDING, Task, utcnow
+
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "poison"},
+        files={"file": ("t.zip", io.BytesIO(_zip()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = resp.json()["id"]
+
+    # Drive it to expired.
+    for _ in range(get_settings().max_attempts):
+        client.post("/api/worker/claim", headers=auth_headers(worker))
+        with session_scope() as db:
+            db.get(Task, task_id).claim_expires_at = utcnow() - timedelta(seconds=1)
+        run_cleanup_pass()
+    with session_scope() as db:
+        assert db.get(Task, task_id).status == TASK_EXPIRED
+
+    # Retry as owner.
+    resp = client.post(f"/api/tasks/{task_id}/retry", headers=auth_headers(owner))
+    assert resp.status_code == 200
+    with session_scope() as db:
+        task = db.get(Task, task_id)
+        assert task.status == TASK_PENDING
+        assert task.attempts == 0
+
+
+def test_expired_input_cleaned_after_ttl(client: TestClient, tmp_state) -> None:
+    """An expired task's input zip is collected by the same failed_input_ttl
+    window the failed branch uses (since the input is again pointless)."""
+    from app.cleaner import run_cleanup_pass
+    from app.config import get_settings
+    from app.db import session_scope
+    from app.models import Task, utcnow
+
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "t"},
+        files={"file": ("t.zip", io.BytesIO(_zip()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = resp.json()["id"]
+
+    # Drive to expired.
+    for _ in range(get_settings().max_attempts):
+        client.post("/api/worker/claim", headers=auth_headers(worker))
+        with session_scope() as db:
+            db.get(Task, task_id).claim_expires_at = utcnow() - timedelta(seconds=1)
+        run_cleanup_pass()
+
+    # Within TTL → input untouched.
+    counts = run_cleanup_pass()
+    assert counts["input_cleaned"] == 0
+
+    # Past TTL → input is collected.
+    with session_scope() as db:
+        db.get(Task, task_id).updated_at = utcnow() - timedelta(days=365)
+    counts = run_cleanup_pass()
+    assert counts["input_cleaned"] == 1

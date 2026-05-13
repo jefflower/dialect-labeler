@@ -38,13 +38,5 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
-  },
-  "plugins": {
-    "updater": {
-      "endpoints": [
-        "http://localhost:8080/api/updater/{{target}}/{{current_version}}"
-      ],
-      "pubkey": ""
-    }
   }
 }

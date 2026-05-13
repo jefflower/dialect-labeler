@@ -92,6 +92,14 @@ class Task(Base):
     claim_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Total times the task has been claimed by any worker. Incremented
+    # atomically on each successful claim. When it exceeds MAX_ATTEMPTS
+    # and the lease expires again, the cleaner promotes the task to
+    # `TASK_EXPIRED` instead of resetting to pending — stops a poison
+    # input from looping a worker pool indefinitely.
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     # Files. Path is relative to STORAGE_DIR. After cleanup these go NULL
     # while {input,output}_size and the timestamps stay populated as a

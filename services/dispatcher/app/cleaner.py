@@ -10,7 +10,10 @@ deletes blobs off disk, so the policy lives in one place:
       input kept for `FAILED_INPUT_TTL_HOURS` so an operator can retry,
       then deleted
   - claimed/running task with expired lease:
-      reset to `pending` (delegated to queue_ops.release_expired_claims)
+      released by `queue_ops.release_expired_claims` — under the attempt
+      cap they reset to `pending`; at the cap they promote to `expired`.
+  - expired task:
+      input kept for the same `FAILED_INPUT_TTL_HOURS` window, then deleted.
 
 After deletion, `files_cleaned_at` is set and `*_path` is nulled. The
 file size and timestamp columns stay populated as a historical record.
@@ -28,6 +31,7 @@ from sqlalchemy.orm import Session
 from .config import get_settings
 from .db import session_scope
 from .models import (
+    TASK_EXPIRED,
     TASK_FAILED,
     TASK_SUCCEEDED,
     Task,
@@ -59,12 +63,14 @@ def _candidate_succeeded(db: Session, now: datetime, output_ttl: timedelta) -> I
     ).scalars()
 
 
-def _candidate_failed(db: Session, now: datetime, failed_ttl: timedelta) -> Iterable[Task]:
-    """failed tasks whose input is past the retention window."""
+def _candidate_failed_or_expired(
+    db: Session, now: datetime, failed_ttl: timedelta
+) -> Iterable[Task]:
+    """failed/expired tasks whose input is past the retention window."""
     threshold = now - failed_ttl
     return db.execute(
         select(Task).where(
-            Task.status == TASK_FAILED,
+            Task.status.in_([TASK_FAILED, TASK_EXPIRED]),
             Task.input_path.is_not(None),
             Task.updated_at < threshold,
         )
@@ -79,10 +85,19 @@ def run_cleanup_pass(storage: Storage | None = None) -> dict[str, int]:
     output_ttl = timedelta(hours=settings.output_ttl_hours)
     failed_ttl = timedelta(hours=settings.failed_input_ttl_hours)
 
-    counts = {"output_cleaned": 0, "input_cleaned": 0, "leases_recovered": 0}
+    counts = {
+        "output_cleaned": 0,
+        "input_cleaned": 0,
+        "leases_recovered": 0,
+        "leases_expired": 0,
+    }
 
     with session_scope() as db:
-        counts["leases_recovered"] = release_expired_claims(db, now=_now())
+        released = release_expired_claims(
+            db, now=_now(), max_attempts=settings.max_attempts
+        )
+        counts["leases_recovered"] = released["recovered"]
+        counts["leases_expired"] = released["expired"]
 
     with session_scope() as db:
         now = _now()
@@ -99,7 +114,7 @@ def run_cleanup_pass(storage: Storage | None = None) -> dict[str, int]:
 
     with session_scope() as db:
         now = _now()
-        for task in _candidate_failed(db, now, failed_ttl):
+        for task in _candidate_failed_or_expired(db, now, failed_ttl):
             if task.input_path:
                 storage.unlink(task.input_path)
                 task.input_path = None

@@ -7,7 +7,7 @@ from typing import Annotated
 
 import bcrypt
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
@@ -65,6 +65,7 @@ def _decode(token: str) -> dict:
 
 
 def get_current_user(
+    request: Request,
     token: Annotated[str | None, Depends(oauth2_scheme)],
     db: Annotated[Session, Depends(get_db)],
 ) -> User:
@@ -85,7 +86,26 @@ def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="User no longer exists"
         )
+    # Stash on request.state so the response middleware can decide
+    # whether to mint a fresh token without re-decoding.
+    request.state.auth_user_id = user.id
+    request.state.auth_token_iat = payload.get("iat")
     return user
+
+
+def should_refresh_token(iat: int | None) -> bool:
+    """Decide whether to re-issue the token on this request.
+
+    Sliding-session policy: any time the token is older than
+    `jwt_refresh_after_hours`, we mint a fresh one so an active user
+    never gets surprised by an expiry. Tokens younger than that are
+    left alone to avoid pointless cryptographic work on every call.
+    """
+    if iat is None:
+        return False
+    settings = get_settings()
+    age = datetime.now(timezone.utc).timestamp() - iat
+    return age >= settings.jwt_refresh_after_hours * 3600
 
 
 def require_admin(
