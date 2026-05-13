@@ -135,40 +135,85 @@ export function ConfigBand(props: ConfigBandProps) {
 
   return (
     <section className="card">
-      <div className="config-row" style={{ flexWrap: "wrap", rowGap: 6 }}>
-        {/* Mode toggle. `dialect` is the historical silence-only cutter
-            (长沙 / 台湾 dialect projects). `semantic` is the Mandarin
-            pipeline driven by 录制数据剪辑转写规则（新）— preprocess +
-            ASR + LLM cut decision + xlsx export. Switching modes does
-            NOT migrate other params; each mode has its own knobs. */}
-        <div
-          className="config-mode-toggle"
-          role="radiogroup"
-          aria-label="切割模式"
-          style={{ display: "flex", gap: 4 }}
+      {/* Mode tabs. Tab bar at the top owns the full width of the card.
+          Only the matching mode's panel renders below — flipping the
+          tab swaps the visible panel instead of stacking two variants
+          of the same form. `dialect` = historical silence-only cutter
+          (长沙 / 台湾); `semantic` = Mandarin pipeline driven by
+          录制数据剪辑转写规则（新）. Switching tabs does NOT migrate
+          per-mode params; each mode owns its own knobs. */}
+      <div
+        className="config-mode-tabs"
+        role="tablist"
+        aria-label="切割模式"
+        style={{
+          display: "flex",
+          gap: 0,
+          borderBottom: "1px solid var(--border, #e2e8f0)",
+          marginBottom: 12,
+        }}
+      >
+        <button
+          role="tab"
+          aria-selected={currentMode === "dialect"}
+          onClick={() => setMode("dialect")}
+          className="config-mode-tab"
+          style={{
+            background: "transparent",
+            border: "none",
+            padding: "10px 18px",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            cursor: "pointer",
+            color:
+              currentMode === "dialect"
+                ? "var(--text-primary, #0f172a)"
+                : "var(--text-secondary, #64748b)",
+            fontWeight: currentMode === "dialect" ? 600 : 400,
+            borderBottom:
+              currentMode === "dialect"
+                ? "2px solid var(--accent, #0d9488)"
+                : "2px solid transparent",
+            marginBottom: -1,
+          }}
+          title="按静音切；方言录音、保留全部声学事件，速度快、可重复"
         >
-          <button
-            className={`btn-ghost ${currentMode === "dialect" ? "btn-active" : ""}`}
-            onClick={() => setMode("dialect")}
-            title="按静音切；方言录音、保留全部声学事件，速度快、可重复"
-            role="radio"
-            aria-checked={currentMode === "dialect"}
-          >
-            <Scissors size={14} />
-            模式 1 · 方言（按静音切）
-          </button>
-          <button
-            className={`btn-ghost ${currentMode === "semantic" ? "btn-active" : ""}`}
-            onClick={() => setMode("semantic")}
-            title="按语义切；普通话、ASR + Qwen 32K context 决定切点、规范化、出 xlsx"
-            role="radio"
-            aria-checked={currentMode === "semantic"}
-          >
-            <Languages size={14} />
-            模式 2 · 普通话（语义切割）
-          </button>
-        </div>
+          <Scissors size={14} />
+          模式 1 · 方言（按静音切）
+        </button>
+        <button
+          role="tab"
+          aria-selected={currentMode === "semantic"}
+          onClick={() => setMode("semantic")}
+          className="config-mode-tab"
+          style={{
+            background: "transparent",
+            border: "none",
+            padding: "10px 18px",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            cursor: "pointer",
+            color:
+              currentMode === "semantic"
+                ? "var(--text-primary, #0f172a)"
+                : "var(--text-secondary, #64748b)",
+            fontWeight: currentMode === "semantic" ? 600 : 400,
+            borderBottom:
+              currentMode === "semantic"
+                ? "2px solid var(--accent, #0d9488)"
+                : "2px solid transparent",
+            marginBottom: -1,
+          }}
+          title="按语义切；普通话、ASR + Qwen 32K context 决定切点、规范化、出 xlsx"
+        >
+          <Languages size={14} />
+          模式 2 · 普通话（语义切割）
+        </button>
+      </div>
 
+      <div className="config-row" style={{ flexWrap: "wrap", rowGap: 6 }}>
         {currentMode === "semantic" ? (
           <details className="config-strategy">
             <summary
@@ -316,6 +361,7 @@ export function ConfigBand(props: ConfigBandProps) {
           </details>
         ) : null}
 
+        {currentMode === "dialect" ? (
         <details className="config-strategy">
           <summary className="config-strategy-trigger" title="展开切割策略参数">
             <span className="config-strategy-trigger-main">
@@ -422,6 +468,7 @@ export function ConfigBand(props: ConfigBandProps) {
             </div>
           </div>
         </details>
+        ) : null}
 
         <span style={{ flex: 1 }} />
 
