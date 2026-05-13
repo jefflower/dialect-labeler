@@ -1631,6 +1631,299 @@ fn fine_pre_cut_for_semantic(
     Ok((piece_paths, boundaries))
 }
 
+// ===========================================================================
+// Phase 4 — Semantic cut decision via LLM
+// ===========================================================================
+//
+// After Phase 3 produces `(piece_paths, boundaries)` and the existing
+// recognize_segments_impl ASRs each piece, we have a sequence of
+// `(text, global_start_ms, global_end_ms)` triples. Phase 4 hands all
+// of that to Qwen2.5:32b at the configured `semantic_endpoint` and
+// asks it to merge the fine pieces into 6-90s "complete semantic
+// unit" segments per spec § 二·切句规则.
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SemanticCutDecision {
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+    pub(crate) reason: String,
+}
+
+/// One ASRed pre-cut piece — input to Phase 4.
+#[derive(Clone, Debug)]
+pub(crate) struct AsredPiece {
+    pub(crate) text: String,
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+}
+
+/// Render the system + user prompts for the semantic-cut LLM call.
+///
+/// Returns `(system, user)`. The system prompt encodes the spec rules
+/// (6-90s, complete semantic units, etc.) and pins the output format.
+/// The user prompt lists each ASRed piece with its global timestamps
+/// and the candidate cut-point pool.
+///
+/// Kept pure (no I/O, no logging) so unit tests can pin the wording
+/// without mocking ureq.
+pub(crate) fn build_semantic_cut_prompt(
+    pieces: &[AsredPiece],
+    candidates_ms: &[u64],
+    config: &CutConfig,
+) -> (String, String) {
+    let system = format!(
+        "你是一个普通话录音剪辑助手。任务：把已经按静音粗切并 ASR 完成的若干小片合并成「语义完整」的大段，\
+         严格遵守以下规则（来源：录制数据剪辑转写规则）：\n\
+         \n\
+         1. 每段时长 {min_s:.0}-{max_s:.0} 秒；短于 {min_s:.0} 秒的独立语义单元可保留，长于 {max_s:.0} 秒必须在自然节点切开。\n\
+         2. 「相对独立的语义单元」=一个完整短语 / 一个完整句子 / 一段完整问答 / 一段连续叙述。\n\
+         3. 不允许将语义紧密相连的内容切断（同一个观点、并列句、问答对，应合并）。\n\
+         4. 一问一答可分别成段（例：「你今天过得怎么样？」「我今天过得还不错。」切两段）。\n\
+         5. 切点只能取自下方候选切点列表中的时间戳（毫秒）。不要发明候选列表外的时间。\n\
+         6. 仅输出 JSON，无前缀、无尾注、无 markdown。schema：\n\
+         {{\n  \"segments\": [\n    {{\"start_ms\": <number>, \"end_ms\": <number>, \"reason\": \"<中文 ≤30 字解释为何这样切>\"}}\n  ]\n}}",
+        min_s = config.min_segment_s,
+        max_s = config.max_segment_s,
+    );
+
+    // Build a compact, deterministic user message:
+    //   候选切点：[0, 1240, 3580, ...]
+    //   小片：
+    //     [0–1240ms] 文本…
+    //     [1240–3580ms] 文本…
+    let mut user = String::new();
+    user.push_str("【候选切点（毫秒）】\n");
+    user.push_str(&format!(
+        "{}\n\n",
+        candidates_ms
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    user.push_str("【ASR 小片】\n");
+    for (i, p) in pieces.iter().enumerate() {
+        user.push_str(&format!(
+            "{:03}. [{}–{}ms] {}\n",
+            i,
+            p.start_ms,
+            p.end_ms,
+            p.text.trim()
+        ));
+    }
+    user.push_str(
+        "\n请按规则输出 JSON。返回的每个 segment 的 start_ms 和 end_ms 必须\
+         严格出现在候选切点列表里（除了起点 0 和终点）。",
+    );
+    (system, user)
+}
+
+/// Parse the LLM's JSON response into a vector of cut decisions.
+///
+/// Accepts the loose shape `{"segments": [{"start_ms":N,"end_ms":N,"reason":"…"}, ...]}`.
+/// Anything missing fields or with non-numeric ms values gets rejected
+/// with a diagnostic — the orchestrator can either retry, fall back to
+/// silence-only cuts, or surface the error.
+pub(crate) fn parse_semantic_cut_response(
+    raw: &str,
+) -> Result<Vec<SemanticCutDecision>, String> {
+    let value: Value = serde_json::from_str(raw.trim())
+        .map_err(|err| format!("LLM 响应非 JSON：{err} (raw: {})", truncate_for_log(raw, 200)))?;
+    let segs = value
+        .get("segments")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            format!(
+                "LLM 响应缺少 segments 数组 (raw: {})",
+                truncate_for_log(raw, 200)
+            )
+        })?;
+    let mut out = Vec::with_capacity(segs.len());
+    for (i, seg) in segs.iter().enumerate() {
+        let start_ms = seg
+            .get("start_ms")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("segment {i}: start_ms missing or not u64"))?;
+        let end_ms = seg
+            .get("end_ms")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("segment {i}: end_ms missing or not u64"))?;
+        if end_ms <= start_ms {
+            return Err(format!(
+                "segment {i}: end_ms {end_ms} must be > start_ms {start_ms}"
+            ));
+        }
+        let reason = seg
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(SemanticCutDecision {
+            start_ms,
+            end_ms,
+            reason,
+        });
+    }
+    Ok(out)
+}
+
+/// Trim a string for logging, adding "…" when it exceeds `max_chars`.
+/// Char-aware so we don't slice through multibyte UTF-8.
+fn truncate_for_log(s: &str, max_chars: usize) -> String {
+    let mut count = 0;
+    for (i, _) in s.char_indices() {
+        if count >= max_chars {
+            return format!("{}…", &s[..i]);
+        }
+        count += 1;
+    }
+    s.to_string()
+}
+
+/// Validate the LLM's cut decisions against the spec + the candidate
+/// boundary pool. Returns the same vector on success, or an error
+/// listing all rule violations.
+///
+/// Rules enforced:
+///   - Each segment's [start_ms, end_ms] must each appear in
+///     `candidates_ms` (so the cut lands on a real silence gap).
+///   - Each segment length must be ≥ min_segment_s − 1s (soft floor;
+///     spec § 二·一·1 allows shorter independent clauses) AND
+///     ≤ max_segment_s (hard ceiling).
+///   - Segments must be sorted by start_ms.
+///   - No overlap: each segment's start_ms ≥ previous end_ms.
+///
+/// Note: segments don't have to COVER the entire input — spec § 二·四
+/// allows dropping unusable bits (long silence / mumble / noise).
+pub(crate) fn validate_semantic_cuts(
+    decisions: &[SemanticCutDecision],
+    candidates_ms: &[u64],
+    config: &CutConfig,
+) -> Result<(), String> {
+    let candidate_set: std::collections::HashSet<u64> = candidates_ms.iter().copied().collect();
+    let min_ms = ((config.min_segment_s - 1.0).max(0.0) * 1000.0) as u64;
+    let max_ms = (config.max_segment_s * 1000.0) as u64;
+    let mut prev_end = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    for (i, d) in decisions.iter().enumerate() {
+        if !candidate_set.contains(&d.start_ms) {
+            errors.push(format!(
+                "[{i}] start_ms {} 不在候选切点池里",
+                d.start_ms
+            ));
+        }
+        if !candidate_set.contains(&d.end_ms) {
+            errors.push(format!(
+                "[{i}] end_ms {} 不在候选切点池里",
+                d.end_ms
+            ));
+        }
+        let len = d.end_ms.saturating_sub(d.start_ms);
+        if len < min_ms {
+            errors.push(format!(
+                "[{i}] 时长 {len}ms 低于下限 {min_ms}ms"
+            ));
+        }
+        if len > max_ms {
+            errors.push(format!(
+                "[{i}] 时长 {len}ms 超过上限 {max_ms}ms"
+            ));
+        }
+        if d.start_ms < prev_end {
+            errors.push(format!(
+                "[{i}] start_ms {} 与上一段 end_ms {} 重叠",
+                d.start_ms, prev_end
+            ));
+        }
+        prev_end = d.end_ms;
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// HTTP-call wrapper around the prompt builder + response parser +
+/// validator. The actual Ollama call uses `/api/chat` with
+/// `options.num_ctx = config.semantic_num_ctx` (must be ≥32K to fit
+/// one hour of ASR — see `CutConfig::semantic_num_ctx` doc).
+///
+/// `endpoint` must include scheme + host + port, e.g.
+/// `http://100.64.0.4:11434`. Empty endpoint is an error — there is no
+/// sensible fallback because the default Ollama pool member runs with
+/// `num_ctx = 2048` which silently truncates the long prompt.
+///
+/// Test seam: the pure helpers (build_semantic_cut_prompt,
+/// parse_semantic_cut_response, validate_semantic_cuts) are unit-tested
+/// without any network; this function is only covered by an integration
+/// test that requires a reachable Ollama endpoint and is gated on env.
+pub(crate) fn llm_decide_semantic_cuts(
+    pieces: &[AsredPiece],
+    candidates_ms: &[u64],
+    config: &CutConfig,
+) -> Result<Vec<SemanticCutDecision>, String> {
+    if config.semantic_endpoint.trim().is_empty() {
+        return Err(
+            "semantic_endpoint is empty — Mode 2 cannot use the default Ollama \
+             pool because the pool's default num_ctx (2048) silently truncates the \
+             long ASR prompt. Configure semanticEndpoint to a box with ≥40GB RAM, \
+             e.g. http://100.64.0.4:11434."
+                .to_string(),
+        );
+    }
+    let (system, user) = build_semantic_cut_prompt(pieces, candidates_ms, config);
+    let body = json!({
+        "model": config.semantic_model,
+        "stream": false,
+        "format": "json",
+        "options": {
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "num_ctx": config.semantic_num_ctx,
+        },
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ]
+    });
+    let url = format!(
+        "{}/api/chat",
+        config.semantic_endpoint.trim_end_matches('/')
+    );
+    // Generous timeout: a 32B model warming up cold + processing 32K
+    // context can run 90-180s on the first call. Subsequent calls
+    // (when the model is hot) are 20-60s.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(900))
+        .build();
+    let response = agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(body)
+        .map_err(|err| format!("Ollama HTTP 失败：{err}"))?;
+    let raw_body = response
+        .into_string()
+        .map_err(|err| format!("Ollama 响应读取失败：{err}"))?;
+    // Ollama wraps the model's actual JSON in `message.content`.
+    let envelope: Value = serde_json::from_str(&raw_body).map_err(|err| {
+        format!("Ollama 信封非 JSON：{err}\nraw: {}", truncate_for_log(&raw_body, 300))
+    })?;
+    let inner = envelope
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| {
+            format!(
+                "Ollama 信封缺 message.content (raw: {})",
+                truncate_for_log(&raw_body, 300)
+            )
+        })?;
+    let decisions = parse_semantic_cut_response(inner)?;
+    validate_semantic_cuts(&decisions, candidates_ms, config)?;
+    Ok(decisions)
+}
+
 /// Audio preprocessing for Semantic mode.
 ///
 /// Two-stage ffmpeg filter (when rnnoise model is available):
@@ -6622,6 +6915,117 @@ mod tests {
             "expected redirect message, got: {err}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ====================================================================
+    // Phase 4: LLM semantic-cut decision — pure-fn tests
+    // ====================================================================
+
+    #[test]
+    fn build_semantic_cut_prompt_encodes_spec_rules() {
+        let pieces = vec![
+            AsredPiece { text: "你今天过得怎么样？".into(), start_ms: 0, end_ms: 2400 },
+            AsredPiece { text: "我今天过得还不错。".into(), start_ms: 2400, end_ms: 5800 },
+        ];
+        let candidates = vec![0u64, 2400, 5800];
+        let cfg = CutConfig {
+            mode: CutMode::Semantic,
+            ..CutConfig::default()
+        };
+        let (system, user) = build_semantic_cut_prompt(&pieces, &candidates, &cfg);
+
+        // System prompt must encode the spec's hard rules.
+        assert!(system.contains("6"), "min segment seconds should appear");
+        assert!(system.contains("90"), "max segment seconds should appear");
+        assert!(system.contains("候选切点"), "must reference candidate pool");
+        assert!(system.contains("一问一答"), "spec example must appear");
+        assert!(system.contains("JSON"), "must demand JSON output");
+        assert!(system.contains("\"segments\""), "must pin output schema");
+
+        // User prompt must list every piece + every candidate.
+        assert!(user.contains("0, 2400, 5800"), "all candidates listed");
+        assert!(user.contains("你今天过得怎么样"), "piece 0 text present");
+        assert!(user.contains("我今天过得还不错"), "piece 1 text present");
+        assert!(user.contains("[0–2400ms]"), "global timestamps formatted");
+    }
+
+    #[test]
+    fn parse_semantic_cut_response_accepts_valid_json() {
+        let raw = r#"{
+            "segments": [
+                {"start_ms": 0, "end_ms": 2400, "reason": "完整问句"},
+                {"start_ms": 2400, "end_ms": 5800, "reason": "完整答句"}
+            ]
+        }"#;
+        let parsed = parse_semantic_cut_response(raw).expect("valid response parses");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].start_ms, 0);
+        assert_eq!(parsed[0].end_ms, 2400);
+        assert_eq!(parsed[0].reason, "完整问句");
+        assert_eq!(parsed[1].start_ms, 2400);
+        assert_eq!(parsed[1].end_ms, 5800);
+    }
+
+    #[test]
+    fn parse_semantic_cut_response_rejects_missing_fields() {
+        // Missing end_ms.
+        let raw = r#"{"segments":[{"start_ms":0,"reason":"x"}]}"#;
+        let err = parse_semantic_cut_response(raw).unwrap_err();
+        assert!(err.contains("end_ms missing"), "got: {err}");
+
+        // end_ms <= start_ms.
+        let raw = r#"{"segments":[{"start_ms":100,"end_ms":100,"reason":"x"}]}"#;
+        let err = parse_semantic_cut_response(raw).unwrap_err();
+        assert!(err.contains("> start_ms"), "got: {err}");
+
+        // Not even JSON.
+        let err = parse_semantic_cut_response("not json").unwrap_err();
+        assert!(err.contains("非 JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_semantic_cuts_enforces_candidates_and_lengths() {
+        let cfg = CutConfig {
+            mode: CutMode::Semantic,
+            min_segment_s: 6.0,
+            max_segment_s: 90.0,
+            ..CutConfig::default()
+        };
+        let candidates = vec![0u64, 8000, 20000, 95000];
+
+        // Happy path: lengths in [5s, 90s] (5s ok because min has a 1s
+        // grace per spec § 二·一·1 "弹性处理"); cut points all in pool.
+        let good = vec![
+            SemanticCutDecision { start_ms: 0, end_ms: 8000, reason: String::new() },
+            SemanticCutDecision { start_ms: 8000, end_ms: 20000, reason: String::new() },
+        ];
+        validate_semantic_cuts(&good, &candidates, &cfg).expect("good cuts validate");
+
+        // Cut point not in candidate pool.
+        let invented = vec![SemanticCutDecision {
+            start_ms: 0,
+            end_ms: 12345,  // not in candidates
+            reason: String::new(),
+        }];
+        let err = validate_semantic_cuts(&invented, &candidates, &cfg).unwrap_err();
+        assert!(err.contains("不在候选切点池"), "got: {err}");
+
+        // Too long: 95s > 90s ceiling.
+        let too_long = vec![SemanticCutDecision {
+            start_ms: 0,
+            end_ms: 95000,
+            reason: String::new(),
+        }];
+        let err = validate_semantic_cuts(&too_long, &candidates, &cfg).unwrap_err();
+        assert!(err.contains("超过上限"), "got: {err}");
+
+        // Overlap.
+        let overlap = vec![
+            SemanticCutDecision { start_ms: 0, end_ms: 20000, reason: String::new() },
+            SemanticCutDecision { start_ms: 8000, end_ms: 95000, reason: String::new() },
+        ];
+        let err = validate_semantic_cuts(&overlap, &candidates, &cfg).unwrap_err();
+        assert!(err.contains("重叠"), "got: {err}");
     }
 
     /// Phase 3 end-to-end: synthesise a 12-second waveform with three
