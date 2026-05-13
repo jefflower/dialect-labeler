@@ -1924,6 +1924,133 @@ pub(crate) fn llm_decide_semantic_cuts(
     Ok(decisions)
 }
 
+// ===========================================================================
+// Phase 5 — Per-segment text normalisation
+// ===========================================================================
+//
+// After Phase 4 merges fine ASR pieces into 6-90s semantic units, each
+// unit's text is still the raw ASR output (no spec punctuation, digits
+// as digits, particles inconsistent). Phase 5 hands each segment to
+// the LLM with a normalisation prompt that encodes the spec's 三·转写规则
+// chapter, gets back a clean string.
+
+/// System prompt for per-segment Mandarin normalisation. Pure constant
+/// so test cases can assert the wording without rebuilding the prompt
+/// every time.
+pub(crate) const SEMANTIC_NORMALIZE_PROMPT: &str = "\
+你是一个普通话录音转写规范化助手。任务：把下面一段 ASR 的初稿改写成符合规范的最终转写文本。
+
+【硬性规则】
+1. 全部使用简体中文宋体字符。
+2. 数字一律用汉字写（不要阿拉伯数字、不要百分号）。例：`20%` → `百分之二十`。
+3. 内个 → 那个。其它常见网络口语词按发音转写（灰常 / 孩纸 / 童鞋 等保留）。
+4. 他/她/它 按语义消歧：人男用「他」，人女用「她」，物用「它」，无明确性别指向的人用「他」。
+5. 儿化音：影响语义的转写出（如「那些花儿」），不影响语义的不转写。
+6. 语气词、拟声词正常转写（嗯啊对哈哈呵呵嘿嘿欸捏咧）。捧哏类「嗯」「啊」要正常转写并加标点。
+
+【标点规则】
+1. 全部中文标点：。？！，、；：……——「」《》（）
+2. 明显停顿必须标点：180ms 以上停顿按语义补标点；连续无停顿短句允许连写。
+3. 句号：语调下降 + 完整语义 + 停顿。
+4. 问号：语调上扬 + 疑问语义。
+5. 感叹号：语调强 + 情绪强 + 停顿。
+6. 逗号：短停顿、语义未结束。
+7. 拖长音 200-700ms：在词尾加 `...`；700ms 以上且语义未结束：转写为 `【……】`。
+
+【输出格式】仅 JSON，不要 markdown，不要前后注释：
+{\"text\":\"<规范化后的中文文本>\"}
+";
+
+/// Run Phase 5 on one segment. Calls the same `semantic_endpoint`
+/// configured in `CutConfig` (the box that already has `num_ctx≥32K`
+/// loaded — though normalisation needs only ~2K context, sharing the
+/// endpoint avoids holding two warm Qwen 32B copies on different
+/// nodes).
+///
+/// On any LLM failure (HTTP error, empty response, malformed JSON),
+/// falls back to the raw ASR text rather than blocking the whole
+/// pipeline — Phase 6's auto-QA will surface the segment as needing
+/// human review.
+pub(crate) fn llm_normalize_segment_text(
+    raw_asr: &str,
+    config: &CutConfig,
+) -> Result<String, String> {
+    if config.semantic_endpoint.trim().is_empty() {
+        return Err("semantic_endpoint required for Mode 2 normalisation".into());
+    }
+    let body = json!({
+        "model": config.semantic_model,
+        "stream": false,
+        "format": "json",
+        "options": {
+            "temperature": 0.1,
+            "top_p": 0.9,
+            // Per-segment text is short — 2K is plenty and lets the
+            // host run a hot Qwen instance with a small KV cache.
+            "num_ctx": 2048,
+        },
+        "messages": [
+            {"role": "system", "content": SEMANTIC_NORMALIZE_PROMPT},
+            {"role": "user", "content": raw_asr},
+        ]
+    });
+    let url = format!(
+        "{}/api/chat",
+        config.semantic_endpoint.trim_end_matches('/')
+    );
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(120))
+        .build();
+    let response = agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(body)
+        .map_err(|err| format!("Ollama HTTP 失败：{err}"))?;
+    let raw_body = response
+        .into_string()
+        .map_err(|err| format!("Ollama 响应读取失败：{err}"))?;
+    let envelope: Value = serde_json::from_str(&raw_body).map_err(|err| {
+        format!(
+            "Ollama 信封非 JSON：{err}\nraw: {}",
+            truncate_for_log(&raw_body, 300)
+        )
+    })?;
+    let inner = envelope
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| {
+            format!(
+                "Ollama 信封缺 message.content (raw: {})",
+                truncate_for_log(&raw_body, 300)
+            )
+        })?;
+    parse_semantic_normalize_response(inner)
+}
+
+/// Pure JSON parser for the normalisation response. Accepts the loose
+/// shape `{"text": "<final text>"}` and returns the text trimmed.
+/// Reject empty text — that's a model failure and the orchestrator
+/// will fall back to raw ASR.
+pub(crate) fn parse_semantic_normalize_response(raw: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(raw.trim()).map_err(|err| {
+        format!(
+            "normalize 响应非 JSON：{err} (raw: {})",
+            truncate_for_log(raw, 200)
+        )
+    })?;
+    let text = value
+        .get("text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("normalize 响应缺 text 字段 (raw: {})", truncate_for_log(raw, 200)))?
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return Err("normalize 响应 text 为空".into());
+    }
+    Ok(text)
+}
+
 /// Audio preprocessing for Semantic mode.
 ///
 /// Two-stage ffmpeg filter (when rnnoise model is available):
@@ -7026,6 +7153,58 @@ mod tests {
         ];
         let err = validate_semantic_cuts(&overlap, &candidates, &cfg).unwrap_err();
         assert!(err.contains("重叠"), "got: {err}");
+    }
+
+    // ====================================================================
+    // Phase 5: per-segment normalisation — pure-fn tests
+    // ====================================================================
+
+    #[test]
+    fn semantic_normalize_prompt_pins_spec_rules() {
+        // The constant prompt must mention each high-leverage spec
+        // rule so a future "improvement" doesn't quietly drop one.
+        // (We're not asserting exact wording, just that the rule is
+        // reachable in the prompt text.)
+        let p = SEMANTIC_NORMALIZE_PROMPT;
+        assert!(p.contains("简体"), "simplified Chinese rule");
+        assert!(p.contains("数字") && p.contains("汉字"), "digits → Chinese");
+        assert!(p.contains("内个") && p.contains("那个"), "内个 → 那个");
+        assert!(p.contains("他") && p.contains("她") && p.contains("它"), "他她它 disambig");
+        assert!(p.contains("儿化"), "儿化音 rule");
+        assert!(p.contains("180ms") || p.contains("180毫秒") || p.contains("180"), "stop threshold");
+        assert!(p.contains("拖长音"), "sustained-sound rule");
+        assert!(p.contains("【……】"), "long-sustain bracket");
+        assert!(p.contains("\"text\""), "output schema pinned");
+        assert!(p.contains("JSON") || p.contains("json"), "JSON mandated");
+    }
+
+    #[test]
+    fn parse_semantic_normalize_response_accepts_valid_payload() {
+        let raw = r#"{"text":"你好，今天天气真不错。"}"#;
+        let out = parse_semantic_normalize_response(raw).expect("valid parse");
+        assert_eq!(out, "你好，今天天气真不错。");
+    }
+
+    #[test]
+    fn parse_semantic_normalize_response_trims_whitespace() {
+        let raw = r#"{"text":"  你好，今天。  "}"#;
+        let out = parse_semantic_normalize_response(raw).expect("valid parse");
+        assert_eq!(out, "你好，今天。");
+    }
+
+    #[test]
+    fn parse_semantic_normalize_response_rejects_bad_payloads() {
+        // Not JSON.
+        let err = parse_semantic_normalize_response("not json").unwrap_err();
+        assert!(err.contains("非 JSON"));
+
+        // Missing `text`.
+        let err = parse_semantic_normalize_response(r#"{"foo":"bar"}"#).unwrap_err();
+        assert!(err.contains("缺 text 字段"));
+
+        // Empty text.
+        let err = parse_semantic_normalize_response(r#"{"text":"  "}"#).unwrap_err();
+        assert!(err.contains("text 为空"));
     }
 
     /// Phase 3 end-to-end: synthesise a 12-second waveform with three
