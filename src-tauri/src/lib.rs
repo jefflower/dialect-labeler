@@ -1531,55 +1531,104 @@ pub(crate) fn cut_audio_file_impl(
     }
 }
 
-/// Stub for the Semantic-mode pipeline. Successive phases land:
-///   Phase 1 (this file): scaffold + dispatch ✓
-///   Phase 2: audio preprocessing (loudnorm + optional rnnoise) ✓
-///   Phase 3: fine pre-cut + ASR
-///   Phase 4: LLM semantic-cut decision (Qwen2.5:32b @ huayu, ctx=32K)
-///   Phase 5: re-cut + per-segment normalisation
-///   Phase 6: auto-QA + Excel export
-///
-/// Returns an error until Phase 3 lands so a user who flips the toggle
-/// gets a clear diagnostic rather than silently dropping the audio
-/// somewhere mid-pipeline.
+/// Mode-2 dispatcher in this entry point only does input validation +
+/// returns a clear redirect. The full pipeline needs an `AppHandle`
+/// for ASR progress events and is too long to share semantics with
+/// the per-file Dialect cutter (preprocess → fine pre-cut → ASR → LLM
+/// cut → re-cut → normalise → QA → Excel export). The frontend should
+/// detect `mode == "semantic"` and call the dedicated
+/// `run_semantic_pipeline` Tauri command instead.
 fn cut_audio_file_semantic_impl(
-    input_path: String,
-    segments_dir: String,
-    config: CutConfig,
+    _input_path: String,
+    _segments_dir: String,
+    _config: CutConfig,
     _role: Option<String>,
     _topic_id: Option<u32>,
     _original_text: Option<String>,
     _emotion: Option<Vec<String>>,
     _target_file_names: Vec<String>,
 ) -> Result<Vec<SegmentRecord>, String> {
-    ensure_ffmpeg()?;
-    let input = PathBuf::from(&input_path);
-    if !input.is_file() {
-        return Err(format!("Input audio not found: {}", input_path));
+    Err(
+        "Semantic mode does not use the per-file cut command. Call \
+         `run_semantic_pipeline` instead — it preprocesses, fine-pre-cuts, \
+         ASRs, asks the LLM to merge into 6-90s semantic units, normalises \
+         text, and exports Excel as a single orchestrated pass."
+            .to_string(),
+    )
+}
+
+/// Phase 3 (fine pre-cut for Semantic mode).
+///
+/// Slices the normalised audio into a flat list of ~10-30s pieces using
+/// strict-but-permissive silence detection. The point isn't to honour
+/// semantic boundaries (that's Phase 4's job, post-ASR) — it's to give
+/// Whisper individually-manageable chunks and to build a *candidate
+/// cut point pool* the LLM will later snap its decisions to.
+///
+/// Returns `(piece_files, candidate_boundaries_ms)`:
+/// - `piece_files`: paths to the cut WAV files, in order. The caller
+///   ASRs each piece and builds `[(text, global_start_ms, global_end_ms)]`.
+/// - `candidate_boundaries_ms`: the global timestamps where one piece
+///   ends and the next begins. Phase 4's LLM must choose merge points
+///   from this list (so the final cuts land on real silence gaps, not
+///   in the middle of a word).
+///
+/// The silence-detection parameters here are **independent** of the
+/// project's main CutConfig — Mode 2 calibrates them locally:
+///   - silence_db: -35 (post-loudnorm signal is well-controlled,
+///     a static threshold works)
+///   - min_silence_ms: 200 (catch even short breath gaps as cut points)
+///   - min_segment_ms: 200 (don't drop tiny utterances)
+///   - max_segment_ms: 30000 (Whisper's quality drops past ~30s)
+///   - pre/post_roll: 50 each (small safety margin; spec § 二·三·1
+///     mandates ≥150 ms head/tail in the FINAL output, but Phase 4
+///     adds extra padding when it emits final cuts)
+fn fine_pre_cut_for_semantic(
+    input: &Path,
+    pieces_dir: &Path,
+) -> Result<(Vec<PathBuf>, Vec<u64>), String> {
+    let probe = probe_audio(input)?;
+    let duration_ms = probe
+        .duration_ms
+        .ok_or_else(|| "ffprobe couldn't read input duration".to_string())?;
+    let duration_sec = duration_ms as f64 / 1000.0;
+
+    let fine_config = CutConfig {
+        silence_db: -35.0,
+        min_silence_ms: 200,
+        min_segment_ms: 200,
+        pre_roll_ms: 50,
+        post_roll_ms: 50,
+        max_segment_ms: 30_000,
+        ..CutConfig::default()
+    };
+    let events = detect_silence(input, &fine_config)?;
+    let ranges = build_segment_ranges(duration_sec, &events, &fine_config);
+    if ranges.is_empty() {
+        return Err("fine pre-cut produced 0 segments — input may be silent".into());
     }
-    let work_dir = PathBuf::from(&segments_dir).join(".semantic-pipeline");
-    fs::create_dir_all(&work_dir).map_err(|err| err.to_string())?;
 
-    // Phase 2: write a normalised copy to a known location in the work
-    // dir. Subsequent phases consume this normalised file rather than
-    // the raw input.
-    let normalised = work_dir.join(format!(
-        "01_normalised_{}.wav",
-        path_file_stem(&input)
-    ));
-    preprocess_audio_for_semantic(
-        &input,
-        &normalised,
-        config.target_loudness_lufs,
-        find_rnnoise_model().as_deref(),
-    )?;
-
-    Err(format!(
-        "Semantic cut pipeline only got through Phase 2 (audio \
-         preprocessing). Normalised file is at {}. Phases 3-6 (ASR + \
-         LLM cut decision + re-cut + Excel export) are still landing.",
-        path_to_string(&normalised)
-    ))
+    fs::create_dir_all(pieces_dir).map_err(|err| err.to_string())?;
+    let codec = output_pcm_codec(&probe);
+    let mut piece_paths = Vec::with_capacity(ranges.len());
+    let mut boundaries = Vec::with_capacity(ranges.len() + 1);
+    // The first boundary is always 0 (start of audio). Each piece end
+    // adds the next boundary, building a complete partition.
+    boundaries.push(0u64);
+    for (i, (start_sec, end_sec)) in ranges.iter().enumerate() {
+        let piece_path = pieces_dir.join(format!("piece_{i:04}.wav"));
+        write_pcm_wav_segment(
+            input,
+            &piece_path,
+            *start_sec,
+            end_sec - start_sec,
+            &probe,
+            codec,
+        )?;
+        piece_paths.push(piece_path);
+        boundaries.push(seconds_to_ms(*end_sec));
+    }
+    Ok((piece_paths, boundaries))
 }
 
 /// Audio preprocessing for Semantic mode.
@@ -6542,15 +6591,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Phase 2 stub-guard: Semantic-mode dispatch goes through the
-    /// preprocess + (eventually) ASR / LLM / etc. With ffmpeg in the
-    /// environment and a non-audio "fake" input, ffmpeg fails fast,
-    /// which we observe as the preprocess error bubbling up. Either
-    /// way, the call must NOT silently fall back to Dialect cutter.
+    /// Calling the per-file cutter with Semantic mode must redirect the
+    /// caller to the new top-level `run_semantic_pipeline` command —
+    /// NOT silently fall back to Dialect cutter.
     #[test]
-    fn semantic_mode_does_not_fall_back_to_dialect() {
+    fn semantic_mode_redirects_to_dedicated_pipeline() {
         let dir = std::env::temp_dir()
-            .join(format!("semantic-dispatch-guard-{}", std::process::id()));
+            .join(format!("semantic-redirect-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let input = dir.join("never-used.wav");
@@ -6569,14 +6616,81 @@ mod tests {
             None,
             Vec::new(),
         );
-        let err = res.expect_err("Semantic must not return Dialect segments");
-        // Acceptable failure surfaces: ffmpeg refusing the fake WAV
-        // (preprocess phase) OR our explicit pipeline-incomplete error.
+        let err = res.expect_err("Semantic must redirect, not fall through");
         assert!(
-            err.contains("ffmpeg")
-                || err.contains("Phase")
-                || err.contains("preprocess"),
-            "got unexpected error: {err}"
+            err.contains("run_semantic_pipeline"),
+            "expected redirect message, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 3 end-to-end: synthesise a 12-second waveform with three
+    /// burst-then-silence regions, run `fine_pre_cut_for_semantic`,
+    /// verify it produces multiple piece files with monotonically
+    /// increasing boundaries that partition the source. The point of
+    /// the test isn't to pin down exact piece count (silence detection
+    /// is sensitive to input shape) — it's to guarantee:
+    ///   - at least 2 pieces emerge (the function actually slices)
+    ///   - every piece file exists and is readable
+    ///   - boundaries are strictly monotonic + start at 0 + last
+    ///     value ≈ source duration (within tolerance)
+    #[test]
+    fn fine_pre_cut_for_semantic_produces_multiple_pieces() {
+        let ffmpeg_ok = silent_command("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ffmpeg_ok {
+            eprintln!("skipping fine-pre-cut test — ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("fine-pre-cut-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("input.wav");
+        let pieces = dir.join("pieces");
+
+        // burst-silence-burst-silence-burst — 3 audible regions across
+        // ~12s. Concat is simpler than aevalsrc conditionals and
+        // makes the silence boundaries crisp / deterministic.
+        let synth = silent_command("ffmpeg")
+            .arg("-y").arg("-hide_banner").arg("-loglevel").arg("error")
+            .arg("-f").arg("lavfi").arg("-i").arg("sine=frequency=440:duration=3:sample_rate=48000")
+            .arg("-f").arg("lavfi").arg("-i").arg("anullsrc=duration=2:sample_rate=48000")
+            .arg("-f").arg("lavfi").arg("-i").arg("sine=frequency=440:duration=3:sample_rate=48000")
+            .arg("-f").arg("lavfi").arg("-i").arg("anullsrc=duration=2:sample_rate=48000")
+            .arg("-f").arg("lavfi").arg("-i").arg("sine=frequency=440:duration=2:sample_rate=48000")
+            .arg("-filter_complex").arg("[0][1][2][3][4]concat=n=5:v=0:a=1[out]")
+            .arg("-map").arg("[out]")
+            .arg("-ar").arg("48000").arg("-ac").arg("1")
+            .arg("-c:a").arg("pcm_s16le")
+            .arg(&src)
+            .status()
+            .expect("ffmpeg synth");
+        assert!(synth.success(), "synth failed");
+
+        let (paths, boundaries) =
+            fine_pre_cut_for_semantic(&src, &pieces).expect("fine pre-cut");
+        assert!(
+            paths.len() >= 2,
+            "expected multiple pieces, got {}",
+            paths.len()
+        );
+        for p in &paths {
+            assert!(p.is_file(), "piece file missing: {}", p.display());
+        }
+        // Boundaries: starts at 0, strictly increasing, last is ≤ 12.3s.
+        assert_eq!(boundaries.first().copied(), Some(0));
+        let mut prev = 0u64;
+        for b in &boundaries[1..] {
+            assert!(*b > prev, "boundary not monotonic: {b} <= {prev}");
+            prev = *b;
+        }
+        assert!(
+            *boundaries.last().unwrap() <= 12_500,
+            "last boundary {} exceeds 12.5s",
+            boundaries.last().unwrap()
         );
         let _ = fs::remove_dir_all(&dir);
     }
