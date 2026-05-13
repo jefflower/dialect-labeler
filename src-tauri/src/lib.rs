@@ -2152,6 +2152,159 @@ pub(crate) fn auto_qa_segment(
     issues
 }
 
+// ===========================================================================
+// Phase 7 — Export (WAV slicing + xlsx) for Semantic mode
+// ===========================================================================
+//
+// Spec § 四·(二) data format:
+//   - WAV per segment, named `<spk>_<业务类型>_<录制形式>_<日期>_<时长>_<NNNNNN>`
+//   - xlsx with columns: 源文件名 / 剪辑文件名 / 转写内容 / 问题记录
+//
+// Phase 4's LLM produced [(start_ms, end_ms)] tuples on the normalised
+// source audio. Phase 5 normalised the text for each. Phase 6 ran
+// auto-QA. This module ties them together: emits one WAV per segment
+// (cut from the same normalised source — no concat boundary clicks)
+// and one xlsx that the QA team opens directly.
+
+/// One row of the export deliverable.
+pub(crate) struct SemanticExportSegment {
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+    pub(crate) final_text: String,
+    pub(crate) problems: Vec<String>,
+}
+
+/// Generate the segment filename for spec § 四·一 naming.
+///
+/// `spec_stem` is everything before the `_NNNNNN` sequence number —
+/// usually carried over from the source filename (e.g.
+/// `spkA_Freetalk_freetalk_260101_40m`). `seq_one_based` starts at 1.
+///
+/// Output: `<spec_stem>_<NNNNNN>.wav` (six-digit zero-padded sequence).
+pub(crate) fn semantic_segment_filename(spec_stem: &str, seq_one_based: usize) -> String {
+    format!("{spec_stem}_{:06}.wav", seq_one_based)
+}
+
+/// Try to derive the spec_stem from a source filename.
+///
+/// Accepts the spec example shape `spk_A_FREETALK_0606_68M_01.wav` and
+/// the variant `spkA_Freetalk_freetalk_260101_40m.wav`. When the
+/// filename doesn't match the spec, returns the bare file stem — the
+/// reviewer can then rename in their delivery script.
+pub(crate) fn derive_spec_stem(source_path: &Path) -> String {
+    let stem = path_file_stem(source_path);
+    // Strip a trailing `_<digits>` sequence marker if present, so a
+    // source like `…_40m_01` becomes the canonical `…_40m`.
+    let trailing_seq = Regex::new(r"_\d{1,6}$").expect("valid regex");
+    trailing_seq.replace(&stem, "").to_string()
+}
+
+/// Run the export: emit one WAV per segment cut from `normalised_source`
+/// at the LLM-decided boundaries, plus an xlsx with the spec's four
+/// columns. Returns paths to the xlsx + the emitted WAV files.
+///
+/// Source file naming (spec § 四·一):
+///   `<spec_stem>_<NNNNNN>.wav`
+/// The xlsx is named `<spec_stem>.xlsx` next to the WAVs.
+pub(crate) fn export_semantic_mode(
+    out_dir: &Path,
+    normalised_source: &Path,
+    spec_stem: &str,
+    source_basename_for_csv: &str,
+    segments: &[SemanticExportSegment],
+) -> Result<(PathBuf, Vec<PathBuf>), String> {
+    if segments.is_empty() {
+        return Err("no segments to export".into());
+    }
+    fs::create_dir_all(out_dir).map_err(|err| err.to_string())?;
+
+    // Probe once — re-cutting uses the same codec/sample-rate as the
+    // source so all output WAVs match.
+    let probe = probe_audio(normalised_source)?;
+    let codec = output_pcm_codec(&probe);
+
+    let mut wav_paths = Vec::with_capacity(segments.len());
+    for (i, seg) in segments.iter().enumerate() {
+        let name = semantic_segment_filename(spec_stem, i + 1);
+        let dst = out_dir.join(&name);
+        let start_sec = seg.start_ms as f64 / 1000.0;
+        let dur_sec = (seg.end_ms.saturating_sub(seg.start_ms)) as f64 / 1000.0;
+        write_pcm_wav_segment(normalised_source, &dst, start_sec, dur_sec, &probe, codec)?;
+        wav_paths.push(dst);
+    }
+
+    let xlsx_path = out_dir.join(format!("{spec_stem}.xlsx"));
+    write_semantic_xlsx(&xlsx_path, source_basename_for_csv, spec_stem, segments)?;
+    Ok((xlsx_path, wav_paths))
+}
+
+/// Pure xlsx writer. Separate from the WAV emission so it's unit-testable
+/// without ffmpeg / a source file. Schema:
+///
+///   | 源文件名 | 剪辑文件名 | 转写内容 | 问题记录 |
+fn write_semantic_xlsx(
+    out: &Path,
+    source_basename: &str,
+    spec_stem: &str,
+    segments: &[SemanticExportSegment],
+) -> Result<(), String> {
+    use rust_xlsxwriter::{Format, Workbook};
+
+    let mut workbook = Workbook::new();
+    let sheet = workbook
+        .add_worksheet()
+        .set_name("剪辑记录")
+        .map_err(|err| err.to_string())?;
+
+    let header_fmt = Format::new()
+        .set_bold()
+        .set_background_color("#E7EFFA");
+    let wrap_fmt = Format::new().set_text_wrap();
+
+    let headers = ["源文件名", "剪辑文件名", "转写内容", "问题记录"];
+    for (col, h) in headers.iter().enumerate() {
+        sheet
+            .write_string_with_format(0, col as u16, *h, &header_fmt)
+            .map_err(|err| err.to_string())?;
+    }
+
+    for (i, seg) in segments.iter().enumerate() {
+        let row = (i + 1) as u32;
+        let clip_name = semantic_segment_filename(spec_stem, i + 1);
+        let problems = if seg.problems.is_empty() {
+            String::new()
+        } else {
+            seg.problems.join("；")
+        };
+        sheet
+            .write_string(row, 0, source_basename)
+            .map_err(|err| err.to_string())?;
+        sheet
+            .write_string(row, 1, &clip_name)
+            .map_err(|err| err.to_string())?;
+        sheet
+            .write_string_with_format(row, 2, &seg.final_text, &wrap_fmt)
+            .map_err(|err| err.to_string())?;
+        sheet
+            .write_string_with_format(row, 3, &problems, &wrap_fmt)
+            .map_err(|err| err.to_string())?;
+    }
+
+    // Reasonable initial column widths — text columns get more room.
+    sheet.set_column_width(0, 28.0).ok();
+    sheet.set_column_width(1, 36.0).ok();
+    sheet.set_column_width(2, 80.0).ok();
+    sheet.set_column_width(3, 40.0).ok();
+    sheet
+        .autofilter(0, 0, segments.len() as u32, 3)
+        .map_err(|err| err.to_string())?;
+
+    workbook
+        .save(out)
+        .map_err(|err| format!("xlsx save failed: {err}"))?;
+    Ok(())
+}
+
 /// Audio preprocessing for Semantic mode.
 ///
 /// Two-stage ffmpeg filter (when rnnoise model is available):
@@ -7254,6 +7407,71 @@ mod tests {
         ];
         let err = validate_semantic_cuts(&overlap, &candidates, &cfg).unwrap_err();
         assert!(err.contains("重叠"), "got: {err}");
+    }
+
+    // ====================================================================
+    // Phase 7: export — naming + xlsx writer tests
+    // ====================================================================
+
+    #[test]
+    fn semantic_segment_filename_six_digit_pad() {
+        assert_eq!(
+            semantic_segment_filename("spkA_Freetalk_freetalk_260101_40m", 1),
+            "spkA_Freetalk_freetalk_260101_40m_000001.wav"
+        );
+        assert_eq!(
+            semantic_segment_filename("spkA_Freetalk_freetalk_260101_40m", 999_999),
+            "spkA_Freetalk_freetalk_260101_40m_999999.wav"
+        );
+    }
+
+    #[test]
+    fn derive_spec_stem_strips_trailing_sequence() {
+        assert_eq!(
+            derive_spec_stem(Path::new("/x/y/spk_A_FREETALK_0606_68M_01.wav")),
+            "spk_A_FREETALK_0606_68M"
+        );
+        // Already-bare stem stays put.
+        assert_eq!(
+            derive_spec_stem(Path::new("/x/spkA_Freetalk_freetalk_260101_40m.wav")),
+            "spkA_Freetalk_freetalk_260101_40m"
+        );
+        // Off-spec name is passed through.
+        assert_eq!(
+            derive_spec_stem(Path::new("/x/random-name.wav")),
+            "random-name"
+        );
+    }
+
+    #[test]
+    fn write_semantic_xlsx_emits_a_readable_workbook() {
+        // Verify the writer produces a non-empty file with the xlsx
+        // signature (PK\x03\x04 — xlsx is a ZIP). We don't parse the
+        // workbook back; deeper tests live in the rust_xlsxwriter crate.
+        let dir = std::env::temp_dir().join(format!("xlsx-smoke-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("test.xlsx");
+        let segments = vec![
+            SemanticExportSegment {
+                start_ms: 0,
+                end_ms: 8400,
+                final_text: "你今天过得怎么样？".into(),
+                problems: vec![],
+            },
+            SemanticExportSegment {
+                start_ms: 8400,
+                end_ms: 18000,
+                final_text: "我今天过得还不错，谢谢关心。".into(),
+                problems: vec!["可能存在长停顿".into()],
+            },
+        ];
+        write_semantic_xlsx(&out, "spkA_Freetalk_freetalk_260101_40m.wav", "spkA_Freetalk_freetalk_260101_40m", &segments)
+            .expect("xlsx write");
+        let bytes = fs::read(&out).expect("read back");
+        assert!(bytes.len() > 1000, "xlsx suspiciously tiny: {} bytes", bytes.len());
+        assert_eq!(&bytes[..4], b"PK\x03\x04", "must be a ZIP container");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ====================================================================

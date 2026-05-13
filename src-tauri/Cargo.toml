@@ -50,3 +50,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 walkdir = "2"
 tempfile = "3"
 thiserror = "1"
+# Mode 2 (semantic Mandarin cutter) — writes the spec's required
+# `源文件名 / 剪辑文件名 / 转写内容 / 问题记录` deliverable as a proper
+# xlsx with UTF-8 + autofilter, since CSV in Excel for Mac still
+# trips on Chinese encoding more often than is comfortable.
+rust_xlsxwriter = "0.78"

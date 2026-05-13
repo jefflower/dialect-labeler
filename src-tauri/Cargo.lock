@@ -906,6 +906,7 @@ dependencies = [
  "rayon",
  "regex",
  "rodio",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
  "tauri",
@@ -3604,6 +3605,15 @@ dependencies = [
  "hound",
  "lewton",
  "symphonia",
+]
+
+[[package]]
+name = "rust_xlsxwriter"
+version = "0.78.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21f14f6d77c0b3a1004a4bb84be3993c65c58145e58600d2c6a2955295b7d9c9"
+dependencies = [
+ "zip",
 ]
 
 [[package]]
