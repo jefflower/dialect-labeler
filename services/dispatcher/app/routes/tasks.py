@@ -34,6 +34,8 @@ from sqlalchemy.orm import Session
 from ..auth import CurrentUser
 from ..db import get_db
 from ..models import (
+    ACTIVE_TASK_STATES,
+    TASK_CLOSED,
     TASK_EXPIRED,
     TASK_FAILED,
     TASK_PENDING,
@@ -82,6 +84,23 @@ def _task_to_out(task: Task, db: Session | None = None) -> TaskOut:
     return TaskOut(**data)
 
 
+def _active_task_for(db: Session, owner_id: int) -> Task | None:
+    """Return the owner's currently-active task, or None.
+
+    Single-task-per-user is enforced at create + retry time. Status set
+    matches ACTIVE_TASK_STATES — pending/claimed/running/succeeded.
+    A succeeded task counts as active until the owner explicitly calls
+    POST /tasks/{id}/close (which deletes the bundle and frees the
+    slot).
+    """
+    return db.execute(
+        select(Task)
+        .where(Task.owner_id == owner_id, Task.status.in_(ACTIVE_TASK_STATES))
+        .order_by(Task.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
 @router.post("", response_model=TaskOut, status_code=status.HTTP_201_CREATED)
 async def create_task(
     user: CurrentUser,
@@ -90,6 +109,18 @@ async def create_task(
     name: Annotated[str, Form(min_length=1, max_length=255)],
     file: Annotated[UploadFile, File()],
 ) -> TaskOut:
+    # Single-task-per-user gate. Reject BEFORE accepting the upload so
+    # we don't spool a multi-GB zip to disk just to bounce it.
+    existing = _active_task_for(db, user.id)
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"已有正在进行的任务（{existing.name}, status={existing.status}）。"
+                f"下载产物并调用 /api/tasks/{existing.id}/close 后再上传新任务。"
+            ),
+        )
+
     task_id = uuid.uuid4().hex
     key = input_key(task_id)
 
@@ -112,6 +143,48 @@ async def create_task(
         input_uploaded_at=now,
     )
     db.add(task)
+    db.commit()
+    db.refresh(task)
+    return _task_to_out(task, db)
+
+
+@router.post("/{task_id}/close", response_model=TaskOut)
+def close_task(
+    task_id: str,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+    storage: Annotated[Storage, Depends(get_storage)],
+) -> TaskOut:
+    """Owner-driven terminal cleanup. Promotes a succeeded task to
+    `closed` and deletes both input + output files immediately to free
+    the per-user slot. Metadata (size, summary, timestamps) is kept on
+    the row forever.
+
+    Closing is only valid from `succeeded`. Other states either don't
+    have a downloadable artifact (failed / expired) or are still in
+    the pipeline (pending / claimed / running). For failed / expired
+    tasks the owner should either retry or DELETE.
+    """
+    task = _load_owned(db, task_id, user)
+    if task.status != TASK_SUCCEEDED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Cannot close task in state {task.status}. "
+                "Only succeeded tasks can be closed; use retry/delete for failed."
+            ),
+        )
+
+    now = utcnow()
+    if task.output_path:
+        storage.unlink(task.output_path)
+        task.output_path = None
+    if task.input_path:
+        storage.unlink(task.input_path)
+        task.input_path = None
+    task.status = TASK_CLOSED
+    task.files_cleaned_at = now
+    task.updated_at = now
     db.commit()
     db.refresh(task)
     return _task_to_out(task, db)
@@ -204,6 +277,18 @@ def retry_task(
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
             detail="Input file has been cleaned up; cannot retry",
+        )
+    # Retry resuscitates a task back into the pipeline → it becomes
+    # active. Refuse if the owner already has another active task —
+    # mirror the create-task constraint.
+    other = _active_task_for(db, user.id)
+    if other is not None and other.id != task.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"已有正在进行的任务（{other.name}, status={other.status}）。"
+                "重试此任务之前请先关闭/删除当前活跃任务。"
+            ),
         )
     task.status = TASK_PENDING
     task.error = None

@@ -1,0 +1,112 @@
+name: Build macOS Client
+
+# Builds the FULL macOS Tauri client (cloud worker mode enabled) for both
+# Apple Silicon and Intel Macs on every `v*` tag push. macOS is where
+# the actual cut/recognize/polish pipeline runs — these are the
+# installers that the team's workers download.
+#
+# v1 ships UNSIGNED. Users hit a Gatekeeper "unidentified developer"
+# warning the first time and must right-click → Open. The dispatcher
+# downloads page surfaces this caveat. Codesigning + notarization is
+# tracked separately for v1.1.
+#
+# Two GitHub secrets are optional but recommended:
+#   DISPATCHER_URL   the dispatcher base URL (e.g. https://47-93-1-242.nip.io)
+#   DISPATCHER_TOKEN admin JWT — get it from POST /api/auth/login as admin,
+#                    rotate when an admin leaves the team
+# If neither is set, the macOS dmg still lands on the GH Release page
+# (drafted) and the dispatcher mirror step is skipped.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            dispatcher_target: darwin-aarch64
+          - target: x86_64-apple-darwin
+            dispatcher_target: darwin-x86_64
+
+    name: Build ${{ matrix.target }}
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri full bundle (macOS)
+        run: npm run tauri build -- --target ${{ matrix.target }}
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dialect-labeler-${{ matrix.target }}-${{ github.sha }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach to GitHub release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: '方言标注 ${{ github.ref_name }}'
+          draft: true
+          generate_release_notes: true
+          files: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+
+      # Tag-only push to dispatcher /api/releases for the in-app
+      # downloads page. Skipped when DISPATCHER_URL/_TOKEN are unset.
+      - name: Mirror dmg to dispatcher /downloads
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          DISPATCHER_URL: ${{ secrets.DISPATCHER_URL }}
+          DISPATCHER_TOKEN: ${{ secrets.DISPATCHER_TOKEN }}
+        run: |
+          if [[ -z "${DISPATCHER_URL:-}" || -z "${DISPATCHER_TOKEN:-}" ]]; then
+            echo "DISPATCHER_URL or DISPATCHER_TOKEN not set; skipping mirror."
+            exit 0
+          fi
+          DMG=$(ls src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg | head -n1)
+          if [[ -z "$DMG" ]]; then
+            echo "no dmg found — skipping mirror"
+            exit 0
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          curl -fsS -X POST "$DISPATCHER_URL/api/releases" \
+            -H "Authorization: Bearer $DISPATCHER_TOKEN" \
+            -F "version=$VERSION" \
+            -F "target=${{ matrix.dispatcher_target }}" \
+            -F "channel=stable" \
+            -F "notes=macOS unsigned · tag $GITHUB_REF_NAME (commit $GITHUB_SHA) · 首次启动右键打开即可绕过 Gatekeeper" \
+            -F "file=@$DMG"
+          echo "uploaded $DMG to dispatcher target=${{ matrix.dispatcher_target }}"

@@ -62,9 +62,42 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          name: '长沙方言标注审核版 ${{ github.ref_name }}'
+          name: '方言标注审核版 ${{ github.ref_name }}'
           draft: true
           generate_release_notes: true
           files: |
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+
+      # On a tag push, ALSO mirror the installer into the dispatcher's
+      # /downloads listing so end users have a single canonical place to
+      # grab clients. Skipped when DISPATCHER_URL/_TOKEN are unset (e.g.
+      # main-branch CI without the production secrets configured).
+      - name: Mirror installer to dispatcher /downloads (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          DISPATCHER_URL: ${{ secrets.DISPATCHER_URL }}
+          DISPATCHER_TOKEN: ${{ secrets.DISPATCHER_TOKEN }}
+        run: |
+          if (-not $env:DISPATCHER_URL -or -not $env:DISPATCHER_TOKEN) {
+            Write-Host "DISPATCHER_URL or DISPATCHER_TOKEN not set; skipping mirror."
+            exit 0
+          }
+          $msi = Get-ChildItem `
+            -Path "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi" `
+            | Select-Object -First 1
+          if (-not $msi) { throw "no msi produced" }
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $form = @{
+            version = $version
+            target  = "windows-x86_64"
+            channel = "stable"
+            notes   = "Reviewer build · tag ${{ github.ref_name }} (commit ${{ github.sha }}) · no auto-update; users download manually."
+            file    = Get-Item $msi.FullName
+          }
+          $headers = @{ Authorization = "Bearer $env:DISPATCHER_TOKEN" }
+          $resp = Invoke-RestMethod `
+            -Uri "$env:DISPATCHER_URL/api/releases" `
+            -Method Post -Headers $headers -Form $form
+          Write-Host "uploaded release id=$($resp.id) version=$($resp.version)"

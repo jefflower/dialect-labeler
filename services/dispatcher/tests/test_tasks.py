@@ -331,3 +331,145 @@ def test_admin_can_delete_other_users_task(client: TestClient) -> None:
     assert resp.status_code == 204
     resp = client.get(f"/api/tasks/{task_id}", headers=auth_headers(token_b))
     assert resp.status_code == 404
+
+
+def test_cannot_upload_when_active_task_exists(client: TestClient) -> None:
+    """Per-user single-task gate. Second create_task while the first is
+    still pending must be rejected with 409 BEFORE the new zip is
+    accepted to disk."""
+    register(client, "u@example.com")
+    token = login(client, "u@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "first"},
+        files={"file": ("a.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(token),
+    )
+    assert resp.status_code == 201
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "second"},
+        files={"file": ("b.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(token),
+    )
+    assert resp.status_code == 409
+    assert "已有正在进行的任务" in resp.text
+
+
+def test_close_succeeded_task_clears_files_and_frees_slot(
+    client: TestClient, tmp_state
+) -> None:
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    task_id = _complete_task_as_worker(client, owner, worker)
+
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "blocked"},
+        files={"file": ("b.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    assert resp.status_code == 409
+
+    resp = client.post(f"/api/tasks/{task_id}/close", headers=auth_headers(owner))
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "closed"
+
+    storage_dir = tmp_state / "storage"
+    assert not any((storage_dir / "outputs").iterdir())
+    assert not any((storage_dir / "inputs").iterdir())
+
+    resp = client.get(f"/api/tasks/{task_id}/output", headers=auth_headers(owner))
+    assert resp.status_code in (409, 410)
+
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "after-close"},
+        files={"file": ("c.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    assert resp.status_code == 201
+
+
+def test_cannot_close_pending_task(client: TestClient) -> None:
+    register(client, "u@example.com")
+    token = login(client, "u@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "still-pending"},
+        files={"file": ("t.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(token),
+    )
+    task_id = resp.json()["id"]
+    resp = client.post(f"/api/tasks/{task_id}/close", headers=auth_headers(token))
+    assert resp.status_code == 409
+
+
+def test_cannot_close_another_users_task(client: TestClient) -> None:
+    register(client, "a@example.com")
+    register(client, "b@example.com")
+    register(client, "c@example.com")
+    register(client, "w@example.com")
+    token_b = login(client, "b@example.com")
+    token_c = login(client, "c@example.com")
+    token_w = login(client, "w@example.com")
+    task_id = _complete_task_as_worker(client, token_b, token_w)
+    resp = client.post(f"/api/tasks/{task_id}/close", headers=auth_headers(token_c))
+    assert resp.status_code in (403, 404)
+
+
+def test_failed_task_does_not_block_new_uploads(client: TestClient) -> None:
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "doomed"},
+        files={"file": ("a.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_id = resp.json()["id"]
+    client.post("/api/worker/claim", headers=auth_headers(worker))
+    client.post(
+        f"/api/worker/tasks/{task_id}/fail",
+        json={"error": "boom"},
+        headers=auth_headers(worker),
+    )
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "fresh"},
+        files={"file": ("b.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    assert resp.status_code == 201
+
+
+def test_retry_blocked_by_other_active_task(client: TestClient) -> None:
+    register(client, "o@example.com")
+    register(client, "w@example.com")
+    owner = login(client, "o@example.com")
+    worker = login(client, "w@example.com")
+    resp = client.post(
+        "/api/tasks",
+        data={"name": "old-fail"},
+        files={"file": ("a.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    task_a = resp.json()["id"]
+    client.post("/api/worker/claim", headers=auth_headers(worker))
+    client.post(
+        f"/api/worker/tasks/{task_a}/fail",
+        json={"error": "x"},
+        headers=auth_headers(worker),
+    )
+    client.post(
+        "/api/tasks",
+        data={"name": "active"},
+        files={"file": ("b.zip", io.BytesIO(_make_zip_bytes()), "application/zip")},
+        headers=auth_headers(owner),
+    )
+    resp = client.post(f"/api/tasks/{task_a}/retry", headers=auth_headers(owner))
+    assert resp.status_code == 409

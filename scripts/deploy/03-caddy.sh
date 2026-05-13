@@ -1,31 +1,40 @@
 #!/usr/bin/env bash
-# 03-caddy.sh — write the production Caddyfile and reload caddy.
+# 03-caddy.sh — write the Caddyfile and reload caddy.
 #
-# Idempotent. Re-runs replace the Caddyfile in place + reload.
+# Two modes, picked by the CADDY_DOMAIN env var:
 #
-# Defaults to `47-93-1-242.nip.io` (the user's Aliyun ECS public IP via
-# nip.io magic DNS) so Let's Encrypt issues a real TLS cert without
-# requiring a purchased domain. Override at any time:
+#   CADDY_DOMAIN=<hostname>   → HTTPS with Let's Encrypt auto-issuance.
+#                               Requires inbound 80 + 443 reachable from
+#                               the public internet (cloud security
+#                               group + host firewall both open).
 #
-#   CADDY_DOMAIN=dispatcher.example.com bash 03-caddy.sh
+#   CADDY_DOMAIN=:8080         → plain HTTP on port 8080. The dispatcher
+#                               is served at http://<server>:8080/. TLS
+#                               is the caller's job (Aliyun SLB,
+#                               Cloudflare in front, etc.). Use when
+#                               the cloud security group only permits
+#                               8080 inbound — the case where every
+#                               other port (80/443/anything ≥1024) is
+#                               firewalled off at the cloud-level.
 #
-# When you move to a real domain, point its A record at this server's
-# public IP, re-run this script with CADDY_DOMAIN set, and caddy will
-# auto-issue + auto-renew the new cert.
+# Default is the HTTP-on-8080 mode because the production target's
+# Aliyun security group has been narrowed to that single port.
 
 set -euo pipefail
 
 step() { echo; echo "▶ $*"; }
 
-CADDY_DOMAIN="${CADDY_DOMAIN:-47-93-1-242.nip.io}"
+CADDY_DOMAIN="${CADDY_DOMAIN:-:8080}"
 ADMIN_EMAIL_FOR_LE="${ADMIN_EMAIL_FOR_LE:-}"  # optional; LE will email cert-expiry alerts here
+UPSTREAM="${UPSTREAM:-127.0.0.1:9000}"  # dispatcher container's host-side loopback bind
 
 # ---------------------------------------------------------------------------
-step "1. write Caddyfile (domain=$CADDY_DOMAIN)"
+step "1. write Caddyfile (site=$CADDY_DOMAIN, upstream=$UPSTREAM)"
 # ---------------------------------------------------------------------------
 mkdir -p /etc/caddy
 {
-  if [[ -n "$ADMIN_EMAIL_FOR_LE" ]]; then
+  # The global block (only emitted when in HTTPS mode + LE email set).
+  if [[ -n "$ADMIN_EMAIL_FOR_LE" && "$CADDY_DOMAIN" != :* ]]; then
     echo "{"
     echo "    email $ADMIN_EMAIL_FOR_LE"
     echo "}"
@@ -45,13 +54,13 @@ $CADDY_DOMAIN {
     # Health check from off-host monitoring stays cheap (no logs).
     @healthz path /healthz
     handle @healthz {
-        reverse_proxy 127.0.0.1:8080
+        reverse_proxy $UPSTREAM
     }
 
     # Long-lived response streaming for /api/worker/* — claim/heartbeat
     # don't need it, but downloading a multi-GB output zip from the
     # worker does. Bump timeouts past defaults.
-    reverse_proxy 127.0.0.1:8080 {
+    reverse_proxy $UPSTREAM {
         flush_interval -1
         transport http {
             read_timeout 30m
@@ -77,7 +86,27 @@ systemctl is-active caddy
 # ---------------------------------------------------------------------------
 step "4. smoke-test"
 # ---------------------------------------------------------------------------
-# Pause briefly so Caddy completes the ACME challenge against LE.
+if [[ "$CADDY_DOMAIN" == :* ]]; then
+  # Plain-HTTP mode: caddy is listening on the bare port, hit /healthz
+  # directly. No ACME involved → it should respond instantly.
+  port="${CADDY_DOMAIN#:}"
+  for i in {1..15}; do
+    if curl -fsS --max-time 5 "http://127.0.0.1:$port/healthz" 2>/dev/null \
+        | grep -q '"ok":true'; then
+      echo "✅ http://<server>:$port/healthz returns 200"
+      echo "  (TLS is the caller's job — front this with SLB / Cloudflare / etc."
+      echo "   if you need https. The dispatcher itself ships plaintext over $port.)"
+      exit 0
+    fi
+    sleep 2
+  done
+  echo "❌ caddy is up but /healthz didn't respond. Check:"
+  echo "    journalctl -u caddy -f"
+  echo "    docker compose -f /srv/dispatcher/docker-compose.yml ps"
+  exit 1
+fi
+
+# HTTPS mode: pause briefly so Caddy completes the ACME challenge against LE.
 echo "waiting up to 60s for the cert to be issued…"
 for i in {1..30}; do
   if curl -fsS --max-time 5 "https://$CADDY_DOMAIN/healthz" 2>/dev/null | grep -q '"ok":true'; then

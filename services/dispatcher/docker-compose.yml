@@ -4,7 +4,12 @@ services:
     container_name: dialect-labeler-dispatcher
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      # Loopback-only. The public port is 8080 on the HOST, served by
+      # Caddy (or another reverse proxy) which terminates TLS and forwards
+      # here on 127.0.0.1:9000. Direct exposure on 8080 would conflict
+      # with the reverse-proxy and make the dispatcher reachable WITHOUT
+      # the proxy's request_body / timeout / log policies.
+      - "127.0.0.1:9000:8080"
     env_file:
       - .env
     volumes:

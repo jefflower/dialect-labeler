@@ -21,27 +21,46 @@ REPO_URL="${REPO_URL:-https://github.com/jefflower/dialect-labeler.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 REPO_DIR="${REPO_DIR:-/srv/dispatcher-repo}"
 APP_DIR="${APP_DIR:-/srv/dispatcher}"
-ADMIN_EMAIL="${ADMIN_EMAIL:-admin@dispatcher.local}"
+# Default: RFC 2606 reserved example.com — pydantic's EmailStr (via
+# email-validator) REJECTS .local / .test / .invalid / .localhost as
+# RFC 6762 reserved names, so naive defaults like admin@dispatcher.local
+# cause 422 on login. Override at deploy time if you have a real
+# admin mailbox you want to use:
+#   ADMIN_EMAIL=ops@yourcompany.com bash 02-bootstrap.sh
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@example.com}"
 
 # ---------------------------------------------------------------------------
 step "1. fetch source"
 # ---------------------------------------------------------------------------
-if [[ ! -d "$REPO_DIR/.git" ]]; then
+# Three valid layouts at this point:
+#   (a) Standard clone path — REPO_DIR is a git checkout, APP_DIR is a
+#       symlink into it. This is the long-term form (what later
+#       `git pull` upgrades work against).
+#   (b) Pre-existing real directory at APP_DIR with a docker-compose.yml
+#       — e.g. an initial `rsync` from a developer's machine when
+#       GitHub access from the box is flaky. We keep it as-is and just
+#       move on, the operator can convert to (a) later by `rm -rf
+#       /srv/dispatcher && rerun this script`.
+#   (c) Nothing on disk yet — clone from REPO_URL.
+if [[ -f "$APP_DIR/docker-compose.yml" && ! -L "$APP_DIR" ]]; then
+  echo "$APP_DIR is a populated directory (no .git); leaving it alone."
+  echo "to switch to git-managed upgrades later: rm -rf $APP_DIR && re-run."
+elif [[ -d "$REPO_DIR/.git" ]]; then
+  echo "updating $REPO_DIR…"
+  git -C "$REPO_DIR" fetch origin
+  git -C "$REPO_DIR" checkout "$REPO_BRANCH"
+  git -C "$REPO_DIR" reset --hard "origin/$REPO_BRANCH"
+  if [[ ! -L "$APP_DIR" ]] || \
+     [[ "$(readlink "$APP_DIR")" != "$REPO_DIR/services/dispatcher" ]]; then
+    rm -f "$APP_DIR"
+    ln -s "$REPO_DIR/services/dispatcher" "$APP_DIR"
+  fi
+else
   mkdir -p "$(dirname "$REPO_DIR")"
   echo "cloning $REPO_URL (sparse, services/dispatcher only)…"
   git clone --depth 1 --filter=blob:none --sparse \
     "$REPO_URL" "$REPO_DIR"
   git -C "$REPO_DIR" sparse-checkout set services/dispatcher
-else
-  echo "updating $REPO_DIR…"
-  git -C "$REPO_DIR" fetch origin
-  git -C "$REPO_DIR" checkout "$REPO_BRANCH"
-  git -C "$REPO_DIR" reset --hard "origin/$REPO_BRANCH"
-fi
-
-# Stable path the operator can `cd` into:
-#   /srv/dispatcher → /srv/dispatcher-repo/services/dispatcher
-if [[ ! -L "$APP_DIR" ]] || [[ "$(readlink "$APP_DIR")" != "$REPO_DIR/services/dispatcher" ]]; then
   rm -f "$APP_DIR"
   ln -s "$REPO_DIR/services/dispatcher" "$APP_DIR"
 fi

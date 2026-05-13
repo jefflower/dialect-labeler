@@ -43,6 +43,23 @@ TASK_RUNNING = "running"
 TASK_SUCCEEDED = "succeeded"
 TASK_FAILED = "failed"
 TASK_EXPIRED = "expired"
+# User-explicit terminal state. The owner downloaded the output zip,
+# then called POST /api/tasks/{id}/close which deletes both input and
+# output files immediately and frees the owner to upload a new task.
+# Distinct from `succeeded`: a succeeded task still holds disk; a closed
+# task is metadata-only.
+TASK_CLOSED = "closed"
+
+# Per-owner single-task gating. A user may have at most one "active"
+# task in the pipeline at a time. We define active narrowly: any state
+# where the task is still consuming a worker slot or holding a
+# downloadable output the user hasn't acted on yet.
+ACTIVE_TASK_STATES = (
+    TASK_PENDING,
+    TASK_CLAIMED,
+    TASK_RUNNING,
+    TASK_SUCCEEDED,
+)
 
 # Roles.
 ROLE_ADMIN = "admin"

@@ -33,14 +33,18 @@ def test_empty_stats_returns_zeros(client: TestClient) -> None:
 
 
 def test_stats_reflect_pending_tasks(client: TestClient) -> None:
+    # Per-user single-task constraint forces us to spread the 3 uploads
+    # across 3 separate users to land 3 simultaneously-pending tasks.
     register(client, "admin@example.com")
     admin = login(client, "admin@example.com")
-    for _ in range(3):
+    for i in range(3):
+        register(client, f"u{i}@example.com")
+        token = login(client, f"u{i}@example.com")
         client.post(
             "/api/tasks",
-            data={"name": "t"},
+            data={"name": f"t{i}"},
             files={"file": ("t.zip", io.BytesIO(_zip()), "application/zip")},
-            headers=auth_headers(admin),
+            headers=auth_headers(token),
         )
     resp = client.get("/api/admin/stats", headers=auth_headers(admin))
     body = resp.json()
