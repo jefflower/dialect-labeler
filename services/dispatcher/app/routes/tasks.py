@@ -59,11 +59,15 @@ def _task_to_out(task: Task, db: Session | None = None) -> TaskOut:
             summary = json.loads(task.summary_json)
         except json.JSONDecodeError:
             summary = None
+    # Wire field name is historical (`claimer_email`) — kept for SPA
+    # backwards compat. The value is now whatever the claimer's
+    # identifier is: phone number, legacy email-shaped string, or
+    # plain username like "worker-bot".
     claimer_email: str | None = None
     if task.claimed_by is not None and db is not None:
         claimer = db.get(User, task.claimed_by)
         if claimer:
-            claimer_email = claimer.email
+            claimer_email = claimer.identifier
     data = {
         "id": task.id,
         "owner_id": task.owner_id,

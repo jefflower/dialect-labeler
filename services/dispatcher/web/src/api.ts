@@ -10,7 +10,13 @@ const TOKEN_KEY = "dispatcher.token";
 
 export interface User {
   id: number;
-  email: string;
+  /** Unified credential field (replaces `email` as of 2026-05).
+   *  Acceptable shapes:
+   *    - 11-digit mobile number (the ONLY form accepted by
+   *      `/api/auth/register`)
+   *    - Admin-created plain username like "admin" / "worker-bot"
+   *    - Legacy email strings (grandfathered) */
+  identifier: string;
   role: "admin" | "user";
   /** Admin-approval gate. Self-registered users start with
    *  `is_approved=false` and can't log in until an admin flips this
@@ -161,17 +167,27 @@ async function request<T>(
 }
 
 // ---- Auth -------------------------------------------------------------
-export function register(email: string, password: string) {
+/**
+ * Self-service signup — mobile number only. The dispatcher validates
+ * `phone` against `^1[3-9]\d{9}$` server-side; client should pre-check
+ * the same shape to give a synchronous error message.
+ */
+export function register(phone: string, password: string) {
   return request<RegisterResponse>("/api/auth/register", {
     method: "POST",
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({ phone, password }),
   });
 }
 
-export function login(email: string, password: string) {
+/**
+ * Login takes any identifier — mobile number, plain username
+ * (`admin`), or legacy email string. The server does exact-match on
+ * `User.identifier`; we don't try to be clever about parsing.
+ */
+export function login(identifier: string, password: string) {
   return request<TokenResponse>("/api/auth/login", {
     method: "POST",
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({ identifier, password }),
   });
 }
 
@@ -229,10 +245,14 @@ export async function downloadOutput(task: Task): Promise<void> {
 export function listUsers() {
   return request<User[]>("/api/users");
 }
-export function createUser(email: string, password: string, role: "admin" | "user") {
+export function createUser(
+  identifier: string,
+  password: string,
+  role: "admin" | "user",
+) {
   return request<User>("/api/users", {
     method: "POST",
-    body: JSON.stringify({ email, password, role }),
+    body: JSON.stringify({ identifier, password, role }),
   });
 }
 export function updateUserRole(userId: number, role: "admin" | "user") {

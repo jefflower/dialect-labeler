@@ -5,15 +5,25 @@ Keep these on the boundary only — internal code passes ORM objects.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field, field_validator
+
+# Chinese mainland mobile prefix: 1[3-9]xxxxxxxxx, 11 digits total.
+# Anything starting with 12 or other special codes is filtered out at
+# the regex level — they're virtual / service numbers that don't
+# correspond to a person who can log in.
+MOBILE_RE = re.compile(r"^1[3-9]\d{9}$")
 
 
 class UserOut(BaseModel):
     id: int
-    email: EmailStr
+    # The unified credential field — see `models.User.identifier` for
+    # the format rules. We expose it on the wire as `identifier` so
+    # the SPA can stop pretending all accounts are emails.
+    identifier: str
     role: str
     # Admin-approval gate. New self-registered users start unapproved
     # (is_approved=False) and a freshly-issued JWT for them won't pass
@@ -41,12 +51,33 @@ class RegisterPendingOut(BaseModel):
 
 
 class RegisterIn(BaseModel):
-    email: EmailStr
+    """Self-service signup: 11-digit Chinese mobile number only.
+
+    No email path on this endpoint — admins create email/username
+    accounts directly via `/api/users`. Keeping self-registration to
+    a single canonical format means we don't have to debate which
+    "looks like a phone number" rules apply across regions; if you
+    need an internal account, ask an admin.
+    """
+
+    phone: str = Field(min_length=11, max_length=11, description="11-digit mobile number")
     password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("phone")
+    @classmethod
+    def _validate_phone(cls, v: str) -> str:
+        if not MOBILE_RE.match(v):
+            raise ValueError("手机号格式不正确，应为 11 位 1 开头的数字")
+        return v
 
 
 class LoginIn(BaseModel):
-    email: EmailStr
+    """Login takes any string as the identifier — a mobile number, a
+    username like `admin`, or a legacy email address. Validation
+    against the DB is exact-match, so wrong-shape inputs just produce
+    the standard 401 (no information leak)."""
+
+    identifier: str = Field(min_length=1, max_length=254)
     password: str
 
 

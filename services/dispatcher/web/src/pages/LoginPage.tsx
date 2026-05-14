@@ -34,11 +34,23 @@ import { Waveform } from "./login/Waveform";
 const PENDING_BANNER =
   "账号已创建，正在等待管理员审核。审核通过后才能登录。";
 
+/**
+ * Chinese mainland mobile number regex — same shape the dispatcher
+ * validates server-side (`schemas.MOBILE_RE`). We pre-check here so
+ * the user gets a synchronous error message instead of a 422
+ * round-trip.
+ */
+const MOBILE_RE = /^1[3-9]\d{9}$/;
+
 export default function LoginPage() {
   const { applyToken } = useAuth();
   const navigate = useNavigate();
   const [mode, setMode] = useState<"login" | "register">("login");
-  const [email, setEmail] = useState("");
+  // The credential the user types in. For login this can be a mobile
+  // number, plain username (`admin`), or legacy email-shaped string —
+  // we just pass it through. For register the dispatcher requires an
+  // 11-digit mobile number; we pre-validate that shape.
+  const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [showPwd, setShowPwd] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -49,14 +61,22 @@ export default function LoginPage() {
     e.preventDefault();
     setError(null);
     setInfo(null);
+
+    // Client-side pre-check for register: must be 11-digit mobile.
+    // Skip for login — server accepts any identifier string.
+    if (mode === "register" && !MOBILE_RE.test(identifier.trim())) {
+      setError("请输入有效的 11 位手机号（1 开头）");
+      return;
+    }
+
     setSubmitting(true);
     try {
       if (mode === "login") {
-        const result = await login(email, password);
+        const result = await login(identifier.trim(), password);
         applyToken(result.access_token, result.user);
         navigate("/tasks", { replace: true });
       } else {
-        const result = await register(email, password);
+        const result = await register(identifier.trim(), password);
         if ("access_token" in result) {
           // Bootstrap admin path: auto-approved, has a token.
           applyToken(result.access_token, result.user);
@@ -186,14 +206,22 @@ export default function LoginPage() {
 
               <form onSubmit={onSubmit} className="login-form">
                 <Field
-                  label="邮箱"
-                  value={email}
-                  onChange={setEmail}
-                  placeholder="you@example.com"
-                  type="email"
-                  icon={<UserIcon />}
+                  label={mode === "register" ? "手机号" : "账号"}
+                  value={identifier}
+                  onChange={setIdentifier}
+                  placeholder={
+                    mode === "register"
+                      ? "11 位手机号"
+                      : "手机号 / 用户名"
+                  }
+                  type={mode === "register" ? "tel" : "text"}
+                  icon={mode === "register" ? <PhoneIcon /> : <UserIcon />}
                   autoFocus
-                  autoComplete="email"
+                  autoComplete={
+                    mode === "register" ? "tel" : "username"
+                  }
+                  inputMode={mode === "register" ? "numeric" : undefined}
+                  maxLength={mode === "register" ? 11 : 64}
                 />
                 <Field
                   label={mode === "register" ? "密码（≥ 8 位）" : "密码"}
@@ -241,7 +269,7 @@ export default function LoginPage() {
 
                 <button
                   type="submit"
-                  disabled={submitting || !email || !password}
+                  disabled={submitting || !identifier || !password}
                   className={`login-submit ${submitting ? "loading" : ""}`}
                 >
                   <span className="login-submit-bg" />
@@ -326,6 +354,16 @@ interface FieldProps {
   autoFocus?: boolean;
   autoComplete?: string;
   minLength?: number;
+  maxLength?: number;
+  inputMode?:
+    | "none"
+    | "text"
+    | "tel"
+    | "url"
+    | "email"
+    | "numeric"
+    | "decimal"
+    | "search";
 }
 
 function Field({
@@ -339,6 +377,8 @@ function Field({
   autoFocus,
   autoComplete,
   minLength,
+  maxLength,
+  inputMode,
 }: FieldProps) {
   const [focused, setFocused] = useState(false);
   return (
@@ -359,6 +399,8 @@ function Field({
           autoFocus={autoFocus}
           autoComplete={autoComplete}
           minLength={minLength}
+          maxLength={maxLength}
+          inputMode={inputMode}
           required
           spellCheck={false}
         />
@@ -386,6 +428,27 @@ function UserIcon() {
       <circle cx="12" cy="8" r="4" stroke="currentColor" strokeWidth="1.5" />
       <path
         d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+function PhoneIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+      <rect
+        x="6"
+        y="2"
+        width="12"
+        height="20"
+        rx="2.5"
+        stroke="currentColor"
+        strokeWidth="1.5"
+      />
+      <path
+        d="M11 18h2"
         stroke="currentColor"
         strokeWidth="1.5"
         strokeLinecap="round"

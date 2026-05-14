@@ -2,7 +2,7 @@
 
 写给下一个会话 / 下一位开发者。当前状态、关键设计决策、可继续做的事都在这里。
 
-最后更新：2026-05-13（深夜），P0 #2 + mode 架构分离 + tray spinner + 账号审核 + 登录页 reskin 之后
+最后更新：2026-05-14（凌晨），identifier 重构 + 手机号注册 + admin 用户名简化之后
 
 ---
 
@@ -19,13 +19,19 @@
 | Whisper 池 | 4 节点 tailnet | `services/whisper-server/`（之前部署） | 各自 ssh 进去 `systemctl restart` |
 | Ollama (huayu) | tailnet 100.64.0.4 | 已装 qwen2.5:32b + qwen3.5:122b | 略 |
 
-凭据：
-- Dispatcher admin: `admin@example.com` / `Admin2026!`
-- Mac Worker bot: `worker-bot@example.com` / `Wb-uS3rT0ken_2026_X`（在 launchd plist EnvironmentVariables 里）
-- 测试上传者: `uploader@example.com` / `Up10ad-T3st-2026`
+凭据（**2026-05-14 之后**）：
+- Dispatcher admin: `admin` / `Admin2026!`（旧 email `admin@example.com` 已由 migration 改成 `admin`）
+- Mac Worker bot: `worker-bot@example.com` / `Wb-uS3rT0ken_2026_X`（identifier 保留 email 字符串形式 —— launchd plist 没改）
+- 测试上传者: `uploader@example.com` / `Up10ad-T3st-2026`（identifier 保留 email 字符串形式）
 - 服务器 SSH: `ssh root@47.93.1.242`（密钥认证，已配）
 
-**注意（2026-05-13 起）**：自助注册 (`POST /api/auth/register`) 默认进入「待管理员审核」状态。第一个注册者（bootstrap admin）自动批准，之后所有新注册者必须 admin 审核才能登录。审核端点：`POST /api/users/{id}/approve`（admin only）。前端在 `/admin/users` 页面有「批准」按钮，stats 端点会返回 `pending_user_count`。详见 §6.10。
+**注意（2026-05-13/14 起）**：
+- 自助注册 (`POST /api/auth/register`) 强制**手机号格式**（11 位 1 开头），不再接受邮箱
+- 注册后默认进入「待管理员审核」状态。第一个注册者（bootstrap admin）自动批准，之后所有新注册者必须 admin 审核才能登录
+- 审核端点：`POST /api/users/{id}/approve`（admin only）
+- 前端 `/admin/users` 页面有「批准」按钮，stats 端点会返回 `pending_user_count`
+- 服务器 `.env` 设了 `ALLOW_OPEN_REGISTRATION=true`，未来想关闭直接改 .env + `docker compose up -d --force-recreate`
+- 详见 §6.10 / §6.14
 
 ## 3. 端到端流程图
 
@@ -230,6 +236,23 @@ LoginPage 重设计后底部有「活跃用户 / 累计任务 / 处理时长 / 2
 
 PNG 资源由 `scripts/gen_tray_spinner_icons.py` 程序生成（Pillow），可随时重跑覆盖。需要换风格直接改 Python 脚本（`INNER_RADIUS_FRAC` / `DOT_RADIUS_FRAC` / opacity 曲线）然后 `python3 scripts/gen_tray_spinner_icons.py`。
 
+### 6.14 Identifier 重构 + 手机号注册（2026-05-14）
+`User.email` 列被重命名成 `User.identifier`（更准确地反映它的角色——可以是手机号 / 用户名 / 历史 email）。`POST /api/auth/register` 现在**只接受 11 位手机号**（`^1[3-9]\d{9}$`），其它形式都返回 422。`POST /api/auth/login` 接受任何 identifier 字符串（exact match），所以管理员用 `admin` 登录、service bot 用 `worker-bot@example.com` 登录都行。`POST /api/users`（admin-only）保留任意 identifier 输入——用于创建命名服务账号。
+
+inline migration 在 `app/db.py::_apply_sqlite_inline_migrations`：
+1. `ALTER TABLE users RENAME COLUMN email TO identifier`
+2. `UPDATE users SET identifier='admin' WHERE identifier='admin@example.com'` — bootstrap admin 一键改名
+3. 其它 email-shaped identifier 保留原值（worker-bot / uploader 等）
+
+**API wire field 兼容**：`TaskOut.claimer_email` 字段名保留（避免破坏旧 SPA），但值现在是 `claimer.identifier`（可能是手机号 / 用户名 / 邮箱）。前端 SPA 已经全部从 `user.email` 改成 `user.identifier`。
+
+**前端 UX**：
+- 登录 tab：label「账号」，placeholder「手机号 / 用户名」，icon 用 UserIcon
+- 注册 tab：label「手机号」，placeholder「11 位手机号」，icon 用 PhoneIcon，11 位 maxLength，提交前 regex 预校验
+- AdminUsers 页的「新建账号」表单：placeholder 改成「账号（手机号 / 用户名）」（admin 可以随意创建）
+
+测试覆盖：85 passed = 75 旧 + 10 新（其中 `test_register_rejects_non_mobile_format` 验证 4 种非法 phone format）。`tests/conftest.py::register()` helper 兼容老测试调用（如 `register(client, "founder@example.com")`）：先用一个生成的 fake phone 注册，然后 DB 直接 rename identifier 为传入字符串，避免重写每个测试。
+
 ### 6.13 登录页深色 reskin（2026-05-13）
 LoginPage 从「居中卡片浅色」改成「双栏深色工业风」，灵感来自一份外部 React 原型（`AI 工作台登录页面设计.zip`）。组件拆到 `services/dispatcher/web/src/pages/login/`：
 - `Logo.tsx` — 方形外框 SVG + 内嵌动画波形 bars
@@ -396,6 +419,15 @@ $ cd src-tauri && cargo build --release        # Rust release
 - ✅ Tests: cargo 77 passed / pytest 84 passed（75 旧 + 9 审核）
 - ✅ Dispatcher 已部署 (rebuild + restart)；Mac Worker 已重启用新 tray 代码
 - ⚠️ **没在真实任务上跑过端到端**——单测 + 编译 + healthz + public/stats 都过，但 Mode 2 prompt 改进 + qaFlags + tray spinner 在生产里的实际效果还没看到
+
+**2026-05-14 凌晨补做**：
+- ✅ 输入框 focus 双层框 bug 修（`.login-shell input` 重置全局 input 样式）
+- ✅ identifier 重构 + admin 改成 username "admin"（migration 一键改名）
+- ✅ 手机号注册（11 位强校验 + Pydantic validator + 前端 regex 预检）
+- ✅ AdminUsersPage / Topbar 全部从 `user.email` 改成 `user.identifier`
+- ✅ pytest 85 passed（10 新审核测试 + 1 新 phone-format reject 测试）
+- ✅ 已部署 + 服务器 .env `ALLOW_OPEN_REGISTRATION=true`
+- ✅ 验证：`admin / Admin2026!` 能登录；新手机号 `13900000001` 能注册并落 pending；非法 phone 422；pending 用户登录 403
 
 仍待做：
 - `Tauri release` 打包 + macOS notarization（P1 #3）

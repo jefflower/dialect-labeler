@@ -62,53 +62,112 @@ def client(tmp_state: Path) -> Iterator[TestClient]:
         yield tc
 
 
-def register(client: TestClient, email: str, password: str = "secret-pass") -> dict:
+def _phone_counter() -> "Iterator[str]":
+    """Yield deterministic 11-digit phone numbers for tests.
+
+    Module-level so it persists across calls within a process — each
+    `register(client, "...")` invocation either passes an explicit
+    identifier (legacy email-style string accepted as a free-form
+    username post-rename) or pulls a fresh phone via `next_phone()`.
+    Starting at 13800000001 keeps the numbers obviously fake.
+    """
+    n = 1
+    while True:
+        yield f"138{n:08d}"
+        n += 1
+
+
+_phone_iter = _phone_counter()
+
+
+def next_phone() -> str:
+    """Allocate a fresh fake phone number for a test."""
+    return next(_phone_iter)
+
+
+def register(
+    client: TestClient,
+    identifier: str | None = None,
+    password: str = "secret-pass",
+) -> dict:
     """Register + auto-approve for legacy test compatibility.
 
     The production register endpoint now drops 2nd+ registrants into a
-    pending state (admin must approve via /api/users/{id}/approve).
-    Most existing tests pre-date this gate and don't care about the
-    workflow — they just want a logged-in user. So this helper:
-      1. Posts /register (gets TokenOut for bootstrap admin, or
-         RegisterPendingOut for everyone else).
-      2. If the response is the pending shape, flips `is_approved` on
-         the DB row directly so subsequent `login()` calls succeed.
-      3. Returns a token-bearing dict, normalised to the legacy shape.
+    pending state (admin must approve via /api/users/{id}/approve)
+    AND only accepts 11-digit Chinese mobile numbers. Most existing
+    tests pre-date both changes and don't care — they just want a
+    logged-in user. So this helper:
 
-    Tests that specifically exercise the approval flow should NOT use
-    this helper — call the endpoints directly with `client.post(...)`.
+      1. If `identifier` looks like an 11-digit mobile, posts
+         /register normally. Otherwise (email-shaped or username
+         "admin" etc.), generates a phone number, registers with that,
+         then DB-renames the identifier — this lets old tests keep
+         their pretty `founder@example.com` strings as the visible
+         account label without having to teach every test the new
+         mobile-only path.
+      2. Auto-approves via direct DB write if the registration landed
+         in the pending state.
+      3. Returns a token-bearing dict, normalised to the legacy shape
+         (with `user.identifier` instead of `user.email`).
+
+    Tests that specifically exercise the registration / approval flow
+    should NOT use this helper — call the endpoints directly with
+    `client.post(...)`.
     """
+    # Resolve which phone number to use for the actual register call.
+    actual_phone = (
+        identifier if identifier and identifier.isdigit() and len(identifier) == 11
+        else next_phone()
+    )
     resp = client.post(
-        "/api/auth/register", json={"email": email, "password": password}
+        "/api/auth/register",
+        json={"phone": actual_phone, "password": password},
     )
     assert resp.status_code == 201, resp.text
     body = resp.json()
-    if "access_token" in body:
-        return body
-    # Pending shape — auto-approve through the DB so legacy tests
-    # can immediately log in. We bypass the API on purpose: this
-    # helper is fixture-grade, not a public surface.
+
+    # If caller passed a non-phone identifier, rename the DB row so
+    # legacy tests that match against "founder@example.com" still
+    # work. Bypass the API — this is fixture-grade, not a public path.
     from app.db import session_scope
     from app.models import User, utcnow
 
     user_id = body["user"]["id"]
-    with session_scope() as db:
-        u = db.get(User, user_id)
-        assert u is not None
-        u.is_approved = True
-        u.approved_at = utcnow()
-    # Now login to get a token the rest of the test can use.
-    token = login(client, email, password)
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user": body["user"] | {"is_approved": True},
-    }
+    needs_rename = identifier and identifier != actual_phone
+    is_pending = "access_token" not in body
+
+    if needs_rename or is_pending:
+        with session_scope() as db:
+            u = db.get(User, user_id)
+            assert u is not None
+            if needs_rename:
+                u.identifier = identifier
+            if is_pending:
+                u.is_approved = True
+                u.approved_at = utcnow()
+        # Refresh body so callers see the renamed/approved row.
+        body["user"]["identifier"] = identifier or actual_phone
+        body["user"]["is_approved"] = True
+
+    if is_pending:
+        # The auto-approve path didn't get a token. Log in now.
+        token = login(client, identifier or actual_phone, password)
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "user": body["user"],
+        }
+    return body
 
 
-def login(client: TestClient, email: str, password: str = "secret-pass") -> str:
+def login(
+    client: TestClient,
+    identifier: str,
+    password: str = "secret-pass",
+) -> str:
     resp = client.post(
-        "/api/auth/login", json={"email": email, "password": password}
+        "/api/auth/login",
+        json={"identifier": identifier, "password": password},
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["access_token"]

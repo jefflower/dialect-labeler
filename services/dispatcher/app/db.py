@@ -155,6 +155,29 @@ def _apply_sqlite_inline_migrations(engine: Engine) -> None:
                 text("ALTER TABLE users ADD COLUMN approved_by_id INTEGER")
             )
 
+        # Column rename `email` → `identifier` (2026-05). Self-service
+        # registration now requires an 11-digit mobile number; legacy
+        # `admin@example.com`-style accounts are grandfathered as-is
+        # (their identifier just happens to look like an email). One
+        # special case: the bootstrap admin is renamed to a plain
+        # `admin` username so the operator can log in by typing
+        # `admin` instead of an email.
+        user_rows = conn.execute(text("PRAGMA table_info(users)")).fetchall()
+        user_columns = {row[1] for row in user_rows}
+        if "email" in user_columns and "identifier" not in user_columns:
+            # SQLite 3.25+ supports RENAME COLUMN; we already require
+            # a recent SQLite for the dispatcher.
+            conn.execute(text("ALTER TABLE users RENAME COLUMN email TO identifier"))
+            # Promote the well-known admin@example.com bootstrap account
+            # to the cleaner `admin` username. Other email-shaped
+            # identifiers stay as-is so existing users keep logging in.
+            conn.execute(
+                text(
+                    "UPDATE users SET identifier = 'admin' "
+                    "WHERE identifier = 'admin@example.com'"
+                )
+            )
+
 
 def get_db() -> Iterator[Session]:
     """FastAPI dependency: yields a Session and closes it after the request."""

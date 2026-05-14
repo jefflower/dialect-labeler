@@ -21,7 +21,7 @@ export default function Topbar() {
       </nav>
       <div className="grow" />
       <span className="user">
-        {user.email}
+        {user.identifier}
         <span className="role-chip">
           {user.role === "admin" ? "管理员" : "用户"}
         </span>

@@ -140,6 +140,22 @@ input:focus, textarea:focus, select:focus {
  *  not the specific typefaces.
  * ===================================================================== */
 
+/* Override the global `input { border + padding + background }` and
+ * `input:focus { outline + border-color }` rules from lines 56-68 above
+ * — those bleed into the login form and stack on top of our
+ * `.login-field-box.focused` ring, producing a double-outline / inner
+ * border look. We deliberately re-reset at higher specificity here
+ * rather than weakening the global rules (which the rest of the SPA's
+ * forms rely on). */
+.login-shell input,
+.login-shell input:focus {
+  border: none;
+  outline: none;
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+}
+
 .login-shell {
   /* Local CSS variables — scoped here, no global pollution. */
   --bg-0: oklch(0.14 0.013 250);

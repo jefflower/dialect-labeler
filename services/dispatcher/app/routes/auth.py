@@ -37,11 +37,11 @@ _login_attempts: dict[str, Deque[float]] = {}
 _login_lock = threading.Lock()
 
 
-def _check_login_rate_limit(email: str) -> None:
-    """Raise 429 if `email` has tried to log in too many times recently."""
+def _check_login_rate_limit(identifier: str) -> None:
+    """Raise 429 if this identifier has tried to log in too many times recently."""
     now = time.monotonic()
     with _login_lock:
-        bucket = _login_attempts.setdefault(email, deque())
+        bucket = _login_attempts.setdefault(identifier, deque())
         # Drop attempts older than the window.
         while bucket and now - bucket[0] > _LOGIN_WINDOW_SECONDS:
             bucket.popleft()
@@ -55,9 +55,9 @@ def _check_login_rate_limit(email: str) -> None:
         bucket.append(now)
 
 
-def _reset_login_rate_limit(email: str) -> None:
+def _reset_login_rate_limit(identifier: str) -> None:
     with _login_lock:
-        _login_attempts.pop(email, None)
+        _login_attempts.pop(identifier, None)
 
 
 @router.post(
@@ -69,22 +69,22 @@ def register(
     payload: RegisterIn,
     db: Annotated[Session, Depends(get_db)],
 ) -> RegisterPendingOut | TokenOut:
-    """Self-service signup with admin-approval gate.
+    """Self-service signup (mobile number only) with admin-approval gate.
 
     Three paths:
-      - **Bootstrap** (users table empty): first registrant becomes admin
-        AND is auto-approved. Returns TokenOut — they can use the system
-        immediately.
-      - **Self-signup with open registration on** (settings.allow_open_registration):
-        account is created with `is_approved=False` and returns
-        RegisterPendingOut. The user CANNOT log in until an admin flips
-        `is_approved` true via POST /api/users/{id}/approve.
-      - **Open registration off**: HTTP 403; admin must use /api/users.
+      - **Bootstrap** (users table empty): first registrant becomes
+        admin AND is auto-approved; their identifier is their phone
+        number. Returns TokenOut — they can use the system immediately.
+      - **Open registration on**: account is created with
+        `is_approved=False` and returns RegisterPendingOut. The user
+        CANNOT log in until an admin flips `is_approved` true.
+      - **Open registration off**: HTTP 403; admin must use /api/users
+        to create the account.
 
-    Why a pending state instead of straight 201 with token? Because we
-    want admins to vet new users before they consume worker quota or
-    upload arbitrary input. Issuing a token only on approval makes the
-    UX flow obvious: register → wait → admin approves → log in.
+    Why mobile-only here? Mixed-format identifiers (mobile / email /
+    username) are an admin-tier concern — only admins should create
+    service accounts ("worker-bot") or plain usernames ("admin").
+    Self-signup gets one canonical format.
     """
     settings = get_settings()
     existing_count = db.execute(select(User.id).limit(1)).scalar_one_or_none()
@@ -100,9 +100,11 @@ def register(
             detail="Open registration is disabled. Ask an admin to create the account.",
         )
 
-    if db.execute(select(User).where(User.email == payload.email)).scalar_one_or_none():
+    if db.execute(
+        select(User).where(User.identifier == payload.phone)
+    ).scalar_one_or_none():
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Email already registered"
+            status_code=status.HTTP_409_CONFLICT, detail="该手机号已注册"
         )
 
     # Bootstrap admin is implicitly approved (no one's around to approve
@@ -111,7 +113,7 @@ def register(
     approved_at = utcnow() if is_bootstrap else None
 
     user = User(
-        email=payload.email,
+        identifier=payload.phone,
         password_hash=hash_password(payload.password),
         role=role,
         is_approved=is_approved,
@@ -122,9 +124,6 @@ def register(
     db.refresh(user)
 
     if is_bootstrap:
-        # First registrant is the bootstrap admin: hand them a token
-        # immediately so they don't get stuck on "waiting for admin"
-        # forever.
         token = create_access_token(user.id)
         return TokenOut(access_token=token, user=UserOut.model_validate(user))
 
@@ -133,16 +132,17 @@ def register(
 
 @router.post("/login", response_model=TokenOut)
 def login(payload: LoginIn, db: Annotated[Session, Depends(get_db)]) -> TokenOut:
-    _check_login_rate_limit(payload.email)
+    identifier = payload.identifier.strip()
+    _check_login_rate_limit(identifier)
     user = db.execute(
-        select(User).where(User.email == payload.email)
+        select(User).where(User.identifier == identifier)
     ).scalar_one_or_none()
     if user is None or not verify_password(payload.password, user.password_hash):
-        # Same error on missing-user vs bad-password: prevents email
-        # enumeration on a public endpoint.
+        # Same error on missing-user vs bad-password: prevents
+        # identifier enumeration on a public endpoint.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
+            detail="账号或密码错误",
         )
 
     # Admin-approval gate. Pending users get a 403 with a clear message
@@ -162,7 +162,7 @@ def login(payload: LoginIn, db: Annotated[Session, Depends(get_db)]) -> TokenOut
 
     # Successful login flushes the bucket — a single typo doesn't burn a
     # legit user's retry budget for the next time they actually forget.
-    _reset_login_rate_limit(payload.email)
+    _reset_login_rate_limit(identifier)
     token = create_access_token(user.id)
     return TokenOut(access_token=token, user=UserOut.model_validate(user))
 

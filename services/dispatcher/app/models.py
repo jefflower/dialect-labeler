@@ -82,7 +82,22 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    email: Mapped[str] = mapped_column(String(254), unique=True, nullable=False)
+    # The single login credential. Acceptable values (2026-05 onward):
+    #   - 11-digit Chinese mainland mobile number ("13812345678") — the
+    #     ONLY form accepted by self-service `/api/auth/register`.
+    #   - Free-form strings (e.g. "admin", "worker-bot") — only created
+    #     by an admin via `/api/users`, used for service accounts and
+    #     the bootstrap admin (literally identifier="admin").
+    #   - Legacy email strings — grandfathered by the inline migration
+    #     so accounts created before this rename still log in. Future
+    #     self-registrations can't add new ones.
+    #
+    # Column renamed from `email` in the 2026-05 migration. SQLite's
+    # ALTER TABLE RENAME COLUMN handles the disk side; SQLAlchemy
+    # picks up the new name on the next session.
+    identifier: Mapped[str] = mapped_column(
+        String(254), unique=True, nullable=False
+    )
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False, default=ROLE_USER)
     # Admin approval gate: a freshly self-registered user starts with

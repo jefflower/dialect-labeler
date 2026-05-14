@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from .conftest import auth_headers, login, register
+from .conftest import auth_headers, login, next_phone, register
 
 
 def test_first_registrant_becomes_admin(client: TestClient) -> None:
@@ -28,7 +28,7 @@ def test_registration_disabled_when_users_exist_and_flag_off(
     config.reset_settings_for_tests()
     resp = client.post(
         "/api/auth/register",
-        json={"email": "blocked@example.com", "password": "secret-pass"},
+        json={"phone": "13855555555", "password": "secret-pass"},
     )
     assert resp.status_code == 403
 
@@ -37,7 +37,7 @@ def test_login_with_bad_password_returns_401(client: TestClient) -> None:
     register(client, "founder@example.com")
     resp = client.post(
         "/api/auth/login",
-        json={"email": "founder@example.com", "password": "wrong-password"},
+        json={"identifier": "founder@example.com", "password": "wrong-password"},
     )
     assert resp.status_code == 401
 
@@ -45,7 +45,7 @@ def test_login_with_bad_password_returns_401(client: TestClient) -> None:
 def test_login_with_unknown_email_returns_401(client: TestClient) -> None:
     resp = client.post(
         "/api/auth/login",
-        json={"email": "ghost@example.com", "password": "secret-pass"},
+        json={"identifier": "ghost@example.com", "password": "secret-pass"},
     )
     assert resp.status_code == 401
 
@@ -61,17 +61,25 @@ def test_me_returns_current_user(client: TestClient) -> None:
     resp = client.get("/api/auth/me", headers=auth_headers(token))
     assert resp.status_code == 200
     body = resp.json()
-    assert body["email"] == "founder@example.com"
+    assert body["identifier"] == "founder@example.com"
     assert body["role"] == "admin"
 
 
-def test_duplicate_email_rejected(client: TestClient) -> None:
-    register(client, "founder@example.com")
-    resp = client.post(
+def test_duplicate_phone_rejected(client: TestClient) -> None:
+    """Re-registering with the same mobile number returns 409 — the
+    unique constraint on `User.identifier` plus an explicit pre-check."""
+    register(client, identifier=None)  # bootstrap with a fresh phone
+    phone = next_phone()
+    first = client.post(
         "/api/auth/register",
-        json={"email": "founder@example.com", "password": "another-pass"},
+        json={"phone": phone, "password": "secret-pass"},
     )
-    assert resp.status_code == 409
+    assert first.status_code == 201
+    second = client.post(
+        "/api/auth/register",
+        json={"phone": phone, "password": "another-pass"},
+    )
+    assert second.status_code == 409
 
 
 def test_login_rate_limit_kicks_in_after_too_many_attempts(client: TestClient) -> None:
@@ -80,13 +88,13 @@ def test_login_rate_limit_kicks_in_after_too_many_attempts(client: TestClient) -
     for _ in range(10):
         resp = client.post(
             "/api/auth/login",
-            json={"email": "victim@example.com", "password": "wrong"},
+            json={"identifier": "victim@example.com", "password": "wrong"},
         )
         assert resp.status_code == 401
     # 11th attempt — even with the right password — must be throttled.
     resp = client.post(
         "/api/auth/login",
-        json={"email": "victim@example.com", "password": "secret-pass"},
+        json={"identifier": "victim@example.com", "password": "secret-pass"},
     )
     assert resp.status_code == 429
     assert "Retry-After" in resp.headers
@@ -99,11 +107,11 @@ def test_successful_login_clears_rate_limit_bucket(client: TestClient) -> None:
     for _ in range(3):
         client.post(
             "/api/auth/login",
-            json={"email": "ok@example.com", "password": "wrong"},
+            json={"identifier": "ok@example.com", "password": "wrong"},
         )
     resp = client.post(
         "/api/auth/login",
-        json={"email": "ok@example.com", "password": "secret-pass"},
+        json={"identifier": "ok@example.com", "password": "secret-pass"},
     )
     assert resp.status_code == 200
     # 8 more wrong attempts (3+8 = 11 total) should still be allowed
@@ -111,7 +119,7 @@ def test_successful_login_clears_rate_limit_bucket(client: TestClient) -> None:
     for _ in range(8):
         resp = client.post(
             "/api/auth/login",
-            json={"email": "ok@example.com", "password": "wrong"},
+            json={"identifier": "ok@example.com", "password": "wrong"},
         )
         assert resp.status_code == 401, f"got {resp.status_code} {resp.text}"
 
@@ -181,14 +189,18 @@ def test_recent_token_not_refreshed(client: TestClient) -> None:
 
 def test_bootstrap_admin_is_auto_approved(client: TestClient) -> None:
     """First-ever registrant becomes admin AND skips the pending state.
-    Otherwise no one could ever log in to do the approving."""
+    Otherwise no one could ever log in to do the approving. The
+    registrant's identifier IS their phone number — admin renaming to
+    "admin" is a migration-time thing, not a register-time thing."""
+    phone = next_phone()
     resp = client.post(
         "/api/auth/register",
-        json={"email": "founder@example.com", "password": "secret-pass"},
+        json={"phone": phone, "password": "secret-pass"},
     )
     assert resp.status_code == 201
     body = resp.json()
     assert body["user"]["role"] == "admin"
+    assert body["user"]["identifier"] == phone
     assert body["user"]["is_approved"] is True
     assert "access_token" in body, "bootstrap admin should get a token immediately"
 
@@ -196,10 +208,10 @@ def test_bootstrap_admin_is_auto_approved(client: TestClient) -> None:
 def test_second_registrant_returns_pending_payload(client: TestClient) -> None:
     """Self-registration after bootstrap returns RegisterPendingOut, NOT
     a token. The user must wait for admin approval before logging in."""
-    register(client, "founder@example.com")  # bootstrap
+    register(client, identifier=None)  # bootstrap with auto-generated phone
     resp = client.post(
         "/api/auth/register",
-        json={"email": "newbie@example.com", "password": "secret-pass"},
+        json={"phone": next_phone(), "password": "secret-pass"},
     )
     assert resp.status_code == 201
     body = resp.json()
@@ -208,17 +220,29 @@ def test_second_registrant_returns_pending_payload(client: TestClient) -> None:
     assert body["user"]["is_approved"] is False
 
 
+def test_register_rejects_non_mobile_format(client: TestClient) -> None:
+    """Self-registration is mobile-only — emails or short codes get
+    422 from the Pydantic validator, not a server error."""
+    for bad in ["not-a-phone", "12345", "138123456789", "20012345678"]:
+        resp = client.post(
+            "/api/auth/register",
+            json={"phone": bad, "password": "secret-pass"},
+        )
+        assert resp.status_code == 422, f"{bad!r} should be rejected"
+
+
 def test_pending_user_cannot_login(client: TestClient) -> None:
     """Login endpoint must distinguish "wrong password" (401) from
     "pending approval" (403) so the SPA can show a useful message."""
-    register(client, "founder@example.com")
+    register(client, identifier=None)
+    pending_phone = next_phone()
     client.post(
         "/api/auth/register",
-        json={"email": "pending@example.com", "password": "secret-pass"},
+        json={"phone": pending_phone, "password": "secret-pass"},
     )
     resp = client.post(
         "/api/auth/login",
-        json={"email": "pending@example.com", "password": "secret-pass"},
+        json={"identifier": pending_phone, "password": "secret-pass"},
     )
     assert resp.status_code == 403
     assert "审核" in resp.json()["detail"]
@@ -226,17 +250,18 @@ def test_pending_user_cannot_login(client: TestClient) -> None:
 
 def test_admin_can_approve_pending_user(client: TestClient) -> None:
     """Happy path: admin flips is_approved, user can then log in."""
-    founder = register(client, "founder@example.com")
+    founder = register(client, identifier=None)
+    candidate_phone = next_phone()
     reg_resp = client.post(
         "/api/auth/register",
-        json={"email": "candidate@example.com", "password": "secret-pass"},
+        json={"phone": candidate_phone, "password": "secret-pass"},
     )
     user_id = reg_resp.json()["user"]["id"]
 
     # Pending login → 403
     pre = client.post(
         "/api/auth/login",
-        json={"email": "candidate@example.com", "password": "secret-pass"},
+        json={"identifier": candidate_phone, "password": "secret-pass"},
     )
     assert pre.status_code == 403
 
@@ -254,7 +279,7 @@ def test_admin_can_approve_pending_user(client: TestClient) -> None:
     # Login now succeeds.
     post = client.post(
         "/api/auth/login",
-        json={"email": "candidate@example.com", "password": "secret-pass"},
+        json={"identifier": candidate_phone, "password": "secret-pass"},
     )
     assert post.status_code == 200
     assert post.json()["access_token"]
@@ -262,10 +287,10 @@ def test_admin_can_approve_pending_user(client: TestClient) -> None:
 
 def test_approve_is_idempotent(client: TestClient) -> None:
     """Double-approving doesn't error or move the approved_at timestamp."""
-    founder = register(client, "founder@example.com")
+    founder = register(client, identifier=None)
     reg = client.post(
         "/api/auth/register",
-        json={"email": "u@example.com", "password": "secret-pass"},
+        json={"phone": next_phone(), "password": "secret-pass"},
     )
     user_id = reg.json()["user"]["id"]
     first = client.post(
@@ -283,13 +308,13 @@ def test_approve_is_idempotent(client: TestClient) -> None:
 
 def test_non_admin_cannot_approve(client: TestClient) -> None:
     """Approval is an admin-only operation."""
-    register(client, "founder@example.com")  # bootstrap admin
-    # Create a regular user via the legacy helper (auto-approved).
-    regular = register(client, "regular@example.com")
+    register(client, identifier=None)  # bootstrap admin
+    # Regular user via the legacy helper (auto-approved).
+    regular = register(client, identifier=None)
     # And a pending user we'll try to approve.
     pending = client.post(
         "/api/auth/register",
-        json={"email": "pending@example.com", "password": "secret-pass"},
+        json={"phone": next_phone(), "password": "secret-pass"},
     ).json()
     resp = client.post(
         f"/api/users/{pending['user']['id']}/approve",
@@ -300,21 +325,29 @@ def test_non_admin_cannot_approve(client: TestClient) -> None:
 
 def test_admin_created_user_is_pre_approved(client: TestClient) -> None:
     """When an admin creates an account via /api/users, the approval
-    step is implicit — they can log in immediately."""
-    founder = register(client, "founder@example.com")
+    step is implicit — they can log in immediately. Admin endpoint
+    accepts ANY identifier shape (phone, email-shaped legacy, plain
+    username), which is the whole point — service accounts like
+    `worker-bot` live here."""
+    founder = register(client, identifier=None)
     create = client.post(
         "/api/users",
-        json={"email": "by-admin@example.com", "password": "secret-pass", "role": "user"},
+        json={
+            "identifier": "worker-bot",
+            "password": "secret-pass",
+            "role": "user",
+        },
         headers=auth_headers(founder["access_token"]),
     )
     assert create.status_code == 201
     body = create.json()
     assert body["is_approved"] is True
     assert body["approved_by_id"] == founder["user"]["id"]
+    assert body["identifier"] == "worker-bot"
     # And login works without any extra step.
     login_resp = client.post(
         "/api/auth/login",
-        json={"email": "by-admin@example.com", "password": "secret-pass"},
+        json={"identifier": "worker-bot", "password": "secret-pass"},
     )
     assert login_resp.status_code == 200
 
@@ -322,11 +355,11 @@ def test_admin_created_user_is_pre_approved(client: TestClient) -> None:
 def test_list_users_orders_pending_first(client: TestClient) -> None:
     """Admin's user list surfaces pending accounts ahead of approved ones
     so the review queue is at the top of the page."""
-    founder = register(client, "founder@example.com")
-    register(client, "approved@example.com")  # legacy auto-approve helper
+    founder = register(client, identifier=None)
+    register(client, identifier=None)  # legacy auto-approve helper
     client.post(
         "/api/auth/register",
-        json={"email": "pending@example.com", "password": "secret-pass"},
+        json={"phone": next_phone(), "password": "secret-pass"},
     )
     rows = client.get(
         "/api/users", headers=auth_headers(founder["access_token"])
@@ -340,14 +373,14 @@ def test_list_users_orders_pending_first(client: TestClient) -> None:
 
 def test_admin_stats_counts_pending_users(client: TestClient) -> None:
     """Admin dashboard surfaces pending_user_count as a separate metric."""
-    founder = register(client, "founder@example.com")
+    founder = register(client, identifier=None)
     client.post(
         "/api/auth/register",
-        json={"email": "p1@example.com", "password": "secret-pass"},
+        json={"phone": next_phone(), "password": "secret-pass"},
     )
     client.post(
         "/api/auth/register",
-        json={"email": "p2@example.com", "password": "secret-pass"},
+        json={"phone": next_phone(), "password": "secret-pass"},
     )
     stats = client.get(
         "/api/admin/stats", headers=auth_headers(founder["access_token"])

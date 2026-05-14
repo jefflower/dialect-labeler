@@ -20,7 +20,7 @@ export default function AdminUsersPage() {
   const [error, setError] = useState<string | null>(null);
 
   // create form
-  const [email, setEmail] = useState("");
+  const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<"admin" | "user">("user");
   const [submitting, setSubmitting] = useState(false);
@@ -43,8 +43,8 @@ export default function AdminUsersPage() {
     setSubmitting(true);
     setError(null);
     try {
-      await createUser(email.trim(), password, role);
-      setEmail("");
+      await createUser(identifier.trim(), password, role);
+      setIdentifier("");
       setPassword("");
       setRole("user");
       await refresh();
@@ -76,7 +76,7 @@ export default function AdminUsersPage() {
   }
 
   async function onDelete(u: User) {
-    if (!window.confirm(`Delete ${u.email}?`)) return;
+    if (!window.confirm(`Delete ${u.identifier}?`)) return;
     setError(null);
     try {
       await deleteUser(u.id);
@@ -98,10 +98,10 @@ export default function AdminUsersPage() {
         <h3 style={{ marginTop: 0 }}>新建账号</h3>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 140px auto", gap: 10 }}>
           <input
-            type="email"
-            placeholder="邮箱"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            type="text"
+            placeholder="账号（手机号 / 用户名）"
+            value={identifier}
+            onChange={(e) => setIdentifier(e.target.value)}
             required
           />
           <input
@@ -150,7 +150,7 @@ export default function AdminUsersPage() {
                 const pending = !u.is_approved;
                 return (
                   <tr key={u.id} className={pending ? "row-pending" : ""}>
-                    <td>{u.email}</td>
+                    <td>{u.identifier}</td>
                     <td>
                       <span
                         className="status-chip"

@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -27,7 +27,12 @@ router = APIRouter(prefix="/api/users", tags=["users"])
 
 
 class UserCreateIn(BaseModel):
-    email: EmailStr
+    # Admin-tier endpoint, so we let the admin pick any identifier
+    # string — phone, email, plain username like "admin" or
+    # "worker-bot", whatever. Self-service signup is still locked to
+    # phone numbers (see schemas.RegisterIn), but admin-created
+    # accounts exist for service bots and named operators.
+    identifier: str = Field(min_length=1, max_length=254)
     password: str = Field(min_length=8, max_length=128)
     role: str = ROLE_USER
 
@@ -65,15 +70,18 @@ def create_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"role must be {ROLE_ADMIN} or {ROLE_USER}",
         )
-    if db.execute(select(User).where(User.email == payload.email)).scalar_one_or_none():
+    if db.execute(
+        select(User).where(User.identifier == payload.identifier)
+    ).scalar_one_or_none():
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Email already registered"
+            status_code=status.HTTP_409_CONFLICT,
+            detail="该账号已被占用",
         )
     # Admin-created accounts are pre-approved by definition — an admin
     # creating a user IS the approval. Skip the pending state so they
     # can log in immediately.
     user = User(
-        email=payload.email,
+        identifier=payload.identifier,
         password_hash=hash_password(payload.password),
         role=payload.role,
         is_approved=True,
