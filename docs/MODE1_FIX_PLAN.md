@@ -8,7 +8,12 @@
 
 ## 用户硬约束（不能违反）
 
-1. **`max_segment_ms` ≤ 30 秒** 是非协商上限。所有合并 / 切分都要受这个约束。
+1. **`max_segment_ms` 是用户配置项，不是硬编码**：
+   - `CutConfig.max_segment_ms`（u64，单位 ms）— 用户在 Tauri 客户端 ConfigBand 里设
+   - `default_max_segment_ms() = 0` — 默认 0 表示**无上限**（`build_segment_ranges` 把 0 翻译成 `f64::INFINITY`）
+   - 用户**当前实际配置的是 30000**（30 秒，典型值），但这是配置不是硬编码
+   - 所有合并 / 切分算法都要**读 `config.max_segment_ms`**，并正确处理 0 = 无上限的情况
+   - **绝对不要硬编码 30000**——会破坏其他用户的不同配置
 2. **Mode 1 音频中间会出现较长的静音段**（自由对话场景特征，Mode 2 没有）。所有处理逻辑都要容忍段内长静音。
 3. **不能借鉴 Mode 2 的 LLM 切割逻辑**——Mode 2 算法假设窗口内是连续语音，Mode 1 不满足。详见 SESSION §7.3a 的 4 条论证。
 
@@ -70,34 +75,39 @@ fn default_min_segment_ms() -> u64 { 300 }   // → 2000
 
 **位置**：modes/silence.rs `build_segment_ranges` 末尾加 post-processing。
 
-**算法**：
+**算法**（伪码——读 `config.max_segment_ms`，0 = 无上限）：
 
 ```text
+# 上限处理：0 → 无穷大（保持 build_segment_ranges 现有语义）
+max_total_ms = if config.max_segment_ms > 0 { config.max_segment_ms } else { u64::MAX }
+
 扫 ranges 数组：
 对每个 ranges[i]：
     if duration(ranges[i]) < min_segment_ms * 1.5:
         # 短段。尝试合并到相邻段
         merge_target = 选 ranges[i-1] 和 ranges[i+1] 中较短的一个
         gap_silence = ranges[i].start - merge_target.end  # 跨长静音的时长
-        if merge_target.duration + ranges[i].duration + gap_silence <= max_segment_ms:
+        if merge_target.duration + ranges[i].duration + gap_silence <= max_total_ms:
             合并 + 删除 ranges[i]
         else:
-            # 受 30s 上限约束无法合并 → 保留独立短段
+            # 合并后会超过用户配置上限 → 保留独立短段
             (用户能在 Tauri 客户端再手工处理)
 ```
 
 **关键设计点**：
 - 合并时**算上中间长静音的时长**到总时长上限里
-- 总时长 ≤ 30s 才合并，否则不合并（碎，但不能突破 30s）
+- 上限来自 `config.max_segment_ms`，**不要硬编码 30000**
+- 用户配置 0 时（无上限）合并永远成功 — 这是 build_segment_ranges 已有的语义
 - **不压缩 / 不删除中间的 silence**——保留为 segment 内部时长。这是 Mode 1 vs Mode 2 的关键不同：Mode 1 segment 内允许有长静音
 
-**测试用例**：
+**测试用例**（用 `CutConfig { max_segment_ms: 30_000, ... }` 实例化）：
 - 短段在中间 → 合并到较短邻段
 - 短段在头部 → 合并到 ranges[1]
 - 短段在尾部 → 合并到 ranges[-2]
-- 合并会超 30s → 保留独立
+- 合并后超 `max_segment_ms` → 保留独立
 - 没有相邻段（只有一个短段）→ 保留独立
-- 跨长静音合并 → 中间静音计入时长
+- 跨长静音合并 → 中间静音计入总时长
+- `max_segment_ms = 0`（无上限）→ 短段始终合并，无论总时长多大
 
 ### M3.3: 段内长静音处理（可选 / 看 M3.2 效果再决定）
 
