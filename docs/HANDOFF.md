@@ -106,13 +106,23 @@ dialect-labeler/
 │   └── env.ts                 # REVIEW_ONLY / HIDE_PROCESSING_UI 标志
 │
 ├── src-tauri/                 # Tauri 后端 (Rust)
-│   ├── src/lib.rs             # ⭐ 主逻辑（~10K 行，含 Mode 2 滑窗算法）
+│   ├── src/lib.rs             # 共享基础设施 (~9K 行) — audio I/O / scan /
+│   │                          # recognize / export / Tauri commands。
+│   │                          # 注意：Mode 1/2 的切割算法已移出（2026-05-14）
 │   ├── src/cloud.rs           # 云端 Worker 流水线 + trait dispatch 到 modes
-│   ├── src/modes/             # ⭐ 每个 cutting mode 一个文件（见 §6.9）
+│   ├── src/modes/             # ⭐ 每个 cutting mode 一个完整文件
 │   │   ├── mod.rs             #   - Mode trait + ModeRunCtx + lookup() 注册表
 │   │   ├── common.rs          #   - SegmentQaFlag enum（mode 共享 schema 唯一处）
-│   │   ├── silence.rs         #   - Mode 1 dispatch + Mode-1-private apply_recognition
-│   │   └── semantic.rs        #   - Mode 2 dispatch + 私有 prompts + detect_qa_flags
+│   │   ├── silence.rs         #   ⭐ Mode 1 完整切割算法 + dispatch (~1316 行)
+│   │   │                      #     cut_audio_file_dialect_impl / detect_silence /
+│   │   │                      #     build_segment_ranges / trim/gate_head_tail /
+│   │   │                      #     effective_silence_db / analyze_noise_floor_db
+│   │   │                      #     SilenceEvent enum 等
+│   │   └── semantic.rs        #   ⭐ Mode 2 完整切割算法 + dispatch (~1175 行)
+│   │                          #     run_semantic_pipeline_impl /
+│   │                          #     process_single_semantic_file /
+│   │                          #     llm_pick_one_cut / transcribe_remote_with_segments
+│   │                          #     DEFAULT_*_PROMPT / detect_qa_flags
 │   ├── tauri.conf.json
 │   └── Cargo.toml
 │
@@ -263,6 +273,18 @@ LoginPage 从「居中卡片浅色」改成「双栏深色工业风」，灵感�
 所有 CSS 都 scope 在 `.login-shell` 容器里，**不污染**其它 admin/tasks 页面（这俩还是原浅色主题）。`oklch()` 色彩空间需要 Safari 15.4+ / Chrome 111+（生产部署内部使用，浏览器 baseline 没问题）。字体用 system fallback（PingFang SC / SF Pro Display / ui-monospace）—— **不引 Google Fonts CDN**，阿里云 ECS 访问境外 CDN 不稳。
 
 保留功能：注册 → pending banner（绿色），login 403 → error banner（红色），bootstrap admin 直接 token。所有审核流程逻辑都没动，只是视觉变了。
+
+### 6.15 物理路径隔离（2026-05-14）
+2026-05-14 把 Mode 1 / Mode 2 的切割算法**物理上**搬到各自的模块文件，让下个 session 改一个 mode 时只需要看一个文件。
+
+**搬移后**：
+- 改 **Mode 1 切割算法** → 只看 `src-tauri/src/modes/silence.rs`（cut_audio_file_dialect_impl / detect_silence / build_segment_ranges / push_with_smart_split / trim/gate_head_tail / effective_silence_db / SilenceEvent 等都在这里）
+- 改 **Mode 2 切割算法** → 只看 `src-tauri/src/modes/semantic.rs`（run_semantic_pipeline_impl / process_single_semantic_file / llm_pick_one_cut / transcribe_remote_with_segments 都在这里）
+- 改 **两个 mode 共用的** → lib.rs（probe_audio / write_pcm_wav_segment / SegmentRecord / CutConfig / recognize_segments_impl / Tauri commands）
+
+**留在 lib.rs 的 Mode 2 v1 死代码**：HANDOFF §10 列的 21 个 `#[allow(dead_code)]` 标记的 v1 函数（fine_pre_cut_for_semantic / build_semantic_cut_prompt / validate_semantic_cuts / 等等）**没搬**。理由：它们已是死代码，搬到 modes/semantic.rs 反而污染「干净的当前 Mode 2 代码」语义。HANDOFF §10 仍说「可删但不是优先项」。
+
+**红线**：未来增删 mode 函数时，别又往 lib.rs 加。新 mode 的所有专属代码都应该在 `modes/<new_mode>.rs`。
 
 ### 6.9 Mode 绝对分离 — `src-tauri/src/modes/` 架构（P0 #2 落地）
 当前两个 mode + 未来更多 mode 共用一套 worker pipeline，但**互不知道对方存在**。规则：
