@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -84,11 +85,32 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(254), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False, default=ROLE_USER)
+    # Admin approval gate: a freshly self-registered user starts with
+    # `is_approved=False` and gets a 403 on login until an existing
+    # admin flips this true. The first-ever registrant (bootstrap) and
+    # admin-created accounts (via /api/users) skip the gate — see
+    # `routes/auth.py::register` + `routes/users.py::create_user`.
+    is_approved: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    # When an admin approved this account. NULL means "still pending"
+    # or "bootstrap admin (was never explicitly approved)". We use
+    # `is_approved` as the authoritative gate; this column is just for
+    # display ("approved by X at Y").
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    approved_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
 
     tasks: Mapped[list["Task"]] = relationship(

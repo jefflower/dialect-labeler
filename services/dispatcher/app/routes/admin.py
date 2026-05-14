@@ -53,6 +53,9 @@ class StatsOut(BaseModel):
     failed_24h: int
     total_user_count: int
     total_admin_count: int
+    # Self-registered users waiting for an admin to approve them.
+    # Dashboard surfaces this as a "你有 N 个待审核账号" badge.
+    pending_user_count: int = 0
     storage: StorageBreakdown
 
 
@@ -117,6 +120,10 @@ def stats(_: AdminUser, db: Annotated[Session, Depends(get_db)]) -> StatsOut:
         )
     ).one()
 
+    pending_user_count = db.execute(
+        select(func.count(User.id)).where(User.is_approved.is_(False))
+    ).scalar_one()
+
     return StatsOut(
         task_counts=counts,
         queue_depth=queue_depth,
@@ -125,5 +132,6 @@ def stats(_: AdminUser, db: Annotated[Session, Depends(get_db)]) -> StatsOut:
         failed_24h=int(failed_24h or 0),
         total_admin_count=int(role_rows[0] or 0),
         total_user_count=int(role_rows[1] or 0),
+        pending_user_count=int(pending_user_count or 0),
         storage=_storage_breakdown(),
     )

@@ -15,10 +15,29 @@ class UserOut(BaseModel):
     id: int
     email: EmailStr
     role: str
+    # Admin-approval gate. New self-registered users start unapproved
+    # (is_approved=False) and a freshly-issued JWT for them won't pass
+    # the login endpoint — the admin must flip this true first.
+    # Defaults to True for backwards compatibility with old clients
+    # that don't surface the field; existing rows are grandfathered
+    # to True by the inline migration.
+    is_approved: bool = True
+    approved_at: datetime | None = None
+    approved_by_id: int | None = None
     created_at: datetime
     last_login_at: datetime | None = None
 
     model_config = {"from_attributes": True}
+
+
+class RegisterPendingOut(BaseModel):
+    """Response when a self-service registration succeeded but is
+    waiting for admin approval. No token issued — the user must come
+    back after the admin signs off."""
+
+    status: str = "pending_approval"
+    detail: str = "账号已创建，等待管理员审核通过后再登录。"
+    user: UserOut
 
 
 class RegisterIn(BaseModel):

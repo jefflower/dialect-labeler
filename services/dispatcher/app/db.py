@@ -131,6 +131,30 @@ def _apply_sqlite_inline_migrations(engine: Engine) -> None:
                 text("ALTER TABLE tasks ADD COLUMN progress_updated_at DATETIME")
             )
 
+        # Admin-approval gate on users (2026-05). New self-registered
+        # users start with is_approved=0 and need an admin to flip it.
+        # On migration, existing users are grandfathered to approved=1
+        # so we don't lock anyone out (especially the admin running
+        # the upgrade).
+        user_rows = conn.execute(text("PRAGMA table_info(users)")).fetchall()
+        user_columns = {row[1] for row in user_rows}
+        if "is_approved" not in user_columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE users ADD COLUMN is_approved BOOLEAN NOT NULL DEFAULT 0"
+                )
+            )
+            # Grandfather existing accounts. SAFE: this only fires on
+            # the migration path; new INSERTs after this still default
+            # to 0 via the column DEFAULT + the SQLAlchemy default.
+            conn.execute(text("UPDATE users SET is_approved = 1"))
+        if "approved_at" not in user_columns:
+            conn.execute(text("ALTER TABLE users ADD COLUMN approved_at DATETIME"))
+        if "approved_by_id" not in user_columns:
+            conn.execute(
+                text("ALTER TABLE users ADD COLUMN approved_by_id INTEGER")
+            )
+
 
 def get_db() -> Iterator[Session]:
     """FastAPI dependency: yields a Session and closes it after the request."""

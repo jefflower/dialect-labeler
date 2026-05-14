@@ -12,6 +12,13 @@ export interface User {
   id: number;
   email: string;
   role: "admin" | "user";
+  /** Admin-approval gate. Self-registered users start with
+   *  `is_approved=false` and can't log in until an admin flips this
+   *  true via POST /api/users/{id}/approve. Defaults to `true` when
+   *  the field is missing (old client / old dispatcher response). */
+  is_approved: boolean;
+  approved_at: string | null;
+  approved_by_id: number | null;
   created_at: string;
   last_login_at: string | null;
 }
@@ -70,6 +77,21 @@ export interface TokenResponse {
   token_type: string;
   user: User;
 }
+
+/**
+ * Response shape when self-registration succeeded but the user is in
+ * the admin-approval queue. No token issued — the user has to come
+ * back after the admin signs off. We use a discriminator on `status`
+ * so callers can `if ("access_token" in body)` and pick the right
+ * branch.
+ */
+export interface RegisterPendingResponse {
+  status: "pending_approval";
+  detail: string;
+  user: User;
+}
+
+export type RegisterResponse = TokenResponse | RegisterPendingResponse;
 
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
@@ -140,7 +162,7 @@ async function request<T>(
 
 // ---- Auth -------------------------------------------------------------
 export function register(email: string, password: string) {
-  return request<TokenResponse>("/api/auth/register", {
+  return request<RegisterResponse>("/api/auth/register", {
     method: "POST",
     body: JSON.stringify({ email, password }),
   });
@@ -223,6 +245,16 @@ export function deleteUser(userId: number) {
   return request<void>(`/api/users/${userId}`, { method: "DELETE" });
 }
 
+/**
+ * Flip a pending account's `is_approved` to true so the user can log
+ * in. Idempotent — calling on an already-approved account is a no-op
+ * returning 200 with the current row. The dispatcher prefers this
+ * over a 409 conflict so the UI can be tolerant of double-clicks.
+ */
+export function approveUser(userId: number) {
+  return request<User>(`/api/users/${userId}/approve`, { method: "POST" });
+}
+
 // ---- Admin: releases --------------------------------------------------
 export interface ReleaseRow {
   id: number;
@@ -291,6 +323,9 @@ export interface AdminStats {
   failed_24h: number;
   total_user_count: number;
   total_admin_count: number;
+  /** Self-registered users waiting for admin approval. UI surfaces
+   *  this as a "你有 N 个待审核账号" badge on the dashboard. */
+  pending_user_count: number;
   storage: {
     inputs_bytes: number;
     inputs_files: number;

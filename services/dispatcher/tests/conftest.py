@@ -63,11 +63,47 @@ def client(tmp_state: Path) -> Iterator[TestClient]:
 
 
 def register(client: TestClient, email: str, password: str = "secret-pass") -> dict:
+    """Register + auto-approve for legacy test compatibility.
+
+    The production register endpoint now drops 2nd+ registrants into a
+    pending state (admin must approve via /api/users/{id}/approve).
+    Most existing tests pre-date this gate and don't care about the
+    workflow — they just want a logged-in user. So this helper:
+      1. Posts /register (gets TokenOut for bootstrap admin, or
+         RegisterPendingOut for everyone else).
+      2. If the response is the pending shape, flips `is_approved` on
+         the DB row directly so subsequent `login()` calls succeed.
+      3. Returns a token-bearing dict, normalised to the legacy shape.
+
+    Tests that specifically exercise the approval flow should NOT use
+    this helper — call the endpoints directly with `client.post(...)`.
+    """
     resp = client.post(
         "/api/auth/register", json={"email": email, "password": password}
     )
     assert resp.status_code == 201, resp.text
-    return resp.json()
+    body = resp.json()
+    if "access_token" in body:
+        return body
+    # Pending shape — auto-approve through the DB so legacy tests
+    # can immediately log in. We bypass the API on purpose: this
+    # helper is fixture-grade, not a public surface.
+    from app.db import session_scope
+    from app.models import User, utcnow
+
+    user_id = body["user"]["id"]
+    with session_scope() as db:
+        u = db.get(User, user_id)
+        assert u is not None
+        u.is_approved = True
+        u.approved_at = utcnow()
+    # Now login to get a token the rest of the test can use.
+    token = login(client, email, password)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": body["user"] | {"is_approved": True},
+    }
 
 
 def login(client: TestClient, email: str, password: str = "secret-pass") -> str:

@@ -2,7 +2,7 @@
 
 写给下一个会话 / 下一位开发者。当前状态、关键设计决策、可继续做的事都在这里。
 
-最后更新：2026-05-13（晚），P0 #2 + mode 架构分离落地之后（commit 待入）
+最后更新：2026-05-13（深夜），P0 #2 + mode 架构分离 + tray spinner + 账号审核 + 登录页 reskin 之后
 
 ---
 
@@ -24,6 +24,8 @@
 - Mac Worker bot: `worker-bot@example.com` / `Wb-uS3rT0ken_2026_X`（在 launchd plist EnvironmentVariables 里）
 - 测试上传者: `uploader@example.com` / `Up10ad-T3st-2026`
 - 服务器 SSH: `ssh root@47.93.1.242`（密钥认证，已配）
+
+**注意（2026-05-13 起）**：自助注册 (`POST /api/auth/register`) 默认进入「待管理员审核」状态。第一个注册者（bootstrap admin）自动批准，之后所有新注册者必须 admin 审核才能登录。审核端点：`POST /api/users/{id}/approve`（admin only）。前端在 `/admin/users` 页面有「批准」按钮，stats 端点会返回 `pending_user_count`。详见 §6.10。
 
 ## 3. 端到端流程图
 
@@ -192,6 +194,53 @@ firewall-cmd --reload
 ```
 重启服务器会丢配置如果忘了 `--permanent`。
 
+### 6.10 账号审核（admin approval gate）
+自助注册 (`/api/auth/register`) 后**默认不能登录**——必须 admin 审核。设计：
+
+- 第一个注册者（bootstrap admin）自动批准、直接发 token
+- 之后所有 `/api/auth/register` 返回 `RegisterPendingOut`（`status: "pending_approval"`），**不发 token**
+- pending 用户登录 → 403 + 「正在等待管理员审核」中文消息
+- admin 用 `POST /api/users/{id}/approve` 批准（幂等：重复批准返回 200）
+- admin 用 `POST /api/users` 创建的账号**直接预批准**（admin 创建 = 隐含批准）
+- admin 用 `DELETE /api/users/{id}` 删除 pending 账号 = 拒绝申请
+- `is_approved` / `approved_at` / `approved_by_id` 三列加在 users 表，inline migration 把现存用户全部 grandfather 为 approved=True（避免锁死自己）
+- `GET /api/admin/stats` 多了 `pending_user_count` 字段
+- 前端 LoginPage 用绿色 banner 显示 pending；AdminUsersPage 顶部用黄色 banner + 行级红色 chip 突出 pending 用户
+
+测试在 `tests/test_auth.py` 9 个 case 覆盖：bootstrap 自动批准、pending 拒登、admin 批准链路、批准幂等、非 admin 不能批准、admin 创建预批准、list_users 排序 pending 在前、stats 计数。
+
+### 6.11 公开 stats 端点 (`/api/public/stats`)
+LoginPage 重设计后底部有「活跃用户 / 累计任务 / 处理时长 / 24h 完成」KPI strip。登录前展示 → 不能用 admin/stats。新增 `routes/public.py`：
+
+- 无 auth required
+- 只返回聚合数字（用户数、任务总数、处理秒数、24h 计数）
+- **不返回**任何 PII（邮箱、任务 id、错误信息）
+- 30s 一拉，前端失败静默退回占位
+
+未来加新「safe-pre-login」字段就放这里。**严禁**加任何 per-task / per-user 细节——那是 admin/stats 的活。
+
+### 6.12 Mac Worker tray spinner（菜单栏动画）
+原 tray 只是静态图标 + 「打开窗口/退出」菜单。现在 worker 工作时：
+- macOS 菜单栏 icon 旁出现文字 spinner（`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`，120ms / 帧）+ 当前阶段中文（「切割中」「识别中」…）
+- icon 本身切到 12 帧旋转 spinner（src-tauri/icons/spinner/，每 30° 一帧，scripts/gen_tray_spinner_icons.py 程序生成）
+- 菜单顶部两个 disabled item 显示当前任务名 + 阶段
+- 任务完成自动停 spinner + 切回 idle icon + 清菜单栏 title
+
+实现位置：`src-tauri/src/lib.rs::TrayController`（在 `build_tray` 区块）。spinner thread 通过 `Arc<AtomicBool>` 取消标志，每次新任务来时先 cancel 旧的再 spawn。菜单更新通过 `ctx.set_stage` 闭包，modes 不直接碰 CloudState（保留 mode 分离边界）。
+
+PNG 资源由 `scripts/gen_tray_spinner_icons.py` 程序生成（Pillow），可随时重跑覆盖。需要换风格直接改 Python 脚本（`INNER_RADIUS_FRAC` / `DOT_RADIUS_FRAC` / opacity 曲线）然后 `python3 scripts/gen_tray_spinner_icons.py`。
+
+### 6.13 登录页深色 reskin（2026-05-13）
+LoginPage 从「居中卡片浅色」改成「双栏深色工业风」，灵感来自一份外部 React 原型（`AI 工作台登录页面设计.zip`）。组件拆到 `services/dispatcher/web/src/pages/login/`：
+- `Logo.tsx` — 方形外框 SVG + 内嵌动画波形 bars
+- `Pipeline.tsx` — 5 阶段流水线（upload → split → AI → pack → annotate），每 3.2s 推进高亮 + 粒子流动 + AI 阶段用冷色 secondary accent
+- `Waveform.tsx` — 底部装饰波形条
+- `StatStrip.tsx` — KPI 条 + 实时时钟，从 `/api/public/stats` 拉数据
+
+所有 CSS 都 scope 在 `.login-shell` 容器里，**不污染**其它 admin/tasks 页面（这俩还是原浅色主题）。`oklch()` 色彩空间需要 Safari 15.4+ / Chrome 111+（生产部署内部使用，浏览器 baseline 没问题）。字体用 system fallback（PingFang SC / SF Pro Display / ui-monospace）—— **不引 Google Fonts CDN**，阿里云 ECS 访问境外 CDN 不稳。
+
+保留功能：注册 → pending banner（绿色），login 403 → error banner（红色），bootstrap admin 直接 token。所有审核流程逻辑都没动，只是视觉变了。
+
 ### 6.9 Mode 绝对分离 — `src-tauri/src/modes/` 架构（P0 #2 落地）
 当前两个 mode + 未来更多 mode 共用一套 worker pipeline，但**互不知道对方存在**。规则：
 
@@ -336,12 +385,17 @@ $ cd src-tauri && cargo build --release        # Rust release
 
 ## 11. 上次会话留的待办 (从前文)
 
-**本次会话（2026-05-13 晚）做了**：
+**本次会话（2026-05-13）做了**：
 - ✅ P0 #2 D：Mode 2 Whisper prompt 升级（长沙话示例 + 禁英文）
 - ✅ P0 #2 E：SegmentQaFlag + detect_qa_flags + Tauri 客户端 badge 展示
 - ✅ mode 架构分离：`src-tauri/src/modes/`，cloud.rs 248 行 if/else → 30 行 trait dispatch
-- ✅ Tests: cargo 77 passed（旧 68 + 新 9 QA 单测）/ pytest 75 passed
-- ⚠️ **没在真实任务上跑过**——单测和编译都过，但 prompt + qaFlags 在生产里的实际效果还没验证
+- ✅ Mac Worker tray 菜单栏：Braille 文字 spinner + 12 帧旋转 icon + 任务/阶段菜单项（§6.12）
+- ✅ 账号审核流程：register pending、admin approve、3 列 migration、9 新测试（§6.10）
+- ✅ `/api/public/stats` 公开端点（§6.11）
+- ✅ LoginPage 双栏深色 reskin + Pipeline / Waveform / StatStrip 子组件（§6.13）
+- ✅ Tests: cargo 77 passed / pytest 84 passed（75 旧 + 9 审核）
+- ✅ Dispatcher 已部署 (rebuild + restart)；Mac Worker 已重启用新 tray 代码
+- ⚠️ **没在真实任务上跑过端到端**——单测 + 编译 + healthz + public/stats 都过，但 Mode 2 prompt 改进 + qaFlags + tray spinner 在生产里的实际效果还没看到
 
 仍待做：
 - `Tauri release` 打包 + macOS notarization（P1 #3）

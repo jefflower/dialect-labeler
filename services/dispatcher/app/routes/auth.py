@@ -20,7 +20,7 @@ from ..auth import (
 from ..config import get_settings
 from ..db import get_db
 from ..models import ROLE_ADMIN, ROLE_USER, User, utcnow
-from ..schemas import LoginIn, RegisterIn, TokenOut, UserOut
+from ..schemas import LoginIn, RegisterIn, RegisterPendingOut, TokenOut, UserOut
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -60,20 +60,37 @@ def _reset_login_rate_limit(email: str) -> None:
         _login_attempts.pop(email, None)
 
 
-@router.post("/register", response_model=TokenOut, status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterIn, db: Annotated[Session, Depends(get_db)]) -> TokenOut:
-    """Self-service signup.
+@router.post(
+    "/register",
+    response_model=RegisterPendingOut | TokenOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def register(
+    payload: RegisterIn,
+    db: Annotated[Session, Depends(get_db)],
+) -> RegisterPendingOut | TokenOut:
+    """Self-service signup with admin-approval gate.
 
-    Allowed when EITHER:
-      - the users table is empty (bootstrap: first registrant becomes admin), OR
-      - settings.allow_open_registration is true.
+    Three paths:
+      - **Bootstrap** (users table empty): first registrant becomes admin
+        AND is auto-approved. Returns TokenOut — they can use the system
+        immediately.
+      - **Self-signup with open registration on** (settings.allow_open_registration):
+        account is created with `is_approved=False` and returns
+        RegisterPendingOut. The user CANNOT log in until an admin flips
+        `is_approved` true via POST /api/users/{id}/approve.
+      - **Open registration off**: HTTP 403; admin must use /api/users.
 
-    Otherwise an admin must create the user via /api/users.
+    Why a pending state instead of straight 201 with token? Because we
+    want admins to vet new users before they consume worker quota or
+    upload arbitrary input. Issuing a token only on approval makes the
+    UX flow obvious: register → wait → admin approves → log in.
     """
     settings = get_settings()
     existing_count = db.execute(select(User.id).limit(1)).scalar_one_or_none()
 
-    if existing_count is None:
+    is_bootstrap = existing_count is None
+    if is_bootstrap:
         role = ROLE_ADMIN
     elif settings.allow_open_registration:
         role = ROLE_USER
@@ -88,17 +105,30 @@ def register(payload: RegisterIn, db: Annotated[Session, Depends(get_db)]) -> To
             status_code=status.HTTP_409_CONFLICT, detail="Email already registered"
         )
 
+    # Bootstrap admin is implicitly approved (no one's around to approve
+    # them anyway). Everyone else lands in the pending queue.
+    is_approved = is_bootstrap
+    approved_at = utcnow() if is_bootstrap else None
+
     user = User(
         email=payload.email,
         password_hash=hash_password(payload.password),
         role=role,
+        is_approved=is_approved,
+        approved_at=approved_at,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
 
-    token = create_access_token(user.id)
-    return TokenOut(access_token=token, user=UserOut.model_validate(user))
+    if is_bootstrap:
+        # First registrant is the bootstrap admin: hand them a token
+        # immediately so they don't get stuck on "waiting for admin"
+        # forever.
+        token = create_access_token(user.id)
+        return TokenOut(access_token=token, user=UserOut.model_validate(user))
+
+    return RegisterPendingOut(user=UserOut.model_validate(user))
 
 
 @router.post("/login", response_model=TokenOut)
@@ -113,6 +143,17 @@ def login(payload: LoginIn, db: Annotated[Session, Depends(get_db)]) -> TokenOut
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
+        )
+
+    # Admin-approval gate. Pending users get a 403 with a clear message
+    # so the SPA can render a "waiting for approval" state without
+    # ambiguity. We DON'T merge this with the 401 above — distinguishing
+    # "wrong credentials" from "credentials valid but account pending"
+    # is the entire point of the feature.
+    if not user.is_approved:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="账号正在等待管理员审核，审核通过后即可登录。",
         )
 
     user.last_login_at = utcnow()

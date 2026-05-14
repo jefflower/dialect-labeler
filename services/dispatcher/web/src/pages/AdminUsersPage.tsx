@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   ApiError,
+  approveUser,
   createUser,
   deleteUser,
   listUsers,
@@ -64,6 +65,16 @@ export default function AdminUsersPage() {
     }
   }
 
+  async function onApprove(u: User) {
+    setError(null);
+    try {
+      await approveUser(u.id);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    }
+  }
+
   async function onDelete(u: User) {
     if (!window.confirm(`Delete ${u.email}?`)) return;
     setError(null);
@@ -111,6 +122,13 @@ export default function AdminUsersPage() {
         </div>
       </form>
 
+      {users && users.some((u) => !u.is_approved) && (
+        <div className="info-banner" style={{ marginBottom: 14 }}>
+          ⚠ 有 {users.filter((u) => !u.is_approved).length} 个账号待审核。
+          点击对应行的「批准」让其登录。
+        </div>
+      )}
+
       <div className="card">
         {users === null ? (
           <div className="loader">加载中…</div>
@@ -120,6 +138,7 @@ export default function AdminUsersPage() {
               <tr>
                 <th>邮箱</th>
                 <th>角色</th>
+                <th>状态</th>
                 <th>创建</th>
                 <th>上次登录</th>
                 <th style={{ textAlign: "right" }}>操作</th>
@@ -128,8 +147,9 @@ export default function AdminUsersPage() {
             <tbody>
               {users.map((u) => {
                 const isSelf = me?.id === u.id;
+                const pending = !u.is_approved;
                 return (
-                  <tr key={u.id}>
+                  <tr key={u.id} className={pending ? "row-pending" : ""}>
                     <td>{u.email}</td>
                     <td>
                       <span
@@ -141,13 +161,53 @@ export default function AdminUsersPage() {
                         {u.role === "admin" ? "管理员" : "用户"}
                       </span>
                     </td>
+                    <td>
+                      {pending ? (
+                        <span
+                          className="status-chip"
+                          style={{ background: "#b65709" }}
+                          title="待管理员审核才能登录"
+                        >
+                          待审核
+                        </span>
+                      ) : (
+                        <span
+                          className="status-chip"
+                          style={{ background: "#107c10" }}
+                          title={
+                            u.approved_at
+                              ? `于 ${u.approved_at} 通过`
+                              : "已通过"
+                          }
+                        >
+                          已通过
+                        </span>
+                      )}
+                    </td>
                     <td>{formatRelative(u.created_at)}</td>
                     <td>{u.last_login_at ? formatRelative(u.last_login_at) : "—"}</td>
                     <td style={{ textAlign: "right" }}>
+                      {pending && (
+                        <>
+                          <button
+                            className="primary"
+                            onClick={() => onApprove(u)}
+                            title="允许该账号登录"
+                          >
+                            批准
+                          </button>{" "}
+                        </>
+                      )}
                       <button
                         onClick={() => onToggleRole(u)}
-                        disabled={isSelf}
-                        title={isSelf ? "无法修改自己的角色" : ""}
+                        disabled={isSelf || pending}
+                        title={
+                          isSelf
+                            ? "无法修改自己的角色"
+                            : pending
+                              ? "先批准后再修改角色"
+                              : ""
+                        }
                       >
                         切换角色
                       </button>{" "}
@@ -155,9 +215,15 @@ export default function AdminUsersPage() {
                         className="danger"
                         onClick={() => onDelete(u)}
                         disabled={isSelf}
-                        title={isSelf ? "无法删除自己" : ""}
+                        title={
+                          isSelf
+                            ? "无法删除自己"
+                            : pending
+                              ? "删除将拒绝此申请"
+                              : ""
+                        }
                       >
-                        删除
+                        {pending ? "拒绝" : "删除"}
                       </button>
                     </td>
                   </tr>

@@ -169,3 +169,187 @@ def test_recent_token_not_refreshed(client: TestClient) -> None:
     resp = client.get("/api/tasks", headers=auth_headers(token))
     assert resp.status_code == 200
     assert resp.headers.get("X-Refreshed-Token") is None
+
+
+# ---------------------------------------------------------------------
+# Admin-approval gate. Self-registered users after the bootstrap admin
+# land in `is_approved=False` and must be flipped by an admin before
+# they can log in. These tests use the raw HTTP API rather than the
+# legacy `register()` helper because the helper auto-approves.
+# ---------------------------------------------------------------------
+
+
+def test_bootstrap_admin_is_auto_approved(client: TestClient) -> None:
+    """First-ever registrant becomes admin AND skips the pending state.
+    Otherwise no one could ever log in to do the approving."""
+    resp = client.post(
+        "/api/auth/register",
+        json={"email": "founder@example.com", "password": "secret-pass"},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["user"]["role"] == "admin"
+    assert body["user"]["is_approved"] is True
+    assert "access_token" in body, "bootstrap admin should get a token immediately"
+
+
+def test_second_registrant_returns_pending_payload(client: TestClient) -> None:
+    """Self-registration after bootstrap returns RegisterPendingOut, NOT
+    a token. The user must wait for admin approval before logging in."""
+    register(client, "founder@example.com")  # bootstrap
+    resp = client.post(
+        "/api/auth/register",
+        json={"email": "newbie@example.com", "password": "secret-pass"},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "pending_approval"
+    assert "access_token" not in body
+    assert body["user"]["is_approved"] is False
+
+
+def test_pending_user_cannot_login(client: TestClient) -> None:
+    """Login endpoint must distinguish "wrong password" (401) from
+    "pending approval" (403) so the SPA can show a useful message."""
+    register(client, "founder@example.com")
+    client.post(
+        "/api/auth/register",
+        json={"email": "pending@example.com", "password": "secret-pass"},
+    )
+    resp = client.post(
+        "/api/auth/login",
+        json={"email": "pending@example.com", "password": "secret-pass"},
+    )
+    assert resp.status_code == 403
+    assert "审核" in resp.json()["detail"]
+
+
+def test_admin_can_approve_pending_user(client: TestClient) -> None:
+    """Happy path: admin flips is_approved, user can then log in."""
+    founder = register(client, "founder@example.com")
+    reg_resp = client.post(
+        "/api/auth/register",
+        json={"email": "candidate@example.com", "password": "secret-pass"},
+    )
+    user_id = reg_resp.json()["user"]["id"]
+
+    # Pending login → 403
+    pre = client.post(
+        "/api/auth/login",
+        json={"email": "candidate@example.com", "password": "secret-pass"},
+    )
+    assert pre.status_code == 403
+
+    # Admin approves.
+    approve = client.post(
+        f"/api/users/{user_id}/approve",
+        headers=auth_headers(founder["access_token"]),
+    )
+    assert approve.status_code == 200
+    approved_body = approve.json()
+    assert approved_body["is_approved"] is True
+    assert approved_body["approved_by_id"] == founder["user"]["id"]
+    assert approved_body["approved_at"]
+
+    # Login now succeeds.
+    post = client.post(
+        "/api/auth/login",
+        json={"email": "candidate@example.com", "password": "secret-pass"},
+    )
+    assert post.status_code == 200
+    assert post.json()["access_token"]
+
+
+def test_approve_is_idempotent(client: TestClient) -> None:
+    """Double-approving doesn't error or move the approved_at timestamp."""
+    founder = register(client, "founder@example.com")
+    reg = client.post(
+        "/api/auth/register",
+        json={"email": "u@example.com", "password": "secret-pass"},
+    )
+    user_id = reg.json()["user"]["id"]
+    first = client.post(
+        f"/api/users/{user_id}/approve",
+        headers=auth_headers(founder["access_token"]),
+    )
+    second = client.post(
+        f"/api/users/{user_id}/approve",
+        headers=auth_headers(founder["access_token"]),
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["approved_at"] == second.json()["approved_at"]
+
+
+def test_non_admin_cannot_approve(client: TestClient) -> None:
+    """Approval is an admin-only operation."""
+    register(client, "founder@example.com")  # bootstrap admin
+    # Create a regular user via the legacy helper (auto-approved).
+    regular = register(client, "regular@example.com")
+    # And a pending user we'll try to approve.
+    pending = client.post(
+        "/api/auth/register",
+        json={"email": "pending@example.com", "password": "secret-pass"},
+    ).json()
+    resp = client.post(
+        f"/api/users/{pending['user']['id']}/approve",
+        headers=auth_headers(regular["access_token"]),
+    )
+    assert resp.status_code == 403
+
+
+def test_admin_created_user_is_pre_approved(client: TestClient) -> None:
+    """When an admin creates an account via /api/users, the approval
+    step is implicit — they can log in immediately."""
+    founder = register(client, "founder@example.com")
+    create = client.post(
+        "/api/users",
+        json={"email": "by-admin@example.com", "password": "secret-pass", "role": "user"},
+        headers=auth_headers(founder["access_token"]),
+    )
+    assert create.status_code == 201
+    body = create.json()
+    assert body["is_approved"] is True
+    assert body["approved_by_id"] == founder["user"]["id"]
+    # And login works without any extra step.
+    login_resp = client.post(
+        "/api/auth/login",
+        json={"email": "by-admin@example.com", "password": "secret-pass"},
+    )
+    assert login_resp.status_code == 200
+
+
+def test_list_users_orders_pending_first(client: TestClient) -> None:
+    """Admin's user list surfaces pending accounts ahead of approved ones
+    so the review queue is at the top of the page."""
+    founder = register(client, "founder@example.com")
+    register(client, "approved@example.com")  # legacy auto-approve helper
+    client.post(
+        "/api/auth/register",
+        json={"email": "pending@example.com", "password": "secret-pass"},
+    )
+    rows = client.get(
+        "/api/users", headers=auth_headers(founder["access_token"])
+    ).json()
+    # Order: pending first (is_approved=False), then approved ones.
+    statuses = [r["is_approved"] for r in rows]
+    assert statuses[0] is False, f"expected pending first, got {statuses}"
+    # Total of 3 users (founder + approved + pending).
+    assert len(rows) == 3
+
+
+def test_admin_stats_counts_pending_users(client: TestClient) -> None:
+    """Admin dashboard surfaces pending_user_count as a separate metric."""
+    founder = register(client, "founder@example.com")
+    client.post(
+        "/api/auth/register",
+        json={"email": "p1@example.com", "password": "secret-pass"},
+    )
+    client.post(
+        "/api/auth/register",
+        json={"email": "p2@example.com", "password": "secret-pass"},
+    )
+    stats = client.get(
+        "/api/admin/stats", headers=auth_headers(founder["access_token"])
+    ).json()
+    assert stats["pending_user_count"] == 2

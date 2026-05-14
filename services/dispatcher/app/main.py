@@ -25,6 +25,7 @@ from .db import get_session_factory, init_db
 from .models import ROLE_ADMIN, User
 from .routes import admin as admin_routes
 from .routes import auth as auth_routes
+from .routes import public as public_routes
 from .routes import releases as releases_routes
 from .routes import tasks as tasks_routes
 from .routes import users as users_routes
@@ -116,6 +117,7 @@ def create_app() -> FastAPI:
     app.include_router(users_routes.router)
     app.include_router(releases_routes.router)
     app.include_router(admin_routes.router)
+    app.include_router(public_routes.router)
 
     @app.get("/healthz")
     def healthz() -> dict:
