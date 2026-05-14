@@ -1140,6 +1140,24 @@ button:disabled {
   color: var(--danger);
 }
 
+/*
+ * Mode-2 QA flags. Three severity tiers — same palette family as
+ * tag-quality-fail so the row reads as "things to look at":
+ *   - non-chinese / empty       → danger (definitely wrong)
+ *   - low-chinese-ratio         → warn   (borderline)
+ *   - very-short-text           → warn   (borderline)
+ *   - unknown / future variants → info   (treated as a hint, not error)
+ */
+.segment-tag.tag-qa-flag {
+  background: var(--warning-soft, var(--danger-soft));
+  color: var(--warning, var(--danger));
+}
+.segment-tag.tag-qa-non-chinese,
+.segment-tag.tag-qa-empty {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
 .player-bar {
   display: flex;
   flex-direction: column;

@@ -13,10 +13,48 @@ import type {
   AudioFileInfo,
   CutValidationResult,
   ProjectScan,
+  SegmentQaFlag,
   SegmentRecord,
 } from "../types";
 import { roleLabels } from "../defaults";
 import { formatClock, formatDuration, formatLongDuration, formatMsRange } from "../lib";
+
+// ---------------------------------------------------------------------
+// QA flag presentation. The labels are intentionally short so the badge
+// row stays one-line-readable; the tooltip carries the "why this flag".
+// Unknown flag values (Rust enum gained a variant the TS bundle hasn't
+// caught up to) fall through to a generic "QA" label so the UI doesn't
+// crash on new pipelines.
+// ---------------------------------------------------------------------
+function qaFlagLabel(flag: SegmentQaFlag | string): string {
+  switch (flag) {
+    case "non-chinese":
+      return "非中文";
+    case "empty":
+      return "空转写";
+    case "low-chinese-ratio":
+      return "中文偏少";
+    case "very-short-text":
+      return "文本过短";
+    default:
+      return "QA 提示";
+  }
+}
+
+function qaFlagTooltip(flag: SegmentQaFlag | string): string {
+  switch (flag) {
+    case "non-chinese":
+      return "Whisper 输出以非中文字符为主——可能识别成英文/拼音了，需要人工复核。";
+    case "empty":
+      return "Whisper 返回空转写——切片可能落在静音或噪声段，需要人工确认。";
+    case "low-chinese-ratio":
+      return "中文字符占比偏低——可能夹杂英文/拼音/乱码，建议复核。";
+    case "very-short-text":
+      return "音频时长 > 1 秒，但转写少于 3 字——Whisper 可能放弃了这段，需要人工补齐。";
+    default:
+      return "切片管线标记需要人工复核。";
+  }
+}
 
 /// Pull `(turn_number, group_key, topic)` out of a segment file name.
 ///
@@ -582,6 +620,22 @@ export function MainView(props: MainViewProps) {
                     {segment.tags.map((t) => (
                       <span className={`segment-tag tag-${t}`} key={t}>
                         {t}
+                      </span>
+                    ))}
+                    {/*
+                     * Mode-2 QA hints. Each flag becomes one badge.
+                     * Click-through opens the segment for review; the
+                     * label is intentionally short — full meaning lives
+                     * in the title tooltip.
+                     */}
+                    {segment.qaFlags?.map((flag) => (
+                      <span
+                        className={`segment-tag tag-qa-flag tag-qa-${flag}`}
+                        key={`qa-${flag}`}
+                        title={qaFlagTooltip(flag)}
+                      >
+                        <AlertTriangle size={10} />
+                        {qaFlagLabel(flag)}
                       </span>
                     ))}
                     {qualityFailed && quality && (

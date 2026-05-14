@@ -2,7 +2,7 @@
 
 写给下一个会话 / 下一位开发者。当前状态、关键设计决策、可继续做的事都在这里。
 
-最后更新：2026-05-13，commit `f243a8f` 之后
+最后更新：2026-05-13（晚），P0 #2 + mode 架构分离落地之后（commit 待入）
 
 ---
 
@@ -99,7 +99,12 @@ dialect-labeler/
 │
 ├── src-tauri/                 # Tauri 后端 (Rust)
 │   ├── src/lib.rs             # ⭐ 主逻辑（~10K 行，含 Mode 2 滑窗算法）
-│   ├── src/cloud.rs           # 云端 Worker 流水线 + dispatch by mode
+│   ├── src/cloud.rs           # 云端 Worker 流水线 + trait dispatch 到 modes
+│   ├── src/modes/             # ⭐ 每个 cutting mode 一个文件（见 §6.9）
+│   │   ├── mod.rs             #   - Mode trait + ModeRunCtx + lookup() 注册表
+│   │   ├── common.rs          #   - SegmentQaFlag enum（mode 共享 schema 唯一处）
+│   │   ├── silence.rs         #   - Mode 1 dispatch + Mode-1-private apply_recognition
+│   │   └── semantic.rs        #   - Mode 2 dispatch + 私有 prompts + detect_qa_flags
 │   ├── tauri.conf.json
 │   └── Cargo.toml
 │
@@ -187,6 +192,18 @@ firewall-cmd --reload
 ```
 重启服务器会丢配置如果忘了 `--permanent`。
 
+### 6.9 Mode 绝对分离 — `src-tauri/src/modes/` 架构（P0 #2 落地）
+当前两个 mode + 未来更多 mode 共用一套 worker pipeline，但**互不知道对方存在**。规则：
+
+1. **新建 mode = 加一个文件**。在 `src/modes/<new>.rs` impl `Mode trait`（id / default_whisper_initial_prompt / run），在 `modes/mod.rs::lookup()` 加一行 `match` 分支。cloud.rs 不用动。
+2. **mode 之间 `use` 互导是禁止的**。看到 `modes/silence.rs` 里 `use crate::modes::semantic::...` 就是回到旧耦合的信号——把共享部分挪到 `modes/common.rs` 或 lib.rs 公共层。
+3. **mode 不直接碰 CloudState**。要更新 frontend stage badge 通过 `ctx.set_stage("recognizing")` 闭包（cloud.rs 提供）。
+4. **跨 mode fallback 写在消费方**。Mode 2 借 Mode 1 的 Ollama 端点池，这个逻辑住在 `modes/semantic.rs::run()` 里——Mode 2 自己声明它愿意借，Mode 1 不知道有这事。`cloud.rs` 不再有 mode-aware 的 fallback 代码。
+5. **prompt 字符串 mode 私有**。每个 mode 的 `DEFAULT_WHISPER_INITIAL_PROMPT` 和 LLM prompts 都是模块级 const。修一个 mode 的 prompt 绝对不会改另一个 mode。
+6. **SegmentRecord 加字段 OK，但要 `#[serde(default, skip_serializing_if = "...")]`**。`qa_flags` 是范本：Mode 1 留空 Vec 不序列化，Mode 2 填值，老 project.json 反序列化不破。
+7. **`SegmentQaFlag` enum 在 `modes/common.rs`**。enum 数据共享，但**检测逻辑 mode 私有**（`detect_qa_flags` 在 semantic.rs，Mode 1 永远不调）。新加 mode-shared 字段就放 common.rs；不要把检测函数也放进去——那是滑坡。
+8. **`#[allow(dead_code)]` 标记的 trait method**：`Mode::id` 和 `default_whisper_initial_prompt` 当前只有 lookup() 路径用得到，预留给 Stage-2-后的诊断 / structured logging。删之前确认确实没人调。
+
 ## 7. 关键文件 + 命令速查
 
 ```bash
@@ -223,7 +240,7 @@ $ cd src-tauri && cargo build --release        # Rust release
 
 ## 8. 已知问题 / 注意事项
 
-1. **Whisper 偶尔切到英文模式**：方言录音里偶尔 Whisper 把方言当英文听。Mode 2 切片质量受 Whisper 影响。Mode 1 一样问题，但用户能在 Tauri 客户端手动校正。
+1. **Whisper 偶尔切到英文模式**：方言录音里偶尔 Whisper 把方言当英文听。**P0 #2 已部分缓解**：（a）Mode 2 默认 Whisper `initial_prompt` 升级为长沙话友好 + 显式禁英文/拼音（`modes/semantic.rs::DEFAULT_WHISPER_INITIAL_PROMPT`）；（b）每个 Mode 2 segment 现在带 `qaFlags`，annotator UI 用红/黄 badge 高亮可疑段（`non-chinese` / `empty` / `low-chinese-ratio` / `very-short-text`）。Mode 1 没改（HANDOFF §6 红线），还是要在 Tauri 客户端手动校正。
 2. **Mac Worker 单机瓶颈**：现在只有这一台 Mac 在 launchd 上跑 worker。多用户并发会排队（dispatcher 的 `single-task-per-user` 限制部分缓解）。下一步可以加更多 worker 节点（任何 tailnet 上的 mac 都行，复制 plist 即可）。
 3. **服务器没 HTTPS**：用户要求只开 8080，没启用 HTTPS。浏览器密码栏旁边「不安全」是正常的。
 4. **下载产物大且慢**：每个 Mode 2 任务的产物 ~200 MB，下载（ECS → 用户）经常 3-5 分钟。可以加 Caddy 的 zstd 压缩，已经开了，但 wav 文件压缩比不高。
@@ -319,11 +336,17 @@ $ cd src-tauri && cargo build --release        # Rust release
 
 ## 11. 上次会话留的待办 (从前文)
 
-这些是上一会话边做边记的，没全部清理:
+**本次会话（2026-05-13 晚）做了**：
+- ✅ P0 #2 D：Mode 2 Whisper prompt 升级（长沙话示例 + 禁英文）
+- ✅ P0 #2 E：SegmentQaFlag + detect_qa_flags + Tauri 客户端 badge 展示
+- ✅ mode 架构分离：`src-tauri/src/modes/`，cloud.rs 248 行 if/else → 30 行 trait dispatch
+- ✅ Tests: cargo 77 passed（旧 68 + 新 9 QA 单测）/ pytest 75 passed
+- ⚠️ **没在真实任务上跑过**——单测和编译都过，但 prompt + qaFlags 在生产里的实际效果还没验证
 
+仍待做：
 - `Tauri release` 打包 + macOS notarization（P1 #3）
-- 多 worker 节点扩容（P0 #1）
-- 文档过时（mode-2-semantic-cutter.md，P2 #7）
+- 多 worker 节点扩容（P0 #1，上次会话用户选了暂缓）
+- 文档过时（mode-2-semantic-cutter.md，P2 #7）—— Phase 7 旧流程还在文里，应该按 §6.4 滑窗版重写
 
 ## 12. 联系方式 / 凭据放哪
 

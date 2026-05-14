@@ -22,11 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::{
-    cut_audio_file_impl, export_dataset_bundle_impl, recognize_segments_impl,
-    run_semantic_pipeline_impl, scan_project_folder_impl, CutConfig, CutMode, ExportOptions,
-    RecognitionOptions, SegmentRecord,
-};
+use crate::{scan_project_folder_impl, CutConfig, CutMode, RecognitionOptions};
 
 const POLL_INTERVAL_SECONDS: u64 = 5;
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 60;
@@ -68,7 +64,7 @@ pub struct WorkerConfig {
 }
 
 impl WorkerConfig {
-    fn to_recognition_options(&self) -> RecognitionOptions {
+    pub(crate) fn to_recognition_options(&self) -> RecognitionOptions {
         let whisper_endpoints = if self.whisper_endpoints.is_empty() {
             None
         } else {
@@ -747,252 +743,51 @@ fn run_pipeline(
     );
 
     // ---- Mode dispatch -------------------------------------------------
-    // Dialect (default) → existing cut + recognize + JSONL bundle path.
-    // Semantic → orchestrated `run_semantic_pipeline_impl` emits xlsx +
-    // WAV-per-segment per-source directly under `bundle_dir`; cloud
-    // pipeline just zips and reports.
-    if cut_config.mode == CutMode::Semantic {
-        // Mode 2 needs at least one Ollama endpoint capable of
-        // num_ctx ≥ 32K. The worker may not have Mode-2-specific config
-        // (semantic_ollama_endpoints / semantic_endpoint) set — that's
-        // a sane default for a worker that mostly runs Mode 1. Fall
-        // back to the worker's Mode 1 Ollama pool so cloud Mode 2
-        // "just works" out of the box without per-mode env JSON
-        // duplication. `semantic_num_ctx` (32768 by default) is
-        // enforced on the LLM request regardless of which endpoint
-        // serves it, so the only risk is the endpoint not having
-        // enough VRAM to load the model at that ctx size — same as
-        // the dedicated Mode 2 path.
-        if cut_config.semantic_ollama_endpoints.is_empty()
-            && cut_config.semantic_endpoint.trim().is_empty()
-        {
-            if !worker_config.ollama_extra_endpoints.is_empty() {
-                cut_config.semantic_ollama_endpoints = worker_config
-                    .ollama_extra_endpoints
-                    .iter()
-                    .map(|url| crate::OllamaEndpointDef {
-                        url: url.clone(),
-                        model: worker_config.ollama_model.clone(),
-                        enabled: true,
-                    })
-                    .collect();
-                eprintln!(
-                    "[cloud] Mode 2: promoted {} Mode 1 Ollama endpoint(s) → semantic pool",
-                    cut_config.semantic_ollama_endpoints.len()
-                );
-            } else if let Some(url) = worker_config.ollama_url.as_ref() {
-                cut_config.semantic_endpoint = url.clone();
-                if let Some(model) = worker_config.ollama_model.clone() {
-                    cut_config.semantic_model = model;
-                }
-                eprintln!("[cloud] Mode 2: promoted Mode 1 primary endpoint → semantic_endpoint");
-            }
+    // Look up the mode handle by id; reject unknown modes loudly so a
+    // future dispatcher upgrade can't silently route a new mode through
+    // the wrong algorithm. Each mode's `run()` lives in `src/modes/`
+    // — see HANDOFF §6 for the design rationale.
+    let mode_handle = crate::modes::lookup(&claim.mode).ok_or_else(|| {
+        CloudError::Pipeline(format!(
+            "unknown task mode '{}' — worker has no handler",
+            claim.mode
+        ))
+    })?;
+
+    // Stage callback bridges modes to `CloudState` without making them
+    // aware of it: modes call `set_stage("recognizing")` and the
+    // frontend Cloud Pane sees the badge update through the
+    // `cloud://status-changed` event. The closure captures by clone so
+    // it can outlive the `state` borrow.
+    let stage_app = app.clone();
+    let stage_claim_id = claim.id.clone();
+    let stage_claim_name = claim.name.clone();
+    let set_stage = move |stage: &str| {
+        if let Some(s) = stage_app.try_state::<CloudState>() {
+            s.set_current_task(Some(CurrentTask {
+                id: stage_claim_id.clone(),
+                name: stage_claim_name.clone(),
+                stage: stage.to_string(),
+                started_at_unix_ms: unix_ms(),
+            }));
         }
+        let _ = stage_app.emit("cloud://status-changed", ());
+    };
 
-        fs::create_dir_all(bundle_dir)?;
-        let input_paths: Vec<String> =
-            scan.audio_files.iter().map(|a| a.path.clone()).collect();
-        let _ = client.progress(
-            &claim.id,
-            25,
-            "语义切割",
-            Some(&format!("{} 个源文件", input_paths.len())),
-        );
-        let result = run_semantic_pipeline_impl(
-            app.clone(),
-            input_paths.clone(),
-            bundle_dir.to_string_lossy().to_string(),
-            cut_config.clone(),
-            worker_config.to_recognition_options(),
-        )
-        .map_err(CloudError::Pipeline)?;
-        if !result.errors.is_empty() {
-            return Err(CloudError::Pipeline(format!(
-                "semantic pipeline failed for {} source(s): {}",
-                result.errors.len(),
-                result.errors.join("; ")
-            )));
-        }
-
-        // The semantic pipeline now produces Mode-1-compatible
-        // segments + a copy of the source under bundle_dir/source. We
-        // top that off with a project.json so Windows annotators can
-        // open the unzipped bundle directly in the Tauri client (the
-        // dialect cut path writes this file via `save_project_file`;
-        // here we assemble it inline since cloud worker doesn't keep
-        // a project state machine).
-        let _ = client.progress(&claim.id, 86, "写入 project.json", None);
-        let mut all_segments: Vec<SegmentRecord> = Vec::new();
-        let mut audio_files_json: Vec<serde_json::Value> = Vec::new();
-        for report in &result.reports {
-            // Each report's first segment carries the basename — pull
-            // one entry per source so audioFiles + segments line up.
-            if let Some(first_seg) = report.segments.first() {
-                audio_files_json.push(json!({
-                    // Use the segment-derived id so we don't pull in
-                    // uuid as a dep. AudioFileInfo.id is opaque to
-                    // the dispatcher / annotator UI.
-                    "id": first_seg.source_file_name.clone(),
-                    "path": first_seg.source_path.clone(),
-                    "fileName": first_seg.source_file_name.clone(),
-                    "matchedEmotion": Vec::<String>::new(),
-                }));
-            }
-            all_segments.extend(report.segments.iter().cloned());
-        }
-        let project_json = json!({
-            "version": 2,
-            "savedAt": format!("epoch_ms_{}", unix_ms()),
-            "rootPath": ".",
-            "projectDir": ".",
-            "segmentsDir": "./segments",
-            "config": &cut_config,
-            "audioFiles": audio_files_json,
-            "manifestRecords": Vec::<serde_json::Value>::new(),
-            "segments": &all_segments,
-        });
-        let project_path = bundle_dir.join("project.json");
-        fs::write(
-            &project_path,
-            serde_json::to_string_pretty(&project_json).map_err(|err| {
-                CloudError::Pipeline(format!("serialize project.json: {err}"))
-            })?,
-        )?;
-
-        let _ = client.progress(&claim.id, 88, "打包产物", None);
-        zip_dir(bundle_dir, output_zip).map_err(CloudError::Pipeline)?;
-        let output_bytes = fs::metadata(output_zip).map(|m| m.len()).unwrap_or(0);
-        let total_segments: usize = result.reports.iter().map(|r| r.segment_count).sum();
-        let summary = json!({
-            "mode": "semantic",
-            "segment_count": total_segments,
-            "source_files": result.reports.len(),
-            "asr_engine": worker_config
-                .whisper_model
-                .clone()
-                .unwrap_or_else(|| "large-v3".to_string()),
-            "semantic_endpoint": cut_config.semantic_endpoint.clone(),
-            "semantic_model": cut_config.semantic_model.clone(),
-            "elapsed_ms": started.elapsed().as_millis() as u64,
-        });
-        return Ok((summary, output_bytes));
-    }
-
-    let _ = client.progress(
-        &claim.id,
-        25,
-        "切割",
-        Some(&format!("{} 个源文件", scan.audio_files.len())),
-    );
-    let total_sources = scan.audio_files.len().max(1);
-    let mut all_segments: Vec<SegmentRecord> = Vec::new();
-    for (idx, audio) in scan.audio_files.iter().enumerate() {
-        let segs = cut_audio_file_impl(
-            audio.path.clone(),
-            scan.segments_dir.clone(),
-            cut_config.clone(),
-            audio.role.clone(),
-            audio.topic_id,
-            audio.matched_text.clone(),
-            Some(audio.matched_emotion.clone()),
-            audio.target_file_names.clone(),
-        )
-        .map_err(CloudError::Pipeline)?;
-        all_segments.extend(segs);
-        // 25 -> 45 across the cutting phase, scaled by source count.
-        let pct = 25 + (20 * (idx + 1) / total_sources);
-        let _ = client.progress(
-            &claim.id,
-            pct as u8,
-            "切割",
-            Some(&format!("{} / {}", idx + 1, total_sources)),
-        );
-    }
-
-    if all_segments.is_empty() {
-        return Err(CloudError::Pipeline(
-            "切分后无可识别的片段（可能整段静音）".into(),
-        ));
-    }
-
-    // ---- 4. recognize ----
-    state.set_current_task(Some(CurrentTask {
-        id: claim.id.clone(),
-        name: claim.name.clone(),
-        stage: "recognizing".to_string(),
-        started_at_unix_ms: unix_ms(),
-    }));
-    let _ = app.emit("cloud://status-changed", ());
-    let _ = client.progress(
-        &claim.id,
-        50,
-        "识别",
-        Some(&format!("{} 段", all_segments.len())),
-    );
-    let recognition = recognize_segments_impl(
-        app.clone(),
-        scan.project_dir.clone(),
-        all_segments.clone(),
-        worker_config.to_recognition_options(),
-    )
-    .map_err(CloudError::Pipeline)?;
-    apply_recognition(&mut all_segments, &recognition);
-
-    // ---- 5. bundle + zip ----
-    state.set_current_task(Some(CurrentTask {
-        id: claim.id.clone(),
-        name: claim.name.clone(),
-        stage: "bundling".to_string(),
-        started_at_unix_ms: unix_ms(),
-    }));
-    let _ = app.emit("cloud://status-changed", ());
-    let _ = client.progress(&claim.id, 85, "打包产物", None);
-    fs::create_dir_all(bundle_dir)?;
-    // Set audio_file_prefix="./" so the JSONL export rewrites every
-    // segment path from the absolute worker temp dir (e.g.
-    // /private/var/folders/.../bundle/segments/...) to a path relative
-    // to the bundle root (./segments/...). Without this the downloader
-    // can't replay the bundle on their own machine — the absolute path
-    // only exists on the Mac that did the processing.
-    export_dataset_bundle_impl(
-        bundle_dir.to_string_lossy().to_string(),
-        all_segments.clone(),
-        ExportOptions {
-            system_prompt: None,
-            pair_user_assistant: Some(true),
-            use_source_audio_for_user: Some(false),
-            audio_file_prefix: Some(".".to_string()),
-            input_root: Some(extract_dir.to_string_lossy().to_string()),
-        },
-        true,
-    )
-    .map_err(CloudError::Pipeline)?;
-
-    zip_dir(bundle_dir, output_zip).map_err(CloudError::Pipeline)?;
-    let output_bytes = fs::metadata(output_zip).map(|m| m.len()).unwrap_or(0);
-
-    // Build the summary the dispatcher keeps after files are cleaned.
-    let mut duration_by_role: serde_json::Map<String, Value> = Default::default();
-    for seg in &all_segments {
-        let key = seg.role.clone().unwrap_or_else(|| "unknown".to_string());
-        let entry = duration_by_role.entry(key).or_insert_with(|| json!(0u64));
-        if let Some(current) = entry.as_u64() {
-            *entry = json!(current + seg.duration_ms);
-        }
-    }
-    let summary = json!({
-        "segment_count": all_segments.len(),
-        "duration_by_role": duration_by_role,
-        "source_files": scan.audio_files.len(),
-        "asr_engine": worker_config
-            .whisper_model
-            .clone()
-            .unwrap_or_else(|| "large-v3-turbo".to_string()),
-        "llm_endpoints": worker_config.ollama_extra_endpoints,
-        "elapsed_ms": started.elapsed().as_millis() as u64,
-    });
-
-    Ok((summary, output_bytes))
+    let ctx = crate::modes::ModeRunCtx {
+        app,
+        client,
+        claim,
+        worker_config: &worker_config,
+        scan: &scan,
+        extract_dir,
+        bundle_dir,
+        output_zip,
+        cut_config,
+        started,
+        set_stage: &set_stage,
+    };
+    mode_handle.run(ctx)
 }
 
 fn spawn_heartbeat(
@@ -1011,26 +806,6 @@ fn spawn_heartbeat(
             }
         }
     })
-}
-
-fn apply_recognition(segments: &mut [SegmentRecord], results: &[crate::RecognitionResult]) {
-    use std::collections::HashMap;
-    let by_id: HashMap<&str, &crate::RecognitionResult> =
-        results.iter().map(|r| (r.segment_id.as_str(), r)).collect();
-    for seg in segments.iter_mut() {
-        if let Some(r) = by_id.get(seg.id.as_str()) {
-            seg.original_text = r.raw_text.clone();
-            seg.phonetic_text = r.text.clone();
-            if let Some(emotion) = r.emotion.clone() {
-                if !emotion.trim().is_empty() {
-                    seg.emotion = vec![emotion];
-                }
-            }
-            if !r.tags.is_empty() {
-                seg.tags = r.tags.clone();
-            }
-        }
-    }
 }
 
 // ============================================================
@@ -1062,7 +837,7 @@ fn unzip_into(zip_path: &Path, dest: &Path) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn zip_dir(src: &Path, dest_zip: &Path) -> std::result::Result<(), String> {
+pub(crate) fn zip_dir(src: &Path, dest_zip: &Path) -> std::result::Result<(), String> {
     let file = fs::File::create(dest_zip).map_err(|e| format!("create zip: {e}"))?;
     let mut writer = zip::ZipWriter::new(file);
     let options: zip::write::FileOptions<()> = zip::write::FileOptions::default()
@@ -1098,7 +873,7 @@ fn zip_dir(src: &Path, dest_zip: &Path) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn unix_ms() -> u64 {
+pub(crate) fn unix_ms() -> u64 {
     UNIX_EPOCH
         .elapsed()
         .ok()

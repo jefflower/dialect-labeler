@@ -6,6 +6,7 @@
 // that the reviewer has no use for.
 #[cfg(not(target_os = "windows"))]
 mod cloud;
+mod modes;
 
 use regex::Regex;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
@@ -148,34 +149,34 @@ struct ManifestRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AudioFileInfo {
-    id: String,
-    path: String,
-    file_name: String,
-    role: Option<String>,
-    topic_id: Option<u32>,
-    target_file_names: Vec<String>,
-    duration_ms: Option<u64>,
-    sample_rate: Option<u32>,
-    channels: Option<u16>,
-    codec_name: Option<String>,
-    bits_per_sample: Option<u32>,
-    matched_text: Option<String>,
-    matched_emotion: Vec<String>,
+pub(crate) struct AudioFileInfo {
+    pub(crate) id: String,
+    pub(crate) path: String,
+    pub(crate) file_name: String,
+    pub(crate) role: Option<String>,
+    pub(crate) topic_id: Option<u32>,
+    pub(crate) target_file_names: Vec<String>,
+    pub(crate) duration_ms: Option<u64>,
+    pub(crate) sample_rate: Option<u32>,
+    pub(crate) channels: Option<u16>,
+    pub(crate) codec_name: Option<String>,
+    pub(crate) bits_per_sample: Option<u32>,
+    pub(crate) matched_text: Option<String>,
+    pub(crate) matched_emotion: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProjectScan {
-    root_path: String,
-    project_dir: String,
-    segments_dir: String,
-    audio_files: Vec<AudioFileInfo>,
-    manifest_records: Vec<ManifestRecord>,
+pub(crate) struct ProjectScan {
+    pub(crate) root_path: String,
+    pub(crate) project_dir: String,
+    pub(crate) segments_dir: String,
+    pub(crate) audio_files: Vec<AudioFileInfo>,
+    pub(crate) manifest_records: Vec<ManifestRecord>,
     /// If `<project_dir>/project.json` exists, surface its contents so the
     /// frontend can resume where it left off without re-cutting or re-running
     /// recognition.
-    existing_project: Option<Value>,
+    pub(crate) existing_project: Option<Value>,
 }
 
 /// Which cutting algorithm to use.
@@ -398,6 +399,18 @@ pub(crate) struct SegmentRecord {
     pub(crate) emotion: Vec<String>,
     pub(crate) tags: Vec<String>,
     pub(crate) notes: String,
+    /// Mode-emitted QA hints for the annotator. Mode 1 leaves this
+    /// empty (its dialect QA happens in the Tauri annotator); Mode 2
+    /// fills it via `crate::modes::semantic::detect_qa_flags`. Skipping
+    /// serialisation when empty keeps existing project.json files
+    /// untouched on the wire — old segments deserialise cleanly with
+    /// `#[serde(default)]`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "qaFlags"
+    )]
+    pub(crate) qa_flags: Vec<crate::modes::common::SegmentQaFlag>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2632,10 +2645,16 @@ fn process_single_semantic_file(
             }
         });
 
+    // Mode-2-private Whisper prompt — physically owned by
+    // `modes::semantic`. See that module's `DEFAULT_WHISPER_INITIAL_PROMPT`
+    // doc for why this exact wording (banning English/pinyin + Changsha
+    // example sentences). worker_config / per-task overrides still win.
     let initial_prompt = asr_options
         .initial_prompt
         .clone()
-        .unwrap_or_else(|| "以下是普通话口语对话/独白，请按发音转写为汉字稿。".to_string());
+        .unwrap_or_else(|| {
+            crate::modes::semantic::DEFAULT_WHISPER_INITIAL_PROMPT.to_string()
+        });
 
     // Sliding-window length. Defaults to `max_segment_s` (the same 90s
     // ceiling we'll cap segments at) so a fresh config "just works".
@@ -2784,6 +2803,13 @@ fn process_single_semantic_file(
             .strip_suffix(".wav")
             .unwrap_or(&seg_filename)
             .to_string();
+        // QA hints — Mode-2-private detection. The annotator UI uses
+        // these to highlight segments that need human review (non-
+        // Chinese output, empty transcript, suspiciously short text).
+        // Mode 1 doesn't run this; it has a separate dialect-aware QA
+        // flow in the Tauri client.
+        let seg_duration_ms = seg_end_abs - seg_start_abs;
+        let qa_flags = crate::modes::semantic::detect_qa_flags(&cut_text, seg_duration_ms);
         segments.push(SegmentRecord {
             id: seg_id,
             source_path: format!("./source/{}", source_basename),
@@ -2793,12 +2819,13 @@ fn process_single_semantic_file(
             role: None,
             start_ms: seg_start_abs,
             end_ms: seg_end_abs,
-            duration_ms: seg_end_abs - seg_start_abs,
+            duration_ms: seg_duration_ms,
             original_text: cut_text.clone(),
             phonetic_text: cut_text,
             emotion: Vec::new(),
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags,
         });
 
         // 7. Drop the scratch window file (each is ~10MB at 48kHz mono).
@@ -2847,11 +2874,11 @@ fn process_single_semantic_file(
 /// Template placeholders — substituted at call time:
 ///   `{transcript}` `{window_ms}` `{min_ms}` `{max_s}` `{sweet_lo}` `{sweet_hi}`
 ///
-/// Design notes:
+/// Design notes for the actual prompt body:
 ///   - We DON'T tell the LLM the strict ms ceiling in the rules
 ///     section — it goes in the "硬性约束" preface so the model treats
 ///     it as non-negotiable rather than a soft preference.
-///   - "Prefer句末标点" emphasised over "prefer late time" — a clean
+///   - "Prefer 句末标点" emphasised over "prefer late time" — a clean
 ///     break at 45s beats a mid-clause break at 80s.
 ///   - "Don't cut in the middle of an utterance" is repeated because
 ///     Qwen sometimes drifts toward "split where there's punctuation
@@ -2859,31 +2886,11 @@ fn process_single_semantic_file(
 ///     text but the AUDIO segment boundary may be 200ms later.
 ///   - JSON format hint at the bottom — Qwen with format=json
 ///     respects it well.
-const DEFAULT_SEMANTIC_CUT_PROMPT: &str = "你是一个普通话 / 长沙话音频切割助手。\
-我会给你一段录音开头 {max_s} 秒的 Whisper 自动转写。每一行是一个 Whisper 自动检测的语音段，\
-格式：[序号] start_ms-end_ms ms  转写文本。\n\
-\n\
-你的任务：在这些行的 end_ms 中挑出**一个**合适的「切第一刀」位置。\n\
-\n\
-硬性约束（必须满足，否则结果作废）：\n\
-- 切点 cut_ms 必须 ≤ {window_ms}（窗口上限）。\n\
-- 切点 cut_ms 必须恰好等于某一行的 end_ms（不要凭空算时间）。\n\
-- 切点前后的音频要是一句完整的话，不要把一句话切两半。\n\
-\n\
-优选规则（按优先级）：\n\
-1. 切点应 ≥ {min_ms}（短段尽量避免，除非剩余内容确实只有这么短就一个完整意群）。\n\
-2. 落在自然句末：句号、问号、感叹号；其次是较长停顿（前后两行 end_ms / start_ms 间隙 ≥ 500ms）。\n\
-3. 在 {sweet_lo} - {sweet_hi} ms 之间寻找最靠后的合适点；这个区间内有句末就用它。\n\
-4. 避免切在以下位置：\n\
-   - 一个完整意群中间（如「我觉得这个东西」后面直接接「特别有意思」，别切在「东西」后）；\n\
-   - 语气词或拖音之前（「然后呢…」后面紧跟正题，别留个孤零零的「然后呢」）；\n\
-   - 两个并列分句的连接处（用「，」连接的两个并列子句通常算一个语义单元）。\n\
-5. 长沙话特征字（哒、咯、嘞、啵、嘎、撇 等）做句末标志时，可以视为句号等价物。\n\
-\n\
-输出格式（**只输出这一行 JSON**，不要解释、不要 markdown 包围）：\n\
-{{\"cut_ms\": <整数>, \"reason\": \"<≤30字说明，包含选了哪行的 end_ms 以及理由>\"}}\n\
-\n\
-Whisper 转写：\n{transcript}";
+///
+/// Stage-1 refactor moved the prompt string into `modes/semantic.rs`
+/// (Mode-2-private). This local re-export keeps the rest of lib.rs
+/// untouched.
+use crate::modes::semantic::DEFAULT_CUT_PROMPT as DEFAULT_SEMANTIC_CUT_PROMPT;
 
 fn llm_pick_one_cut(
     asr: &WhisperResult,
@@ -3439,6 +3446,7 @@ fn cut_audio_file_dialect_impl(
             emotion: emotion.clone().unwrap_or_default(),
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags: Vec::new(),
         });
     }
 
@@ -7963,6 +7971,7 @@ mod tests {
             emotion: Vec::new(),
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
         let assistant = SegmentRecord {
             id: "a".to_string(),
@@ -7979,6 +7988,7 @@ mod tests {
             emotion: vec!["中立".to_string()],
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
 
         let lines = build_paired_jsonl(&[user, assistant], "长沙本地人", false, "", "")
@@ -8029,6 +8039,7 @@ mod tests {
             emotion: Vec::new(),
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
         let segments = vec![
             make_segment("assistant", 1200, "文案演绎_0001_01_01_发音人.wav"),
@@ -9093,6 +9104,7 @@ mod tests {
             emotion: Vec::new(),
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
         assert_eq!(pair_key(&assistant), "自由演绎_0001_01");
 
@@ -9153,6 +9165,7 @@ mod tests {
             emotion: Vec::new(),
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
         // The stale field doesn't parse, but the canonical basename
         // does → pair_key reflects the on-disk truth.
@@ -9180,6 +9193,7 @@ mod tests {
             emotion: Vec::new(),
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
 
         // Both files describe dialogue turn "话题1" of the 0413 session;
@@ -9220,6 +9234,7 @@ mod tests {
             emotion: vec![],
             tags: vec![],
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
         let assistant = SegmentRecord {
             id: "a".into(),
@@ -9238,6 +9253,7 @@ mod tests {
             emotion: vec!["中立".into()],
             tags: vec![],
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
         let lines = build_paired_jsonl(
             &[user, assistant],
@@ -9316,6 +9332,7 @@ mod tests {
             emotion: vec![],
             tags: vec![],
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
         let make_assistant = |idx: u64, text: &str, emotion: &str| SegmentRecord {
             id: format!("a{}", idx),
@@ -9332,6 +9349,7 @@ mod tests {
             emotion: vec![emotion.into()],
             tags: vec![],
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
         let segments = vec![
             user,
@@ -9403,6 +9421,7 @@ mod tests {
             },
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
 
         let segments = vec![
@@ -9950,6 +9969,7 @@ mod tests {
             emotion: Vec::new(),
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
         let quality = validate_cut_segment(&check_segment, &check_config);
         assert!(quality.ok, "quality check failed: {:?}", quality);
@@ -10017,6 +10037,7 @@ mod tests {
             emotion: Vec::new(),
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
         let config = CutConfig {
             silence_db: -30.0,
@@ -10071,6 +10092,7 @@ mod tests {
             emotion: Vec::new(),
             tags: Vec::new(),
             notes: String::new(),
+            qa_flags: Vec::new(),
         };
         let config = CutConfig {
             silence_db: -30.0,

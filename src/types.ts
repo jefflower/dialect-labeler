@@ -123,6 +123,21 @@ export type CutPresetDef = {
   config: CutConfig;
 };
 
+/**
+ * Per-segment QA hint emitted by Mode 2 (semantic). Mirrors the Rust
+ * `crate::modes::common::SegmentQaFlag` enum on the wire format
+ * (kebab-case). Mode 1 leaves `qaFlags` empty.
+ *
+ * Adding a new variant on the Rust side without bumping this list is
+ * safe — runtime renders unknown variants as a generic "qa" badge so
+ * older annotator builds don't crash on new hint kinds.
+ */
+export type SegmentQaFlag =
+  | "non-chinese"
+  | "empty"
+  | "low-chinese-ratio"
+  | "very-short-text";
+
 export type SegmentRecord = {
   id: string;
   sourcePath: string;
@@ -141,6 +156,12 @@ export type SegmentRecord = {
   /** Last LLM endpoint that polished this segment — for visibility only. */
   lastPolishEndpoint?: string | null;
   lastPolishModel?: string | null;
+  /**
+   * QA hints from the cutting pipeline. Mode 2 fills these; Mode 1
+   * leaves it absent / empty. Annotator UI surfaces them as badges
+   * so reviewers can prioritise segments Whisper had trouble with.
+   */
+  qaFlags?: SegmentQaFlag[];
 };
 
 export type CutValidationResult = {
